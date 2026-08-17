@@ -172,6 +172,79 @@ IOC_CLASSES = {
               "whois-registrant-name"]),
 }
 
+# -- OpenCTI ---------------------------------------------------------------
+# Keys here are the value types flatten_indicator() emits, not OpenCTI entity
+# types: a StixFile observable yields one record per hash plus one for its name,
+# so the hash algorithm is the key that reaches the mapper.
+OPENCTI_TO_ZEEK = {
+    "IPv4-Addr":    [(0, "Intel::ADDR")],
+    "IPv6-Addr":    [(0, "Intel::ADDR")],
+    "Domain-Name":  [(0, "Intel::DOMAIN")],
+    "Hostname":     [(0, "Intel::DOMAIN")],
+    "Url":          [(0, "Intel::URL")],
+    "Email-Addr":   [(0, "Intel::EMAIL")],
+    "File-Name":    [(0, "Intel::FILE_NAME")],
+    "MD5":          [(0, "Intel::FILE_HASH")],
+    "SHA-1":        [(0, "Intel::FILE_HASH")],
+    "SHA-224":      [(0, "Intel::FILE_HASH")],
+    "SHA-256":      [(0, "Intel::FILE_HASH")],
+    "SHA-384":      [(0, "Intel::FILE_HASH")],
+    "SHA-512":      [(0, "Intel::FILE_HASH")],
+    # Certificate SHA-1 is Intel::CERT_HASH, not Intel::FILE_HASH, so it needs
+    # a key of its own rather than sharing "SHA-1".
+    "X509-SHA-1":   [(0, "Intel::CERT_HASH")],
+    "User-Account": [(0, "Intel::USER_NAME")],
+    "Software":     [(0, "Intel::SOFTWARE")],
+}
+
+OPENCTI_UNMAPPABLE = {
+    "Mutex": "no Zeek Intel equivalent",
+    "Windows-Registry-Key": "no Zeek Intel equivalent",
+    "Autonomous-System": "no Zeek Intel equivalent",
+    "Process": "no Zeek Intel equivalent",
+    "Directory": "no Zeek Intel equivalent",
+    "Network-Traffic": "no Zeek Intel equivalent",
+    "Cryptocurrency-Wallet": "no Zeek Intel equivalent",
+    "Phone-Number": "no Zeek Intel equivalent",
+    "Text": "free-form, not an indicator",
+    "X509-MD5": "Intel::CERT_HASH is SHA-1 only",
+    "X509-SHA-256": "Intel::CERT_HASH is SHA-1 only",
+    "SSDEEP": "fuzzy hash, no Zeek equivalent",
+    "TLSH": "fuzzy hash, no Zeek equivalent",
+}
+
+# Keyed on x_opencti_main_observable_type, which is what the type filter takes.
+OPENCTI_IOC_CLASSES = {
+    "network": ("Network - IP / subnet / domain / URL",
+                ["IPv4-Addr", "IPv6-Addr", "Domain-Name", "Hostname", "Url"]),
+    "file": ("File - hashes / filenames", ["StixFile", "Artifact"]),
+    "email": ("Email - addresses", ["Email-Addr"]),
+    "tls": ("TLS - certificate hashes", ["X509-Certificate"]),
+    "host": ("Host - user agents / usernames", ["User-Account", "Software"]),
+}
+
+OPENCTI_IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
+
+OPENCTI_OFF_BY_DEFAULT = frozenset(("User-Account", "Software"))
+
+# Connectors write the same algorithm a dozen ways; the mapping table holds one.
+_HASH_ALGORITHM_ALIASES = {
+    "MD5": "MD5", "SHA1": "SHA-1", "SHA-1": "SHA-1",
+    "SHA224": "SHA-224", "SHA-224": "SHA-224",
+    "SHA256": "SHA-256", "SHA-256": "SHA-256",
+    "SHA384": "SHA-384", "SHA-384": "SHA-384",
+    "SHA512": "SHA-512", "SHA-512": "SHA-512",
+    "SSDEEP": "SSDEEP", "TLSH": "TLSH",
+}
+
+
+def normalise_hash_algorithm(label):
+    """OpenCTI hash algorithm label -> the OPENCTI_TO_ZEEK key."""
+    key = (label or "").strip().upper().replace("_", "-")
+    return _HASH_ALGORITHM_ALIASES.get(key, _HASH_ALGORITHM_ALIASES.get(
+        key.replace("-", ""), key))
+
+
 log = logging.getLogger("nexus")
 
 
@@ -678,14 +751,14 @@ def apply_feed_to_params(params, feed):
 # MAPPING
 # ---------------------------------------------------------------------------
 
-def mappable_types():
-    """MISP attribute types Nexus can turn into Zeek intel."""
-    return sorted(MISP_TO_ZEEK)
+def mappable_types(table=None):
+    """Attribute types Nexus can turn into Zeek intel, for the given table."""
+    return sorted(table if table is not None else MISP_TO_ZEEK)
 
 
-def zeek_type_for(misp_type):
+def zeek_type_for(misp_type, table=None):
     """Human-readable target type(s), for the interview's annotated list."""
-    spec = MISP_TO_ZEEK.get(misp_type)
+    spec = (table if table is not None else MISP_TO_ZEEK).get(misp_type)
     if not spec:
         return None
     seen = []
@@ -695,13 +768,16 @@ def zeek_type_for(misp_type):
     return " + ".join(seen)
 
 
-def map_attribute(record, split_composites="both", allow_subnet=True):
+def map_attribute(record, split_composites="both", allow_subnet=True, table=None):
     """Record -> [(raw_indicator, zeek_type), ...] before normalisation.
 
     `split_composites` is "both", "first" or "second" and decides which halves
     of a composite MISP value (domain|ip, filename|md5) become indicators.
+    `table` selects the source's {type: [(part_index, zeek_type)]} mapping --
+    defaults to MISP_TO_ZEEK so existing callers are unaffected.
     """
-    spec = MISP_TO_ZEEK.get(record.get("type"))
+    lookup = table if table is not None else MISP_TO_ZEEK
+    spec = lookup.get(record.get("type"))
     if not spec:
         return []
 
@@ -1178,13 +1254,18 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
                      split_composites="both", allow_subnet=True,
                      source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
                      misp_base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
-                     do_notice=None):
+                     do_notice=None, mapping_table=None, unmappable=None):
     """Records -> deduplicated intel rows.  Pure: no I/O, no network.
+
+    `mapping_table`/`unmappable` select the source; default to the MISP
+    tables so existing callers are unaffected.
 
     Returns (rows, stats) where each row is
     (indicator, zeek_type, source, desc, url, do_notice).
     """
     stats = stats or BuildStats()
+    lookup = mapping_table if mapping_table is not None else MISP_TO_ZEEK
+    reasons = unmappable if unmappable is not None else MISP_UNMAPPABLE
     allowed = set(types) if types is not None else None
     seen = {}
     rows = []
@@ -1195,14 +1276,15 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
 
         if allowed is not None and misp_type not in allowed:
             continue
-        if misp_type not in MISP_TO_ZEEK:
+        if misp_type not in lookup:
             stats.unmap(misp_type or "<empty>")
             continue
 
         meta = render_meta(record, source_fmt, desc_template, misp_base_url,
                            meta_maxlen)
 
-        for raw, zeek_type in map_attribute(record, split_composites, allow_subnet):
+        for raw, zeek_type in map_attribute(record, split_composites,
+                                            allow_subnet, table=lookup):
             try:
                 indicator = normalise(raw, zeek_type)
             except Rejected as exc:

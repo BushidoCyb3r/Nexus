@@ -2787,5 +2787,85 @@ class TestTransportRefactor(unittest.TestCase):
         self.assertEqual(client.base_url, "http://10.0.0.1:8080")
 
 
+class TestOpenctiMapping(unittest.TestCase):
+
+    def rec(self, value_type, value):
+        return {"type": value_type, "value": value}
+
+    def test_observable_types_map_to_zeek(self):
+        cases = [
+            ("IPv4-Addr", "45.33.32.1", [("45.33.32.1", "Intel::ADDR")]),
+            ("IPv6-Addr", "2606:4700::1", [("2606:4700::1", "Intel::ADDR")]),
+            ("Domain-Name", "evil.com", [("evil.com", "Intel::DOMAIN")]),
+            ("Hostname", "a.evil.com", [("a.evil.com", "Intel::DOMAIN")]),
+            ("Url", "http://evil.com/a", [("http://evil.com/a", "Intel::URL")]),
+            ("Email-Addr", "a@evil.com", [("a@evil.com", "Intel::EMAIL")]),
+            ("File-Name", "bad.exe", [("bad.exe", "Intel::FILE_NAME")]),
+            ("SHA-256", "a" * 64, [("a" * 64, "Intel::FILE_HASH")]),
+            ("X509-SHA-1", "b" * 40, [("b" * 40, "Intel::CERT_HASH")]),
+            ("User-Account", "bad_actor", [("bad_actor", "Intel::USER_NAME")]),
+            ("Software", "Mozilla/4.0", [("Mozilla/4.0", "Intel::SOFTWARE")]),
+        ]
+        for value_type, value, expected in cases:
+            with self.subTest(value_type=value_type):
+                self.assertEqual(
+                    nexus.map_attribute(self.rec(value_type, value),
+                                        table=nexus.OPENCTI_TO_ZEEK),
+                    expected)
+
+    def test_cidr_valued_ipv4_becomes_a_subnet(self):
+        out = nexus.map_attribute(self.rec("IPv4-Addr", "45.33.32.0/24"),
+                                  table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(out, [("45.33.32.0/24", "Intel::SUBNET")])
+
+    def test_cidr_dropped_when_subnets_disallowed(self):
+        out = nexus.map_attribute(self.rec("IPv4-Addr", "45.33.32.0/24"),
+                                  allow_subnet=False,
+                                  table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(out, [])
+
+    def test_misp_table_is_still_the_default(self):
+        self.assertEqual(nexus.map_attribute(self.rec("ip-dst", "45.33.32.1")),
+                         [("45.33.32.1", "Intel::ADDR")])
+
+    def test_unmappable_types_carry_reasons(self):
+        for key in ("Mutex", "Windows-Registry-Key", "X509-MD5", "TLSH"):
+            self.assertIn(key, nexus.OPENCTI_UNMAPPABLE)
+            self.assertTrue(nexus.OPENCTI_UNMAPPABLE[key])
+
+    def test_cert_hash_is_sha1_only(self):
+        self.assertIn("X509-SHA-1", nexus.OPENCTI_TO_ZEEK)
+        self.assertNotIn("X509-SHA-256", nexus.OPENCTI_TO_ZEEK)
+        self.assertNotIn("X509-MD5", nexus.OPENCTI_TO_ZEEK)
+
+    def test_hash_algorithm_labels_normalise(self):
+        for raw in ("sha-256", "SHA256", "sha256", "SHA-256"):
+            self.assertEqual(nexus.normalise_hash_algorithm(raw), "SHA-256")
+        self.assertEqual(nexus.normalise_hash_algorithm("md5"), "MD5")
+        self.assertEqual(nexus.normalise_hash_algorithm("SHA-1"), "SHA-1")
+        self.assertEqual(nexus.normalise_hash_algorithm("ssdeep"), "SSDEEP")
+
+    def test_ioc_classes_cover_the_mappable_surface(self):
+        listed = set()
+        for _, types in nexus.OPENCTI_IOC_CLASSES.values():
+            listed.update(types)
+        self.assertIn("IPv4-Addr", listed)
+        self.assertIn("StixFile", listed)
+        self.assertIn("X509-Certificate", listed)
+
+    def test_mappable_types_follows_the_table(self):
+        self.assertIn("IPv4-Addr", nexus.mappable_types(nexus.OPENCTI_TO_ZEEK))
+        self.assertIn("ip-dst", nexus.mappable_types())
+
+    def test_build_indicators_accepts_the_opencti_table(self):
+        records = [{"type": "Domain-Name", "value": "evil.com", "to_ids": True,
+                    "uuid": "x", "event_info": "i", "event_id": "1",
+                    "event_tags": [], "org": "o", "comment": "", "category": "",
+                    "timestamp": ""}]
+        rows, _ = nexus.build_indicators(records,
+                                         mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual([r[0] for r in rows], ["evil.com"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
