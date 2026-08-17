@@ -64,6 +64,9 @@ PROFILE_EXCLUDED_KEYS = ("token", "discovery")
 PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
                       "misp_base_url": "source_base_url"}
 
+SOURCES = ("misp", "opencti")
+SOURCE_LABELS = {"misp": "MISP", "opencti": "OpenCTI"}
+
 # Zeek Intel framework.  This is the complete Intel::Type set.
 ZEEK_TYPES = (
     "Intel::ADDR",
@@ -2597,16 +2600,30 @@ def discover(client, probe_limit=5000):
 
 # -- stages -----------------------------------------------------------------
 
-def _stage1_connection(config, client, input_fn, getpass_fn):
+def _stage1_connection(config, client, input_fn, getpass_fn, source=None):
     """Stage 1.  Collects connection answers only -- main() builds the client."""
     _stage(1, "Connection")
+
+    # No silent default: a flagless run asks which platform it is pointed at.
+    # A caller that already knows (later, --source) skips the question.
+    if source is None:
+        source = ask_choice("Threat intel platform", list(SOURCES),
+                            "misp", input_fn)
+    config["source"] = source
+    label = SOURCE_LABELS.get(source, source)
+
     config["source_host"] = ask_required(
-        "MISP address (IP or hostname)",
+        "%s address (IP or hostname)" % label,
         client.host if client is not None else None, input_fn)
     config["scheme"] = ask_choice(
         "Scheme", ["https", "http"],
         client.scheme if client is not None else "https", input_fn)
-    default_port = 443 if config["scheme"] == "https" else 80
+    if config["scheme"] == "https":
+        default_port = 443
+    elif source == "opencti":
+        default_port = OPENCTI_DEFAULT_PORT_HTTP
+    else:
+        default_port = 80
     if client is not None and client.port:
         default_port = client.port
     config["port"] = ask_int("Port", default_port, 1, 65535, input_fn)
@@ -2629,7 +2646,8 @@ def _stage1_connection(config, client, input_fn, getpass_fn):
     # An existing client already holds a working token; re-prompting for it
     # would only be a chance to fat-finger it.
     config["token"] = (client.token if client is not None
-                       else ask_token(getpass_fn=getpass_fn))
+                       else ask_token("%s API token" % label,
+                                      getpass_fn=getpass_fn))
 
     config["timeout"] = ask_int(
         "Request timeout (seconds)",
@@ -2886,14 +2904,14 @@ def _stage8_output(config, input_fn):
     return config
 
 
-def run_interview(client, input_fn=input, getpass_fn=getpass.getpass):
+def run_interview(client, input_fn=input, getpass_fn=getpass.getpass, source=None):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
     (and testable) with no MISP in reach.
     """
     config = {}
-    _stage1_connection(config, client, input_fn, getpass_fn)
+    _stage1_connection(config, client, input_fn, getpass_fn, source=source)
 
     _stage(2, "Discovery")
     discovery = discover(client)

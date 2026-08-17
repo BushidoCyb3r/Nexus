@@ -2034,8 +2034,11 @@ class TestBuildOpenctiFilters(unittest.TestCase):
 class TestRunInterview(Quiet):
 
     def run_it(self, input_fn, client=None, token="scripted-token-1234"):
+        # source="misp" -- this class exercises the MISP path itself; the
+        # new source question is covered separately by TestOpenctiStage1.
         return nexus.run_interview(
-            client, input_fn=input_fn, getpass_fn=lambda prompt: token)
+            client, input_fn=input_fn, getpass_fn=lambda prompt: token,
+            source="misp")
 
     def test_all_defaults_produces_a_usable_config(self):
         fake = scripted(["misp.example"], fill="")
@@ -2213,13 +2216,14 @@ class TestRunInterview(Quiet):
         with self.assertRaises(nexus.InterviewAborted):
             nexus.run_interview(None,
                                     input_fn=scripted(["a.example"], fill=""),
-                                    getpass_fn=refuse)
+                                    getpass_fn=refuse, source="misp")
 
     def test_a_connected_client_supplies_the_defaults_and_the_token(self):
         def no_token(prompt):
             raise AssertionError("must not re-prompt for a known token")
         config = nexus.run_interview(
-            StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token)
+            StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token,
+            source="misp")
         self.assertEqual(config["source_host"], "misp.example")
         self.assertEqual(config["port"], 8443)
         self.assertEqual(config["token"], "stub-token-1234")
@@ -2232,6 +2236,60 @@ class TestRunInterview(Quiet):
 
 
 # ---------------------------------------------------------------------------
+# STAGE 1 -- source selection
+# ---------------------------------------------------------------------------
+
+class TestOpenctiStage1(Quiet):
+
+    def test_source_question_is_asked_when_not_supplied(self):
+        fake = scripted(["2", "cti.local", "1", "443", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok")
+        self.assertEqual(config["source"], "opencti")
+        self.assertEqual(config["source_host"], "cti.local")
+
+    def test_source_question_is_skipped_when_supplied(self):
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        self.assertEqual(config["source"], "opencti")
+        self.assertEqual(config["source_host"], "cti.local")
+
+    def test_prompts_name_the_selected_platform(self):
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        nexus._stage1_connection({}, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        joined = " ".join(fake.state["prompts"])
+        self.assertIn("OpenCTI address", joined)
+
+    def test_http_default_port_is_4000_for_opencti(self):
+        fake = scripted(["cti.local", "2", "", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        self.assertEqual(config["port"], nexus.OPENCTI_DEFAULT_PORT_HTTP)
+
+    def test_misp_http_default_port_is_unchanged(self):
+        fake = scripted(["misp.local", "2", "", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="misp")
+        self.assertEqual(config["port"], 80)
+
+    def test_token_prompt_names_the_platform(self):
+        seen = {}
+
+        def getpass_fn(prompt=""):
+            seen["prompt"] = prompt
+            return "tok"
+
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        nexus._stage1_connection({}, None, fake, getpass_fn, source="opencti")
+        self.assertIn("OpenCTI", seen["prompt"])
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
 
@@ -2240,7 +2298,7 @@ class TestSummarise(Quiet):
     def config(self):
         return nexus.run_interview(
             None, input_fn=scripted(["misp.example"], fill=""),
-            getpass_fn=lambda prompt: "scripted-token-1234")
+            getpass_fn=lambda prompt: "scripted-token-1234", source="misp")
 
     def test_summary_covers_every_stage(self):
         text = nexus.summarise_config(self.config())
