@@ -944,7 +944,22 @@ class TestOpenctiClient(unittest.TestCase):
         self.cti = FakeOpencti(script=[
             (200, {"errors": [{"message": "Something went wrong"}], "data": None})])
         client = self.cti.client()
-        self.assertRaises(nexus.SourceError, client.get_version)
+        with self.assertRaises(nexus.SourceError) as ctx:
+            client.get_version()
+        # Must be the base type, not the auth subtype -- a generic failure
+        # should never be reported to the operator as a rejected token.
+        self.assertIs(type(ctx.exception), nexus.SourceError)
+
+    def test_non_auth_message_does_not_raise_auth_error(self):
+        # "Author" contains "auth"; a validation error naming a field must not
+        # be misread as a rejected API token and sent the operator to rotate
+        # credentials over an unrelated GraphQL input error.
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "Author field is required"}], "data": None})])
+        client = self.cti.client()
+        with self.assertRaises(nexus.SourceError) as ctx:
+            client.get_version()
+        self.assertIs(type(ctx.exception), nexus.SourceError)
 
     def test_auth_message_in_a_200_body_raises_auth_error(self):
         self.cti = FakeOpencti(script=[

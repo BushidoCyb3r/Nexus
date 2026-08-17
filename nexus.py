@@ -234,7 +234,9 @@ OPENCTI_DEFAULT_PORT_HTTP = 4000
 OPENCTI_AUTH_ERROR_CODES = frozenset(
     ("AUTH_REQUIRED", "FORBIDDEN_ACCESS", "AUTH_FAILURE", "UNAUTHORIZED"))
 _OPENCTI_AUTH_PATTERN = re.compile(
-    r"auth|token|forbidden|unauthor|logged in", re.IGNORECASE)
+    r"\bunauthori[sz]ed\b|\bforbidden\b|\bauthentication\b|\bauthenticate\b"
+    r"|\bmust be logged in\b|\blogged in\b|invalid token|expired token"
+    r"|missing token", re.IGNORECASE)
 
 # Connectors write the same algorithm a dozen ways; the mapping table holds one.
 _HASH_ALGORITHM_ALIASES = {
@@ -668,10 +670,6 @@ class OpenctiClient(_HttpTransport):
                                 verify_tls=verify_tls, proxy=proxy,
                                 timeout=timeout, retries=retries)
         self.page_size = page_size
-        # Counted rather than raised: an indicator with more linked observables
-        # than one page holds is unusual, and dropping values silently is the
-        # failure mode this tool exists to avoid.
-        self.truncated_observables = 0
 
     def _auth_headers(self):
         return {"Authorization": "Bearer %s" % self.token}
