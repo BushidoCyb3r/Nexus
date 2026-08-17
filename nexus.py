@@ -297,24 +297,31 @@ class NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
             self, req, fp, code, msg, headers, newurl)
 
 
-class MispError(Exception):
-    """Any failure talking to MISP."""
+class SourceError(Exception):
+    """Any failure talking to a threat intel platform."""
 
 
-class MispAuthError(MispError):
-    """401/403 -- bad or unprivileged token."""
+class SourceAuthError(SourceError):
+    """The platform rejected the API token."""
 
 
-class MispClient(object):
-    """Minimal MISP REST client over urllib.
+# The MISP names predate OpenCTI support.  Kept so existing call sites and
+# tests keep working; new code raises and catches the neutral names.
+MispError = SourceError
+MispAuthError = SourceAuthError
 
-    Only this class speaks HTTP.  Everything downstream sees flattened dicts.
+
+class _HttpTransport(object):
+    """Shared HTTP plumbing.  Subclasses own their auth header and their API.
+
+    Only transport subclasses speak HTTP.  Everything downstream sees flattened
+    dicts.
     """
 
     RETRY_STATUS = frozenset((429, 500, 502, 503, 504))
 
     def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
-                 proxy=None, timeout=30, retries=3, page_size=1000):
+                 proxy=None, timeout=30, retries=3):
         self.host = host
         self.scheme = scheme
         self.port = port
@@ -322,7 +329,6 @@ class MispClient(object):
         self.verify_tls = verify_tls
         self.timeout = timeout
         self.retries = max(1, retries)  # retries=0 would send no request at all
-        self.page_size = page_size
         REDACTOR.add_secret(token)
 
         netloc = host if not port else "%s:%d" % (host, port)
@@ -348,18 +354,19 @@ class MispClient(object):
             handlers.append(urllib.request.ProxyHandler({}))
         self._opener = urllib.request.build_opener(*handlers)
 
-    # -- transport ---------------------------------------------------------
+    def _auth_headers(self):
+        raise NotImplementedError("a transport subclass must supply its auth header")
 
     def _request(self, method, path, body=None):
         """Return (parsed_json, headers).  Retries on transient failures."""
         url = urllib.parse.urljoin(self.base_url, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {
-            "Authorization": self.token,
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": "nexus/%s" % __version__,
         }
+        headers.update(self._auth_headers())
 
         last_exc = None
         for attempt in range(1, self.retries + 1):
@@ -371,8 +378,9 @@ class MispClient(object):
                     return self._decode(raw, url), resp.headers
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
-                    raise MispAuthError(
-                        "MISP rejected the API token (HTTP %d) for %s" % (exc.code, url)
+                    raise SourceAuthError(
+                        "the platform rejected the API token (HTTP %d) for %s"
+                        % (exc.code, url)
                     )
                 if exc.code in self.RETRY_STATUS and attempt < self.retries:
                     last_exc = exc
@@ -383,15 +391,15 @@ class MispClient(object):
                     detail = exc.read().decode("utf-8", "replace")[:500]
                 except Exception:  # pragma: no cover - best effort only
                     pass
-                raise MispError("HTTP %d from %s %s" % (exc.code, url, detail))
+                raise SourceError("HTTP %d from %s %s" % (exc.code, url, detail))
             except (urllib.error.URLError, ssl.SSLError, OSError) as exc:
                 if attempt < self.retries:
                     last_exc = exc
                     self._backoff(attempt, str(exc))
                     continue
-                raise MispError("could not reach %s: %s" % (url, exc))
-        raise MispError("giving up on %s after %d attempts: %s"
-                        % (url, self.retries, last_exc))
+                raise SourceError("could not reach %s: %s" % (url, exc))
+        raise SourceError("giving up on %s after %d attempts: %s"
+                          % (url, self.retries, last_exc))
 
     @staticmethod
     def _decode(raw, url):
@@ -400,13 +408,27 @@ class MispClient(object):
         try:
             return json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
-            raise MispError("malformed JSON from %s: %s" % (url, exc))
+            raise SourceError("malformed JSON from %s: %s" % (url, exc))
 
     @staticmethod
     def _backoff(attempt, reason):
         delay = min(2 ** attempt, 30)
         log.debug("retrying in %ss (%s)", delay, reason)
         time.sleep(delay)
+
+
+class MispClient(_HttpTransport):
+    """Minimal MISP REST client over urllib."""
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, page_size=1000):
+        _HttpTransport.__init__(self, host, token, scheme=scheme, port=port,
+                                verify_tls=verify_tls, proxy=proxy,
+                                timeout=timeout, retries=retries)
+        self.page_size = page_size
+
+    def _auth_headers(self):
+        return {"Authorization": self.token}
 
     # -- discovery ---------------------------------------------------------
 

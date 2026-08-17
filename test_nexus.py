@@ -2763,5 +2763,29 @@ class TestResolveToken(unittest.TestCase):
                 nexus.resolve_token(self.args, interactive=False), "")
 
 
+class TestTransportRefactor(unittest.TestCase):
+    """The shared transport is what OpenCTI reuses; MISP behaviour must not move."""
+
+    def test_neutral_exception_names_exist_and_alias(self):
+        self.assertTrue(issubclass(nexus.SourceAuthError, nexus.SourceError))
+        self.assertIs(nexus.MispError, nexus.SourceError)
+        self.assertIs(nexus.MispAuthError, nexus.SourceAuthError)
+
+    def test_misp_client_is_a_transport(self):
+        self.assertTrue(issubclass(nexus.MispClient, nexus._HttpTransport))
+
+    def test_transport_base_refuses_to_guess_auth(self):
+        transport = nexus._HttpTransport("10.0.0.1", "tok")
+        self.assertRaises(NotImplementedError, transport._auth_headers)
+
+    def test_misp_auth_header_is_the_bare_token(self):
+        client = nexus.MispClient("10.0.0.1", "tok")
+        self.assertEqual(client._auth_headers(), {"Authorization": "tok"})
+
+    def test_base_url_still_built_from_scheme_host_port(self):
+        client = nexus.MispClient("10.0.0.1", "tok", scheme="http", port=8080)
+        self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
