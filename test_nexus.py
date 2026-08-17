@@ -357,7 +357,7 @@ class TestBuild(unittest.TestCase):
             exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {category}",
-            misp_base_url="https://misp.example",
+            base_url="https://misp.example",
         )
         params.update(kwargs)
         return nexus.build_indicators(sample_records(), **params)
@@ -590,7 +590,7 @@ class TestFileIO(unittest.TestCase):
             sample_records(), exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {category}",
-            misp_base_url="https://misp.example")
+            base_url="https://misp.example")
         self.write([nexus.header_line()] + nexus.rows_to_lines(rows))
         self.assertEqual(nexus.lint_file(self.path), [])
         _, parsed = nexus.read_existing(self.path)
@@ -859,7 +859,7 @@ class TestMispClient(unittest.TestCase):
             exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {tags}",
-            misp_base_url="https://misp.example")
+            base_url="https://misp.example")
         lines = nexus.rows_to_lines(rows)
         self.assertEqual(stats.emitted, 2)
         self.assertEqual(
@@ -2041,7 +2041,7 @@ class TestRunInterview(Quiet):
         fake = scripted(["misp.example"], fill="")
         config = self.run_it(fake)
 
-        self.assertEqual(config["misp_host"], "misp.example")
+        self.assertEqual(config["source_host"], "misp.example")
         self.assertEqual(config["scheme"], "https")
         self.assertEqual(config["port"], 443)
         self.assertIs(config["verify_tls"], True)
@@ -2083,7 +2083,7 @@ class TestRunInterview(Quiet):
         self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
         self.assertEqual(config["desc_template"],
                          nexus.DEFAULT_DESC_TEMPLATE)
-        self.assertEqual(config["misp_base_url"], "https://misp.example")
+        self.assertEqual(config["source_base_url"], "https://misp.example")
         self.assertIs(config["do_notice"], False)
         self.assertEqual(config["meta_maxlen"], 200)
 
@@ -2140,7 +2140,7 @@ class TestRunInterview(Quiet):
         ]
         config = self.run_it(by_prompt(rules))
 
-        self.assertEqual(config["misp_host"], "10.9.8.7")
+        self.assertEqual(config["source_host"], "10.9.8.7")
         self.assertEqual(config["scheme"], "http")
         self.assertEqual(config["port"], 8080)
         self.assertIs(config["verify_tls"], False)
@@ -2161,7 +2161,7 @@ class TestRunInterview(Quiet):
         self.assertEqual(config["own_networks"], ["10.0.0.0/8"])
         self.assertEqual(config["own_domains"], ["corp.example"])
         self.assertEqual(config["source_fmt"], "OURSOC")
-        self.assertIsNone(config["misp_base_url"])
+        self.assertIsNone(config["source_base_url"])
         self.assertIs(config["do_notice"], True)
         self.assertEqual(config["meta_maxlen"], 80)
         self.assertEqual(config["output_path"], "/tmp/intel.dat")
@@ -2196,7 +2196,7 @@ class TestRunInterview(Quiet):
     def test_non_standard_port_lands_in_the_meta_url(self):
         config = self.run_it(by_prompt([("MISP address", "a.example"),
                                         ("Port", "8443")]))
-        self.assertEqual(config["misp_base_url"], "https://a.example:8443")
+        self.assertEqual(config["source_base_url"], "https://a.example:8443")
 
     def test_declining_the_summary_aborts(self):
         with self.assertRaises(nexus.InterviewAborted):
@@ -2220,7 +2220,7 @@ class TestRunInterview(Quiet):
             raise AssertionError("must not re-prompt for a known token")
         config = nexus.run_interview(
             StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token)
-        self.assertEqual(config["misp_host"], "misp.example")
+        self.assertEqual(config["source_host"], "misp.example")
         self.assertEqual(config["port"], 8443)
         self.assertEqual(config["token"], "stub-token-1234")
         self.assertEqual((config["timeout"], config["retries"]), (45, 2))
@@ -2957,7 +2957,7 @@ class TestProfiles(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def config(self, **extra):
-        base = {"misp_host": "misp.example", "scheme": "https", "port": 443,
+        base = {"source_host": "misp.example", "scheme": "https", "port": 443,
                 "token": "super-secret-token-value", "types": ["ip-dst"],
                 "to_ids": True, "days": 90, "time_mode": "last",
                 "discovery": {"tags": [{"name": "tlp:amber"}] * 500}}
@@ -2967,7 +2967,7 @@ class TestProfiles(unittest.TestCase):
     def test_round_trip_preserves_the_answers(self):
         nexus.save_profile(self.config(), self.path)
         loaded = nexus.load_profile(self.path)
-        self.assertEqual(loaded["misp_host"], "misp.example")
+        self.assertEqual(loaded["source_host"], "misp.example")
         self.assertEqual(loaded["types"], ["ip-dst"])
         self.assertIs(loaded["to_ids"], True)
 
@@ -3033,6 +3033,65 @@ class TestProfiles(unittest.TestCase):
 
     def test_a_path_is_taken_as_given(self):
         self.assertEqual(nexus.profile_path("/tmp/x.json"), "/tmp/x.json")
+
+
+class TestProfileMigration(unittest.TestCase):
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "p.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, payload):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_v1_profile_migrates_forward(self):
+        self.write({"profile_version": 1, "config": {
+            "misp_host": "misp.local", "misp_base_url": "https://misp.local",
+            "types": ["ip-dst"]}})
+        config = nexus.load_profile(self.path)
+        self.assertEqual(config["source"], "misp")
+        self.assertEqual(config["source_host"], "misp.local")
+        self.assertEqual(config["source_base_url"], "https://misp.local")
+        self.assertNotIn("misp_host", config)
+
+    def test_v1_migration_is_logged(self):
+        self.write({"profile_version": 1, "config": {"misp_host": "m"}})
+        with self.assertLogs("nexus", level="INFO"):
+            nexus.load_profile(self.path)
+
+    def test_v1_token_is_still_stripped(self):
+        self.write({"profile_version": 1,
+                    "config": {"misp_host": "m", "token": "leaked"}})
+        self.assertNotIn("token", nexus.load_profile(self.path))
+
+    def test_v2_round_trip(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "types": ["IPv4-Addr"], "token": "secret"}
+        nexus.save_profile(config, self.path)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["profile_version"], 2)
+        loaded = nexus.load_profile(self.path)
+        self.assertEqual(loaded["source"], "opencti")
+        self.assertEqual(loaded["source_host"], "cti.local")
+        self.assertNotIn("token", loaded)
+
+    def test_unknown_version_is_rejected(self):
+        self.write({"profile_version": 99, "config": {}})
+        self.assertRaises(ValueError, nexus.load_profile, self.path)
+
+    def test_v2_files_stay_0600(self):
+        nexus.save_profile({"source": "misp", "source_host": "m"}, self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_migration_defaults_source_to_misp_only_when_absent(self):
+        self.write({"profile_version": 1,
+                    "config": {"misp_host": "m", "source": "opencti"}})
+        self.assertEqual(nexus.load_profile(self.path)["source"], "opencti")
 
 
 # ---------------------------------------------------------------------------

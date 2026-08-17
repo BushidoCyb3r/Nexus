@@ -56,10 +56,13 @@ SO_ZEEK_POLICY_DIRS = (
 # Nexus working state.
 NEXUS_HOME = "/opt/nexus"
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 # Never persisted.  The token is a secret; `discovery` is a cache of live MISP
 # lists that would be stale the moment it is written.
 PROFILE_EXCLUDED_KEYS = ("token", "discovery")
+# v1 predates OpenCTI support and named everything after MISP.
+PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
+                      "misp_base_url": "source_base_url"}
 
 # Zeek Intel framework.  This is the complete Intel::Type set.
 ZEEK_TYPES = (
@@ -1757,19 +1760,18 @@ class BuildStats(object):
 def build_indicators(records, types=None, exclusions=None, stats=None,
                      split_composites="both", allow_subnet=True,
                      source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
-                     misp_base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
-                     do_notice=None, mapping_table=None, unmappable=None):
+                     base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
+                     do_notice=None, mapping_table=None):
     """Records -> deduplicated intel rows.  Pure: no I/O, no network.
 
-    `mapping_table`/`unmappable` select the source; default to the MISP
-    tables so existing callers are unaffected.
+    `mapping_table` selects the source; defaults to the MISP table so
+    existing callers are unaffected.
 
     Returns (rows, stats) where each row is
     (indicator, zeek_type, source, desc, url, do_notice).
     """
     stats = stats or BuildStats()
     lookup = mapping_table if mapping_table is not None else MISP_TO_ZEEK
-    reasons = unmappable if unmappable is not None else MISP_UNMAPPABLE
     allowed = set(types) if types is not None else None
     seen = {}
     rows = []
@@ -1784,7 +1786,7 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
             stats.unmap(misp_type or "<empty>")
             continue
 
-        meta = render_meta(record, source_fmt, desc_template, misp_base_url,
+        meta = render_meta(record, source_fmt, desc_template, base_url,
                            meta_maxlen)
 
         for raw, zeek_type in map_attribute(record, split_composites,
@@ -2598,7 +2600,7 @@ def discover(client, probe_limit=5000):
 def _stage1_connection(config, client, input_fn, getpass_fn):
     """Stage 1.  Collects connection answers only -- main() builds the client."""
     _stage(1, "Connection")
-    config["misp_host"] = ask_required(
+    config["source_host"] = ask_required(
         "MISP address (IP or hostname)",
         client.host if client is not None else None, input_fn)
     config["scheme"] = ask_choice(
@@ -2828,14 +2830,14 @@ def _stage7_metadata(config, input_fn):
         "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
 
     if ask_yes_no("Link meta.url back to the MISP event?", True, input_fn):
-        netloc = config.get("misp_host") or ""
+        netloc = config.get("source_host") or ""
         port = config.get("port")
         if port and port not in (80, 443):
             netloc = "%s:%d" % (netloc, port)
-        config["misp_base_url"] = "%s://%s" % (config.get("scheme", "https"),
-                                               netloc)
+        config["source_base_url"] = "%s://%s" % (config.get("scheme", "https"),
+                                                  netloc)
     else:
-        config["misp_base_url"] = None
+        config["source_base_url"] = None
 
     config["do_notice"] = ask_yes_no(
         "Emit the meta.do_notice column?", False, input_fn)
@@ -3092,7 +3094,7 @@ def summarise_config(config):
     lines = ["Pre-flight summary", ""]
 
     lines.append("  MISP        : %s://%s%s (verify TLS: %s)"
-                 % (scheme, config.get("misp_host", "?"), shown_port,
+                 % (scheme, config.get("source_host", "?"), shown_port,
                     _yes_no(config.get("verify_tls"))))
     if config.get("proxy"):
         lines.append("  proxy       : %s" % config["proxy"])
@@ -3152,7 +3154,7 @@ def summarise_config(config):
 
     lines.append("  meta.source : %s" % config.get("source_fmt"))
     lines.append("  meta.desc   : %s" % config.get("desc_template"))
-    lines.append("  meta.url    : %s" % (config.get("misp_base_url") or "none"))
+    lines.append("  meta.url    : %s" % (config.get("source_base_url") or "none"))
     lines.append("  do_notice   : %s  (max meta length %s)"
                  % (_yes_no(config.get("do_notice")), config.get("meta_maxlen")))
 
@@ -3207,6 +3209,28 @@ def save_profile(config, path):
     return path
 
 
+def migrate_profile_config(config, version):
+    """Bring an older profile's keys up to the current schema, in memory.
+
+    A systemd timer replaying a v1 profile must keep working across the
+    upgrade; silently breaking a scheduled run is worse than migration code.
+    """
+    if version == PROFILE_VERSION:
+        return config
+    if version == 1:
+        migrated = dict(config)
+        for old, new in PROFILE_V1_KEY_MAP.items():
+            if old in migrated:
+                migrated.setdefault(new, migrated.pop(old))
+            migrated.pop(old, None)
+        migrated.setdefault("source", "misp")
+        log.info("migrated a profile-version-1 profile forward to version %d",
+                 PROFILE_VERSION)
+        return migrated
+    raise ValueError("profile version %r is not supported by this nexus"
+                     % version)
+
+
 def load_profile(path):
     """Read a saved profile back into a config dict."""
     with open(path, "r", encoding="utf-8") as handle:
@@ -3215,11 +3239,11 @@ def load_profile(path):
     if not isinstance(payload, dict) or "config" not in payload:
         raise ValueError("%s is not a nexus profile" % path)
     version = payload.get("profile_version")
-    if version != PROFILE_VERSION:
+    if version not in (1, PROFILE_VERSION):
         raise ValueError("%s is profile version %r, this nexus writes %d"
                          % (path, version, PROFILE_VERSION))
 
-    config = dict(payload["config"])
+    config = migrate_profile_config(dict(payload["config"]), version)
     for key in PROFILE_EXCLUDED_KEYS:
         config.pop(key, None)  # a hand-edited profile does not get to inject one
     return config
@@ -3773,7 +3797,7 @@ def cmd_build(args):
         config["apply"] = config.get("apply", False)
 
     client = MispClient(
-        host=config["misp_host"], token=config["token"],
+        host=config["source_host"], token=config["token"],
         scheme=config["scheme"], port=config["port"],
         verify_tls=config["verify_tls"], proxy=config["proxy"],
         timeout=config["timeout"], retries=config["retries"],
@@ -3807,7 +3831,7 @@ def cmd_build(args):
         split_composites=config["split_composites"],
         allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
         desc_template=config["desc_template"],
-        misp_base_url=config["misp_base_url"],
+        base_url=config["source_base_url"],
         meta_maxlen=config["meta_maxlen"],
         do_notice=config["do_notice"] or None,
     )
