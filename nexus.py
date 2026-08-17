@@ -816,6 +816,127 @@ class OpenctiClient(_HttpTransport):
         nodes = _edge_nodes(connection)
         return len(nodes), not page_info.get("hasNextPage")
 
+    # -- search ------------------------------------------------------------
+
+    INDICATORS_QUERY = """
+    query NexusIndicators($first: Int!, $after: ID, $filters: FilterGroup) {
+      indicators(first: $first, after: $after, filters: $filters,
+                 orderBy: created_at, orderMode: asc) {
+        pageInfo { endCursor hasNextPage globalCount }
+        edges {
+          node {
+            id
+            standard_id
+            name
+            description
+            pattern
+            pattern_type
+            x_opencti_score
+            confidence
+            revoked
+            x_opencti_detection
+            valid_from
+            valid_until
+            created_at
+            updated_at
+            createdBy { ... on Identity { name } }
+            objectLabel { id value }
+            objectMarking { id definition }
+            observables(first: 50) {
+              pageInfo { hasNextPage }
+              edges {
+                node {
+                  id
+                  entity_type
+                  observable_value
+                  ... on StixFile { name hashes { algorithm hash } }
+                  ... on Artifact { hashes { algorithm hash } }
+                  ... on X509Certificate { hashes { algorithm hash } }
+                  ... on UserAccount { account_login }
+                  ... on Software { name }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    def search_indicators(self, filters, max_results=None, max_pages=None,
+                          stats=None):
+        """Yield flattened records, walking the cursor until OpenCTI runs dry.
+
+        The sort is fixed so the cursor walk is stable: an instance ingesting
+        during a long pull would otherwise shift the window and drop rows.
+        """
+        after = None
+        previous_cursor = None
+        yielded = 0
+        pages = 0
+        while max_pages is None or pages < max_pages:
+            data = self._graphql(self.INDICATORS_QUERY, {
+                "first": self.page_size, "after": after, "filters": filters})
+            connection = data.get("indicators") or {}
+            nodes = _edge_nodes(connection)
+            page_info = connection.get("pageInfo") or {}
+            pages += 1
+
+            for node in nodes:
+                for record in self._records_for(node, stats):
+                    yield record
+                    yielded += 1
+                    if max_results is not None and yielded >= max_results:
+                        log.info("stopped at max_results=%d", max_results)
+                        return
+
+            if not page_info.get("hasNextPage"):
+                return
+            cursor = page_info.get("endCursor")
+            # A proxy that drops `after` would otherwise replay page one for ever.
+            if not cursor or cursor == previous_cursor:
+                log.warning("stopped because OpenCTI did not advance the cursor "
+                            "-- does this endpoint honour `after`?")
+                return
+            previous_cursor = cursor
+            after = cursor
+        log.warning("stopped at the explicit %d page ceiling", max_pages)
+
+    def _records_for(self, node, stats):
+        """Records from linked observables, falling back to the STIX pattern."""
+        records = flatten_indicator(node, stats=stats)
+        if records:
+            return records
+
+        pattern_type = (node.get("pattern_type") or "").lower()
+        if pattern_type not in OPENCTI_PARSEABLE_PATTERN_TYPES:
+            if stats is not None:
+                stats.opencti_non_stix_patterns += 1
+            return []
+
+        pairs = parse_stix_pattern(node.get("pattern"))
+        if not pairs:
+            if stats is not None:
+                stats.opencti_unparsed_patterns += 1
+            return []
+        if stats is not None:
+            stats.opencti_pattern_fallbacks += 1
+
+        # flatten_indicator with no observables still produced the shared
+        # metadata; rebuild records around the parsed values.
+        stripped = dict(node)
+        out = []
+        for value_type, value in pairs:
+            stripped["observables"] = {"pageInfo": {"hasNextPage": False},
+                                       "edges": [{"node": {
+                                           "entity_type": "__parsed__",
+                                           "observable_value": value}}]}
+            built = flatten_indicator(stripped)
+            if built:
+                built[0]["type"] = value_type
+                out.append(built[0])
+        return out
+
 
 def _misp_bool(value):
     """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""

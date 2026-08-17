@@ -3346,5 +3346,133 @@ class TestStixPattern(unittest.TestCase):
                          [("Domain-Name", "a.com")])
 
 
+class TestOpenctiSearch(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def node(self, value, ident="i1", **overrides):
+        node = {
+            "id": ident, "standard_id": "indicator--" + ident,
+            "name": "n", "description": "", "pattern": "",
+            "pattern_type": "stix", "x_opencti_detection": True,
+            "updated_at": "2026-08-02T12:00:00Z", "createdBy": None,
+            "objectLabel": [], "objectMarking": [],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": "Domain-Name",
+                          "observable_value": value}}]},
+        }
+        node.update(overrides)
+        return node
+
+    def page(self, nodes, cursor, has_next):
+        return {"data": {"indicators": {
+            "pageInfo": {"endCursor": cursor, "hasNextPage": has_next,
+                         "globalCount": len(nodes)},
+            "edges": [{"node": n} for n in nodes]}}}
+
+    def test_single_page(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com")], "c1", False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com"])
+
+    def test_walks_pages_with_the_cursor(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c2", False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com", "b.com"])
+        self.assertIsNone(self.cti.requests[0]["body"]["variables"]["after"])
+        self.assertEqual(self.cti.requests[1]["body"]["variables"]["after"], "c1")
+
+    def test_repeated_cursor_stops_the_walk(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c1", True)),
+            (200, self.page([self.node("c.com", "i3")], "c1", True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com", "b.com"])
+
+    def test_null_cursor_with_more_pages_stops_the_walk(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com")], None, True)),
+            (200, self.page([self.node("b.com", "i2")], None, True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com"])
+
+    def test_max_results_stops_early(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1"),
+                             self.node("b.com", "i2")], "c1", True))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, max_results=1))
+        self.assertEqual(len(records), 1)
+
+    def test_max_pages_ceiling(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c2", True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}, max_pages=1))
+        self.assertEqual(len(records), 1)
+
+    def test_empty_page_terminates(self):
+        self.cti = FakeOpencti(script=[(200, self.page([], None, False))])
+        client = self.cti.client()
+        self.assertEqual(list(client.search_indicators({})), [])
+
+    def test_pattern_fallback_when_no_observables(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern"] = "[domain-name:value = 'pattern.com']"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, stats=stats))
+        self.assertEqual([r["value"] for r in records], ["pattern.com"])
+        self.assertEqual(records[0]["type"], "Domain-Name")
+        self.assertEqual(stats.opencti_pattern_fallbacks, 1)
+
+    def test_non_stix_pattern_is_counted_not_mined(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern_type"] = "yara"
+        node["pattern"] = "rule x { strings: $a = 'evil.com' condition: $a }"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, stats=stats))
+        self.assertEqual(records, [])
+        self.assertEqual(stats.opencti_non_stix_patterns, 1)
+
+    def test_unparseable_stix_pattern_is_counted(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern"] = "[windows-registry-key:key = 'HKLM']"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        self.assertEqual(list(client.search_indicators({}, stats=stats)), [])
+        self.assertEqual(stats.opencti_unparsed_patterns, 1)
+
+    def test_filters_and_page_size_are_sent(self):
+        self.cti = FakeOpencti(script=[(200, self.page([], None, False))])
+        client = self.cti.client(page_size=250)
+        filters = {"mode": "and", "filters": [], "filterGroups": []}
+        list(client.search_indicators(filters))
+        variables = self.cti.requests[0]["body"]["variables"]
+        self.assertEqual(variables["first"], 250)
+        self.assertEqual(variables["filters"], filters)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
