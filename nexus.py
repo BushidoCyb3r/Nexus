@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""nexus.py - build a Zeek intel.dat from MISP, for Security Onion 3.2.
+"""nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
 
-Phases 0-3 and 5: environment check, MISP client, the mapping/normalise/write
-core, the interactive interview, and the safety guardrails.
+Phases 0-3 and 5: environment check, source client (MISP or OpenCTI), the
+mapping/normalise/write core, the interactive interview, and the safety
+guardrails. One source per run, selected in the interview or via --source.
 
 Standard library only.  Python 3.6+.
 """
@@ -26,7 +27,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.2.0-dev"
+__version__ = "0.3.0-dev"
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
