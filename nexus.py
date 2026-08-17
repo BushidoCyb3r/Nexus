@@ -772,8 +772,17 @@ class OpenctiClient(_HttpTransport):
         """Return (count, exact).
 
         globalCount is an exact total, unlike MISP's bounded probe.  It is
-        permission-dependent, so fall back to what the page actually returned
-        and say so rather than reporting a guess as fact.
+        permission-dependent, so when it's missing or unreadable we fall back
+        to what the page actually returned and say so rather than reporting a
+        guess as fact.
+
+        The fallback's exactness still holds even without globalCount:
+        COUNT_QUERY asks for `first: 1`, so `hasNextPage=False` means that
+        single row *was* the whole result set and len(nodes) (0 or 1) is the
+        true total, not a lower bound.  This is coupled to the query's page
+        size — if COUNT_QUERY's `first:` ever grows past 1, `not hasNextPage`
+        stops meaning "we saw everything" and this exactness claim must
+        change with it.
 
         probe_limit is accepted and ignored so this stays call-compatible
         with MispClient.count_type; a later stage calls both through one
@@ -791,6 +800,8 @@ class OpenctiClient(_HttpTransport):
                 return int(page_info["globalCount"]), True
             except (TypeError, ValueError):
                 pass
+        # first: 1 above means a closed page (no hasNextPage) already saw the
+        # entire result set, so len(nodes) is exact even without globalCount.
         nodes = _edge_nodes(connection)
         return len(nodes), not page_info.get("hasNextPage")
 

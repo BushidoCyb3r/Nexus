@@ -1075,6 +1075,45 @@ class TestOpenctiDiscovery(unittest.TestCase):
         client = self.cti.client()
         self.assertEqual(client.count_type("Url"), (1, False))
 
+    def test_count_type_no_global_count_closed_page_one_edge_is_exact(self):
+        # first: 1 means a closed page (hasNextPage=False) already saw the
+        # whole result set, so this is exact even without globalCount.
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, True))
+
+    def test_count_type_no_global_count_closed_page_zero_edges_is_exact(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": []}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (0, True))
+
+    def test_count_type_unparseable_global_count_falls_back(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": "many", "endCursor": None,
+                         "hasNextPage": False},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, True))
+
+    def test_count_type_null_global_count_falls_back(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": None, "endCursor": None,
+                         "hasNextPage": True},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, False))
+
+    def test_edge_nodes_tolerates_malformed_connection(self):
+        self.assertEqual(nexus._edge_nodes("not a dict"), [])
+        self.assertEqual(nexus._edge_nodes(
+            {"edges": ["not a dict", {"node": "not a dict"},
+                       {"node": {"id": "ok"}}]}),
+            [{"id": "ok"}])
+
 
 class TestFlatten(unittest.TestCase):
 
