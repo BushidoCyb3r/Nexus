@@ -2288,6 +2288,17 @@ class TestOpenctiStage1(Quiet):
         nexus._stage1_connection({}, None, fake, getpass_fn, source="opencti")
         self.assertIn("OpenCTI", seen["prompt"])
 
+    def test_flagless_run_interview_asks_and_honours_the_answer(self):
+        # The boundary that matters: main() calls run_interview(), not
+        # _stage1_connection() directly.  With no `source` argument -- the
+        # shape of a real flagless run -- it must still ask, and the answer
+        # must actually be read.  OpenCTI (not the "misp" default) proves
+        # that: a silently-defaulting implementation would fail this.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["2", "cti.local"], fill=""),
+            getpass_fn=lambda prompt: "tok")
+        self.assertEqual(config["source"], "opencti")
+
 
 # ---------------------------------------------------------------------------
 # SUMMARY
