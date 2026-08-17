@@ -4009,5 +4009,80 @@ class TestSourceCli(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
 
+class TestOpenctiEndToEnd(unittest.TestCase):
+    """An OpenCTI profile all the way to rendered intel lines."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def indicator(self, ident, entity_type, value):
+        return {
+            "id": ident, "standard_id": "indicator--" + ident,
+            "name": "bad thing", "description": "seen in phishing",
+            "pattern": "", "pattern_type": "stix",
+            "x_opencti_detection": True, "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "objectLabel": [{"id": "l1", "value": "phishing"}],
+            "objectMarking": [{"id": "m1", "definition": "TLP:AMBER"}],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": entity_type,
+                          "observable_value": value}}]},
+        }
+
+    def test_records_render_to_valid_intel_lines(self):
+        nodes = [self.indicator("i1", "Domain-Name", "evil.com"),
+                 self.indicator("i2", "IPv4-Addr", "45.33.32.1"),
+                 self.indicator("i3", "Url", "http://evil.com/payload")]
+        records = []
+        for node in nodes:
+            records.extend(nexus.flatten_indicator(node))
+
+        rows, stats = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="OpenCTI", desc_template="{event_info}",
+            exclusions=nexus.ExclusionSet(exclude_private=True))
+
+        lines = [nexus.header_line(False)] + nexus.rows_to_lines(rows, False)
+        self.assertEqual(nexus.lint_lines(lines, False), [])
+
+        indicators = sorted(r[0] for r in rows)
+        self.assertEqual(indicators,
+                         ["45.33.32.1", "evil.com", "evil.com/payload"])
+        self.assertTrue(all(row[2] == "OpenCTI" for row in rows))
+
+    def test_private_addresses_are_still_excluded(self):
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "IPv4-Addr", "10.0.0.1"))
+        rows, _ = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            exclusions=nexus.ExclusionSet(exclude_private=True))
+        self.assertEqual(rows, [])
+
+    def test_append_only_merge_across_sources(self):
+        path = os.path.join(self.dir, "intel.dat")
+        existing = [nexus.header_line(False),
+                    "evil.com\tIntel::DOMAIN\tMISP\told desc\t-"]
+        nexus.write_atomic(path, existing)
+
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "Domain-Name", "evil.com"))
+        rows, _ = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="OpenCTI", desc_template="{event_info}")
+        _, existing_rows = nexus.read_existing(path)
+        combined = nexus.merge_additive(
+            existing_rows, nexus.rows_to_lines(rows, False))
+
+        # The MISP row owns the key; the OpenCTI run adds nothing and removes
+        # nothing.
+        self.assertEqual(len(combined), 1)
+        self.assertIn("MISP", combined[0])
+        added, removed = nexus.indicator_delta(existing_rows, combined)
+        self.assertEqual(removed, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
