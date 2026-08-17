@@ -866,13 +866,24 @@ def flatten_attribute(attr):
     }
 
 
+def _opencti_timestamp_text(value):
+    """OpenCTI ISO-8601 -> a string strptime("%z") can take on Python 3.6.
+
+    strptime's %z directive only learned to accept a colon in the offset in
+    3.7 (the ":?" in CPython's _strptime.TimeRE pattern) -- this project's
+    floor is 3.6, so "+00:00" has to become "+0000" before parsing, not after.
+    """
+    text = str(value).strip().replace("Z", "+0000")
+    # OpenCTI emits millisecond precision; datetime in 3.6 will not take it.
+    text = re.sub(r"\.\d+", "", text)
+    return re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", text)
+
+
 def _opencti_epoch(value):
     """ISO-8601 from OpenCTI -> epoch seconds, or "" when it will not parse."""
     if not value:
         return ""
-    text = str(value).strip().replace("Z", "+00:00")
-    # OpenCTI emits millisecond precision; datetime in 3.6 will not take it.
-    text = re.sub(r"\.\d+", "", text)
+    text = _opencti_timestamp_text(value)
     try:
         parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
     except ValueError:

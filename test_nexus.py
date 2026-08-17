@@ -3236,6 +3236,55 @@ class TestFlattenIndicator(unittest.TestCase):
             [{"entity_type": "Domain-Name", "observable_value": ""}]))
         self.assertEqual(nexus.flatten_indicator(node), [])
 
+    def test_unknown_entity_type_passes_through_for_the_mapping_layer(self):
+        # Mutex has no Zeek equivalent, but it must still surface as a record
+        # of type "Mutex" so build_indicators can count it against
+        # OPENCTI_UNMAPPABLE instead of it vanishing without a trace.
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Mutex", "observable_value": "Global\\evil"}]))
+        records = nexus.flatten_indicator(node)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["type"], "Mutex")
+        self.assertEqual(records[0]["value"], "Global\\evil")
+
+
+class TestOpenctiTimestamp(unittest.TestCase):
+    """3.6 does not accept a colon in strptime's %z offset (bpo-30618, fixed
+    in 3.7); these tests pin the colon-stripping fix at the text level so a
+    3.9+ CI run -- which would parse the colon form silently -- can still
+    catch a regression here."""
+
+    def test_z_suffix_normalises_to_colon_free_utc_offset(self):
+        text = nexus._opencti_timestamp_text("2026-08-02T12:00:00Z")
+        self.assertEqual(text, "2026-08-02T12:00:00+0000")
+        self.assertNotIn(":", text[-5:])  # the offset itself, not the time
+
+    def test_explicit_offset_colon_is_stripped(self):
+        text = nexus._opencti_timestamp_text("2026-08-02T12:00:00+01:00")
+        self.assertEqual(text, "2026-08-02T12:00:00+0100")
+
+    def test_epoch_from_z_timestamp(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00Z"),
+                         1785672000)
+
+    def test_epoch_honours_an_explicit_offset(self):
+        # 13:00+01:00 is the same instant as 12:00Z -- if the offset were
+        # ignored (or stripped instead of normalised) these would diverge.
+        utc = nexus._opencti_epoch("2026-08-02T12:00:00Z")
+        offset = nexus._opencti_epoch("2026-08-02T13:00:00+01:00")
+        self.assertEqual(utc, offset)
+
+    def test_epoch_from_millisecond_precision(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00.123Z"),
+                         1785672000)
+
+    def test_epoch_from_naive_timestamp_with_no_timezone(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00"),
+                         1785672000)
+
+    def test_epoch_from_unparseable_text_is_empty(self):
+        self.assertEqual(nexus._opencti_epoch("not a date"), "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
