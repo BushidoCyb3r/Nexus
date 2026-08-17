@@ -227,6 +227,15 @@ OPENCTI_IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
 
 OPENCTI_OFF_BY_DEFAULT = frozenset(("User-Account", "Software"))
 
+GRAPHQL_PATH = "/graphql"
+OPENCTI_DEFAULT_PORT_HTTP = 4000
+# GraphQL answers 200 even when it refuses you, so auth failure has to be read
+# out of the error body rather than the status line.
+OPENCTI_AUTH_ERROR_CODES = frozenset(
+    ("AUTH_REQUIRED", "FORBIDDEN_ACCESS", "AUTH_FAILURE", "UNAUTHORIZED"))
+_OPENCTI_AUTH_PATTERN = re.compile(
+    r"auth|token|forbidden|unauthor|logged in", re.IGNORECASE)
+
 # Connectors write the same algorithm a dozen ways; the mapping table holds one.
 _HASH_ALGORITHM_ALIASES = {
     "MD5": "MD5", "SHA1": "SHA-1", "SHA-1": "SHA-1",
@@ -648,6 +657,56 @@ class MispClient(_HttpTransport):
         else:
             attrs = []
         return [a for a in attrs if isinstance(a, dict)]
+
+
+class OpenctiClient(_HttpTransport):
+    """Minimal OpenCTI 6.x GraphQL client over urllib."""
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, page_size=100):
+        _HttpTransport.__init__(self, host, token, scheme=scheme, port=port,
+                                verify_tls=verify_tls, proxy=proxy,
+                                timeout=timeout, retries=retries)
+        self.page_size = page_size
+        # Counted rather than raised: an indicator with more linked observables
+        # than one page holds is unusual, and dropping values silently is the
+        # failure mode this tool exists to avoid.
+        self.truncated_observables = 0
+
+    def _auth_headers(self):
+        return {"Authorization": "Bearer %s" % self.token}
+
+    def _graphql(self, query, variables=None):
+        body = {"query": query, "variables": variables or {}}
+        payload, _ = self._request("POST", GRAPHQL_PATH, body)
+        self._check_errors(payload)
+        return payload.get("data") or {}
+
+    @staticmethod
+    def _check_errors(payload):
+        """GraphQL reports failure inside a 200 response, so read the body.
+
+        Unhandled, a rejected token looks exactly like an empty result set and
+        a scheduled run would report "0 new indicators" forever.
+        """
+        if not isinstance(payload, dict):
+            raise SourceError("OpenCTI returned %s, not a JSON object"
+                              % type(payload).__name__)
+        errors = payload.get("errors") or []
+        if errors:
+            first = errors[0] if isinstance(errors[0], dict) else {}
+            message = str(first.get("message") or "unspecified GraphQL error")
+            code = str((first.get("extensions") or {}).get("code") or "")
+            if code in OPENCTI_AUTH_ERROR_CODES or _OPENCTI_AUTH_PATTERN.search(message):
+                raise SourceAuthError("OpenCTI rejected the API token: %s" % message)
+            raise SourceError("OpenCTI error: %s" % message)
+        if payload.get("data") is None:
+            raise SourceError("OpenCTI returned no data and no error")
+
+    def get_version(self):
+        data = self._graphql("query NexusVersion { about { version } }")
+        about = data.get("about") or {}
+        return {"version": about.get("version") or "unknown"}
 
 
 def _misp_bool(value):

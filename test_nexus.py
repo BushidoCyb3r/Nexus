@@ -868,6 +868,115 @@ class TestMispClient(unittest.TestCase):
         self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
 
 
+# ---------------------------------------------------------------------------
+# OPENCTI CLIENT (against a local fake)
+# ---------------------------------------------------------------------------
+
+class FakeOpenctiHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        self.server.requests.append({
+            "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "body": json.loads(raw.decode("utf-8")) if raw else {},
+        })
+        if self.server.script:
+            status, payload = self.server.script.pop(0)
+        else:
+            status, payload = 200, {"data": {}}
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class FakeOpencti(object):
+    """A local GraphQL endpoint replaying a scripted list of responses."""
+
+    def __init__(self, script=None):
+        self.server = HTTPServer(("127.0.0.1", 0), FakeOpenctiHandler)
+        self.server.script = list(script or [])
+        self.server.requests = []
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    @property
+    def requests(self):
+        return self.server.requests
+
+    def client(self, **kwargs):
+        return nexus.OpenctiClient("127.0.0.1", "tok", scheme="http",
+                                   port=self.port, retries=1, **kwargs)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestOpenctiClient(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def test_bearer_token_and_graphql_path(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"about": {"version": "6.4.1"}}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_version(), {"version": "6.4.1"})
+        request = self.cti.requests[0]
+        self.assertEqual(request["path"], "/graphql")
+        self.assertEqual(request["auth"], "Bearer tok")
+        self.assertIn("query", request["body"])
+
+    def test_errors_in_a_200_body_raise(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "Something went wrong"}], "data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceError, client.get_version)
+
+    def test_auth_message_in_a_200_body_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "You must be logged in to do this."}],
+                   "data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_auth_extension_code_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "nope",
+                               "extensions": {"code": "FORBIDDEN_ACCESS"}}]})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_null_data_without_errors_raises(self):
+        self.cti = FakeOpencti(script=[(200, {"data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceError, client.get_version)
+
+    def test_http_401_still_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[(401, {"errors": []})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_variables_are_sent(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"x": 1}})])
+        client = self.cti.client()
+        client._graphql("query Q($a: Int) { x }", {"a": 3})
+        self.assertEqual(self.cti.requests[0]["body"]["variables"], {"a": 3})
+
+
 class TestFlatten(unittest.TestCase):
 
     def test_flatten_pulls_event_context_and_tags(self):
