@@ -1,0 +1,2767 @@
+#!/usr/bin/env python3
+"""Tests for nexus.py.  Stdlib only:  python3 -m unittest test_nexus -v
+
+No MISP and no Security Onion required -- the MISP client is exercised against
+a local http.server that replays canned responses.
+"""
+
+import contextlib
+import io
+import json
+import logging
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import nexus
+
+
+# ---------------------------------------------------------------------------
+# MAPPING
+# ---------------------------------------------------------------------------
+
+class TestMapping(unittest.TestCase):
+
+    def rec(self, misp_type, value):
+        return {"type": misp_type, "value": value}
+
+    def test_simple_types(self):
+        cases = [
+            ("ip-dst", "1.2.3.4", [("1.2.3.4", "Intel::ADDR")]),
+            ("domain", "evil.com", [("evil.com", "Intel::DOMAIN")]),
+            ("hostname", "a.evil.com", [("a.evil.com", "Intel::DOMAIN")]),
+            ("url", "http://evil.com/a", [("http://evil.com/a", "Intel::URL")]),
+            ("md5", "d41d8cd98f00b204e9800998ecf8427e",
+             [("d41d8cd98f00b204e9800998ecf8427e", "Intel::FILE_HASH")]),
+            ("email-src", "a@evil.com", [("a@evil.com", "Intel::EMAIL")]),
+            ("user-agent", "Mozilla/4.0", [("Mozilla/4.0", "Intel::SOFTWARE")]),
+        ]
+        for misp_type, value, expected in cases:
+            with self.subTest(misp_type=misp_type):
+                self.assertEqual(nexus.map_attribute(self.rec(misp_type, value)),
+                                 expected)
+
+    def test_composite_domain_ip_splits_both_halves(self):
+        out = nexus.map_attribute(self.rec("domain|ip", "evil.com|1.2.3.4"))
+        self.assertEqual(out, [("evil.com", "Intel::DOMAIN"),
+                               ("1.2.3.4", "Intel::ADDR")])
+
+    def test_composite_filename_hash_splits_both_halves(self):
+        out = nexus.map_attribute(
+            self.rec("filename|md5", "bad.exe|d41d8cd98f00b204e9800998ecf8427e"))
+        self.assertEqual(out, [("bad.exe", "Intel::FILE_NAME"),
+                               ("d41d8cd98f00b204e9800998ecf8427e",
+                                "Intel::FILE_HASH")])
+
+    def test_composite_first_or_second_only(self):
+        rec = self.rec("domain|ip", "evil.com|1.2.3.4")
+        self.assertEqual(nexus.map_attribute(rec, split_composites="first"),
+                         [("evil.com", "Intel::DOMAIN")])
+        self.assertEqual(nexus.map_attribute(rec, split_composites="second"),
+                         [("1.2.3.4", "Intel::ADDR")])
+
+    def test_port_composite_discards_the_port(self):
+        out = nexus.map_attribute(self.rec("ip-dst|port", "1.2.3.4|443"))
+        self.assertEqual(out, [("1.2.3.4", "Intel::ADDR")])
+
+    def test_cidr_in_ip_attribute_becomes_subnet(self):
+        out = nexus.map_attribute(self.rec("ip-dst", "192.0.2.0/24"))
+        self.assertEqual(out, [("192.0.2.0/24", "Intel::SUBNET")])
+
+    def test_cidr_dropped_when_subnets_disabled(self):
+        out = nexus.map_attribute(self.rec("ip-dst", "192.0.2.0/24"),
+                                  allow_subnet=False)
+        self.assertEqual(out, [])
+
+    def test_unmapped_and_empty(self):
+        self.assertEqual(nexus.map_attribute(self.rec("ssdeep", "3:abc")), [])
+        self.assertEqual(nexus.map_attribute(self.rec("ip-dst", "   ")), [])
+
+    def test_every_mapped_type_targets_a_real_zeek_type(self):
+        for misp_type, spec in nexus.MISP_TO_ZEEK.items():
+            for _, ztype in spec:
+                self.assertIn(ztype, nexus.ZEEK_TYPES,
+                              "%s maps to unknown %s" % (misp_type, ztype))
+                self.assertIn(ztype, nexus.NORMALISERS,
+                              "%s has no normaliser" % ztype)
+
+    def test_composite_specs_match_composite_type_names(self):
+        for misp_type, spec in nexus.MISP_TO_ZEEK.items():
+            max_index = max(idx for idx, _ in spec)
+            expected_parts = misp_type.count("|") + 1
+            self.assertLess(max_index, expected_parts,
+                            "%s indexes part %d but has %d part(s)"
+                            % (misp_type, max_index, expected_parts))
+
+    def test_off_by_default_and_unmappable_are_disjoint(self):
+        self.assertFalse(set(nexus.MISP_UNMAPPABLE) & set(nexus.MISP_TO_ZEEK))
+        self.assertTrue(set(nexus.MISP_OFF_BY_DEFAULT) <= set(nexus.MISP_TO_ZEEK))
+        for _, types in nexus.IOC_CLASSES.values():
+            for misp_type in types:
+                self.assertIn(misp_type, nexus.MISP_TO_ZEEK)
+
+
+# ---------------------------------------------------------------------------
+# NORMALISATION
+# ---------------------------------------------------------------------------
+
+class TestNormalise(unittest.TestCase):
+
+    def assertRejected(self, fn, value, reason=None):
+        with self.assertRaises(nexus.Rejected) as ctx:
+            fn(value)
+        if reason:
+            self.assertEqual(ctx.exception.reason, reason)
+
+    # -- addresses ---------------------------------------------------------
+
+    def test_addr_ok(self):
+        self.assertEqual(nexus.norm_addr(" 1.2.3.4 "), "1.2.3.4")
+        self.assertEqual(nexus.norm_addr("2001:0DB8::0001"), "2001:db8::1")
+
+    def test_addr_defanged(self):
+        self.assertEqual(nexus.norm_addr("1[.]2[.]3[.]4"), "1.2.3.4")
+
+    def test_addr_rejections(self):
+        self.assertRejected(nexus.norm_addr, "not-an-ip", "invalid_ip")
+        self.assertRejected(nexus.norm_addr, "0.0.0.0", "unspecified_ip")
+        self.assertRejected(nexus.norm_addr, "127.0.0.1", "loopback_ip")
+        self.assertRejected(nexus.norm_addr, "224.0.0.1", "multicast_ip")
+        self.assertRejected(nexus.norm_addr, "169.254.1.1", "link_local_ip")
+        self.assertRejected(nexus.norm_addr, "10.0.0.0/8", "cidr_in_addr")
+        self.assertRejected(nexus.norm_addr, "", "empty")
+
+    def test_addr_rejects_embedded_tab(self):
+        self.assertRejected(nexus.norm_addr, "1.2.3.4\tIntel::ADDR",
+                            "control_char")
+
+    # -- subnets -----------------------------------------------------------
+
+    def test_subnet_ok(self):
+        self.assertEqual(nexus.norm_subnet("192.0.2.0/24"), "192.0.2.0/24")
+        self.assertEqual(nexus.norm_subnet("192.0.2.5/24"), "192.0.2.0/24")
+
+    def test_subnet_rejections(self):
+        self.assertRejected(nexus.norm_subnet, "1.2.3.4", "not_a_cidr")
+        self.assertRejected(nexus.norm_subnet, "0.0.0.0/0", "default_route")
+        self.assertRejected(nexus.norm_subnet, "10.0.0.0/8", "subnet_too_broad")
+        self.assertRejected(nexus.norm_subnet, "junk/24", "invalid_cidr")
+
+    # -- domains -----------------------------------------------------------
+
+    def test_domain_ok(self):
+        self.assertEqual(nexus.norm_domain("EVIL.com."), "evil.com")
+        self.assertEqual(nexus.norm_domain("*.evil.com"), "evil.com")
+        self.assertEqual(nexus.norm_domain("evil[.]com"), "evil.com")
+        self.assertEqual(nexus.norm_domain("_dmarc.evil.com"), "_dmarc.evil.com")
+
+    def test_domain_idna(self):
+        self.assertEqual(nexus.norm_domain("bücher.de"), "xn--bcher-kva.de")
+
+    def test_domain_rejections(self):
+        self.assertRejected(nexus.norm_domain, "com", "bare_tld")
+        self.assertRejected(nexus.norm_domain, "1.2.3.4", "ip_as_domain")
+        self.assertRejected(nexus.norm_domain, "evil.com/path", "not_a_domain")
+        self.assertRejected(nexus.norm_domain, "ev il.com", "not_a_domain")
+        self.assertRejected(nexus.norm_domain, "evil..com", "invalid_label")
+        self.assertRejected(nexus.norm_domain, "-evil.com", "invalid_label")
+        self.assertRejected(nexus.norm_domain, "a." + "b" * 64, "invalid_label")
+
+    # -- urls --------------------------------------------------------------
+
+    def test_url_strips_scheme(self):
+        self.assertEqual(nexus.norm_url("http://evil.com/a/b"), "evil.com/a/b")
+        self.assertEqual(nexus.norm_url("https://EVIL.com/A/B"), "evil.com/A/B")
+
+    def test_url_pathless_gets_a_root_slash(self):
+        # Zeek matches host+uri and a uri always starts with "/", so a
+        # pathless indicator would otherwise never fire.
+        self.assertEqual(nexus.norm_url("http://evil.com"), "evil.com/")
+
+    def test_url_drops_fragment_keeps_query(self):
+        self.assertEqual(nexus.norm_url("http://evil.com/a?b=1#frag"),
+                         "evil.com/a?b=1")
+
+    def test_url_defanged(self):
+        self.assertEqual(nexus.norm_url("hxxp://evil[.]com/a"), "evil.com/a")
+
+    def test_url_rejections(self):
+        self.assertRejected(nexus.norm_url, "http://", "empty_url")
+        self.assertRejected(nexus.norm_url, "http://evil com/a",
+                            "whitespace_in_url")
+        self.assertRejected(nexus.norm_url, "http://localhost-ish/a",
+                            "url_no_host")
+
+    # -- hashes ------------------------------------------------------------
+
+    def test_hash_ok(self):
+        self.assertEqual(nexus.norm_hash("D41D8CD98F00B204E9800998ECF8427E"),
+                         "d41d8cd98f00b204e9800998ecf8427e")
+        self.assertEqual(len(nexus.norm_hash("a" * 64)), 64)
+
+    def test_hash_rejections(self):
+        self.assertRejected(nexus.norm_hash, "z" * 32, "hash_not_hex")
+        self.assertRejected(nexus.norm_hash, "a" * 33, "hash_bad_length")
+
+    def test_cert_hash_is_sha1_only(self):
+        self.assertEqual(nexus.norm_cert_hash("AB:" * 19 + "AB"), "ab" * 20)
+        self.assertRejected(nexus.norm_cert_hash, "a" * 64, "cert_not_sha1")
+
+    # -- email / freeform --------------------------------------------------
+
+    def test_email_ok(self):
+        self.assertEqual(nexus.norm_email("<Bad@Evil.COM>"), "bad@evil.com")
+        self.assertEqual(nexus.norm_email("bad@evil[.]com"), "bad@evil.com")
+
+    def test_email_rejections(self):
+        self.assertRejected(nexus.norm_email, "not-an-email", "invalid_email")
+        self.assertRejected(nexus.norm_email, "a@b@c.com", "invalid_email")
+        self.assertRejected(nexus.norm_email, "@evil.com", "invalid_email")
+        self.assertRejected(nexus.norm_email, "bad@com", "bare_tld")
+
+    def test_filename_keeps_case_and_is_not_defanged(self):
+        self.assertEqual(nexus.norm_filename("Report(dot)exe"),
+                         "Report(dot)exe")
+        self.assertRejected(nexus.norm_filename, "a" * 256,
+                            "filename_too_long")
+
+    def test_normalise_dispatches_and_rejects_unknown_type(self):
+        self.assertEqual(nexus.normalise("1.2.3.4", "Intel::ADDR"), "1.2.3.4")
+        self.assertRejected(
+            lambda v: nexus.normalise(v, "Intel::NOPE"), "x",
+            "unknown_intel_type")
+
+    # -- metadata ----------------------------------------------------------
+
+    def test_sanitize_meta_strips_tabs_and_newlines(self):
+        self.assertEqual(nexus.sanitize_meta("a\tb\nc"), "a b c")
+        self.assertEqual(nexus.sanitize_meta("  spaced   out  "), "spaced out")
+
+    def test_sanitize_meta_nulls_and_truncates(self):
+        self.assertEqual(nexus.sanitize_meta(""), nexus.NULL_FIELD)
+        self.assertEqual(nexus.sanitize_meta(None), nexus.NULL_FIELD)
+        self.assertEqual(nexus.sanitize_meta("\t\n  "), nexus.NULL_FIELD)
+        self.assertEqual(len(nexus.sanitize_meta("x" * 500, maxlen=200)), 200)
+
+
+# ---------------------------------------------------------------------------
+# FILTERS
+# ---------------------------------------------------------------------------
+
+class TestExclusions(unittest.TestCase):
+
+    def test_private_addresses_excluded_by_default(self):
+        ex = nexus.ExclusionSet()
+        self.assertEqual(ex.reason("192.168.1.1", "Intel::ADDR"), "private_ip")
+        self.assertIsNone(ex.reason("1.2.3.4", "Intel::ADDR"))
+
+    def test_private_can_be_allowed(self):
+        ex = nexus.ExclusionSet(exclude_private=False)
+        self.assertIsNone(ex.reason("192.168.1.1", "Intel::ADDR"))
+
+    def test_own_network(self):
+        ex = nexus.ExclusionSet(own_networks=["45.33.32.0/24"])
+        self.assertEqual(ex.reason("45.33.32.9", "Intel::ADDR"), "own_network")
+        self.assertIsNone(ex.reason("8.8.8.8", "Intel::ADDR"))
+
+    def test_own_network_overlap_for_subnets(self):
+        ex = nexus.ExclusionSet(own_networks=["45.33.32.0/24"])
+        self.assertEqual(ex.reason("45.33.32.0/25", "Intel::SUBNET"),
+                         "own_network")
+
+    def test_own_domain_matches_subdomains_only_at_a_label_boundary(self):
+        ex = nexus.ExclusionSet(own_domains=["corp.example"])
+        self.assertEqual(ex.reason("corp.example", "Intel::DOMAIN"),
+                         "own_domain")
+        self.assertEqual(ex.reason("mail.corp.example", "Intel::DOMAIN"),
+                         "own_domain")
+        self.assertIsNone(ex.reason("notcorp.example", "Intel::DOMAIN"))
+
+    def test_own_domain_applies_to_urls_and_emails(self):
+        ex = nexus.ExclusionSet(own_domains=["corp.example"])
+        self.assertEqual(ex.reason("corp.example/a", "Intel::URL"), "own_domain")
+        self.assertEqual(ex.reason("bob@corp.example", "Intel::EMAIL"),
+                         "own_domain")
+
+    def test_allowlist(self):
+        ex = nexus.ExclusionSet(allowlist=["1.2.3.4"])
+        self.assertEqual(ex.reason("1.2.3.4", "Intel::ADDR"), "allowlisted")
+
+    def test_ipv4_ipv6_do_not_cross_match(self):
+        ex = nexus.ExclusionSet(own_networks=["45.33.32.0/24"])
+        self.assertIsNone(ex.reason("2606:4700::1111", "Intel::ADDR"))
+
+    def test_invalid_exclusion_network_is_ignored_not_fatal(self):
+        ex = nexus.ExclusionSet(own_networks=["not-a-network"])
+        self.assertEqual(ex.own_networks, [])
+
+
+# ---------------------------------------------------------------------------
+# BUILD + RENDER
+# ---------------------------------------------------------------------------
+
+def sample_records():
+    return [
+        {"type": "ip-dst", "value": "45.33.32.7", "category": "Network activity",
+         "to_ids": True, "uuid": "u1", "comment": "c2", "event_id": "42",
+         "event_uuid": "e-42", "event_info": "Emotet infrastructure",
+         "event_tags": ["tlp:amber", "malware:emotet"], "org": "CIRCL"},
+        {"type": "domain|ip", "value": "evil.example|45.33.32.8",
+         "category": "Network activity", "to_ids": True, "uuid": "u2",
+         "comment": "", "event_id": "42", "event_uuid": "e-42",
+         "event_info": "Emotet infrastructure", "event_tags": [], "org": "CIRCL"},
+        {"type": "url", "value": "http://evil.example/gate.php",
+         "category": "Network activity", "to_ids": True, "uuid": "u3",
+         "comment": "", "event_id": "43", "event_uuid": "e-43",
+         "event_info": "Panel\twith\ttabs", "event_tags": [], "org": "CIRCL"},
+        # duplicate of the first record, different event
+        {"type": "ip-src", "value": "45.33.32.7", "category": "Network activity",
+         "to_ids": True, "uuid": "u4", "comment": "", "event_id": "44",
+         "event_uuid": "e-44", "event_info": "Other", "event_tags": [],
+         "org": "CIRCL"},
+        # private -- excluded
+        {"type": "ip-dst", "value": "10.1.2.3", "category": "Network activity",
+         "to_ids": True, "uuid": "u5", "comment": "", "event_id": "45",
+         "event_uuid": "e-45", "event_info": "Internal", "event_tags": [],
+         "org": "CIRCL"},
+        # malformed -- rejected
+        {"type": "md5", "value": "nope", "category": "Payload delivery",
+         "to_ids": True, "uuid": "u6", "comment": "", "event_id": "46",
+         "event_uuid": "e-46", "event_info": "Bad hash", "event_tags": [],
+         "org": "CIRCL"},
+        # unmappable type -- tallied
+        {"type": "ssdeep", "value": "3:abc", "category": "Payload delivery",
+         "to_ids": True, "uuid": "u7", "comment": "", "event_id": "47",
+         "event_uuid": "e-47", "event_info": "Fuzzy", "event_tags": [],
+         "org": "CIRCL"},
+    ]
+
+
+GOLDEN = """#fields\tindicator\tindicator_type\tmeta.source\tmeta.desc\tmeta.url
+45.33.32.7\tIntel::ADDR\tMISP-event-42\tEmotet infrastructure | Network activity\thttps://misp.example/events/view/42
+evil.example\tIntel::DOMAIN\tMISP-event-42\tEmotet infrastructure | Network activity\thttps://misp.example/events/view/42
+45.33.32.8\tIntel::ADDR\tMISP-event-42\tEmotet infrastructure | Network activity\thttps://misp.example/events/view/42
+evil.example/gate.php\tIntel::URL\tMISP-event-43\tPanel with tabs | Network activity\thttps://misp.example/events/view/43
+"""
+
+
+class TestBuild(unittest.TestCase):
+
+    def build(self, **kwargs):
+        params = dict(
+            exclusions=nexus.ExclusionSet(),
+            source_fmt="MISP-event-{event_id}",
+            desc_template="{event_info} | {category}",
+            misp_base_url="https://misp.example",
+        )
+        params.update(kwargs)
+        return nexus.build_indicators(sample_records(), **params)
+
+    def test_golden_file_output(self):
+        rows, _ = self.build()
+        body = "\n".join([nexus.header_line()] + nexus.rows_to_lines(rows)) + "\n"
+        self.assertEqual(body, GOLDEN)
+
+    def test_stats_account_for_every_input(self):
+        _, stats = self.build()
+        self.assertEqual(stats.fetched, 7)
+        self.assertEqual(stats.emitted, 4)
+        self.assertEqual(stats.duplicates, 1)
+        self.assertEqual(stats.excluded, {"private_ip": 1})
+        self.assertEqual(stats.rejected, {"hash_not_hex": 1})
+        self.assertEqual(stats.unmapped, {"ssdeep": 1})
+        self.assertEqual(stats.by_type,
+                         {"Intel::ADDR": 2, "Intel::DOMAIN": 1, "Intel::URL": 1})
+
+    def test_report_is_printable(self):
+        _, stats = self.build()
+        report = stats.report()
+        self.assertIn("fetched 7 attributes -> 4 indicators", report)
+        self.assertIn("private_ip", report)
+
+    def test_type_selection_filters_input(self):
+        rows, stats = self.build(types=["ip-dst"])
+        self.assertEqual([r[1] for r in rows], ["Intel::ADDR"])
+        # types the operator did not select are skipped, not tallied as unmapped
+        self.assertEqual(stats.unmapped, {})
+
+    def test_dedup_is_per_indicator_and_type(self):
+        records = [
+            {"type": "domain", "value": "evil.example", "event_id": "1"},
+            {"type": "hostname", "value": "evil.example", "event_id": "2"},
+        ]
+        rows, stats = nexus.build_indicators(records)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(stats.duplicates, 1)
+
+    def test_do_notice_column(self):
+        rows, _ = self.build(do_notice=True)
+        lines = nexus.rows_to_lines(rows, do_notice=True)
+        self.assertTrue(lines[0].endswith("\tT"))
+        self.assertEqual(len(lines[0].split("\t")), 6)
+
+    def test_tab_in_metadata_never_reaches_the_file(self):
+        rows, _ = self.build()
+        for line in nexus.rows_to_lines(rows):
+            self.assertEqual(len(line.split("\t")), 5)
+
+    def test_missing_metadata_becomes_the_null_field(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "domain", "value": "evil.example"}])
+        line = nexus.rows_to_lines(rows)[0]
+        self.assertEqual(line,
+                         "evil.example\tIntel::DOMAIN\tMISP\t-\t-")
+
+
+# ---------------------------------------------------------------------------
+# LINT
+# ---------------------------------------------------------------------------
+
+class TestLint(unittest.TestCase):
+
+    def lines(self, *body):
+        return [nexus.header_line()] + list(body)
+
+    def test_clean_file_has_no_problems(self):
+        self.assertEqual(
+            nexus.lint_lines(self.lines("1.2.3.4\tIntel::ADDR\tMISP\t-\t-")), [])
+
+    def test_bad_header(self):
+        problems = nexus.lint_lines(["#fields\tindicator", "x"])
+        self.assertTrue(any("header must be exactly" in p for p in problems))
+
+    def test_wrong_column_count(self):
+        problems = nexus.lint_lines(self.lines("1.2.3.4\tIntel::ADDR"))
+        self.assertTrue(any("expected 5 tab-separated fields" in p
+                            for p in problems))
+
+    def test_invalid_intel_type(self):
+        problems = nexus.lint_lines(self.lines("1.2.3.4\tIntel::IP\tMISP\t-\t-"))
+        self.assertTrue(any("not a valid Intel::Type" in p for p in problems))
+
+    def test_empty_field_and_blank_line(self):
+        problems = nexus.lint_lines(
+            self.lines("1.2.3.4\tIntel::ADDR\t\t-\t-", ""))
+        self.assertTrue(any("empty field" in p for p in problems))
+        self.assertTrue(any("blank line" in p for p in problems))
+
+    def test_whitespace_problems(self):
+        problems = nexus.lint_lines(
+            self.lines(" 1.2.3.4\tIntel::ADDR\tMISP\t-\t-"))
+        self.assertTrue(any("leading or trailing whitespace" in p
+                            for p in problems))
+        problems = nexus.lint_lines(
+            self.lines("1.2.3.4 \tIntel::ADDR\tMISP\t-\t-"))
+        self.assertTrue(any("space adjacent to a tab" in p for p in problems))
+
+    def test_filename_with_spaces_is_not_flagged(self):
+        self.assertEqual(
+            nexus.lint_lines(
+                self.lines("my  bad file.exe\tIntel::FILE_NAME\tMISP\t-\t-")),
+            [])
+
+    def test_duplicate_indicator(self):
+        row = "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"
+        problems = nexus.lint_lines(self.lines(row, row))
+        self.assertTrue(any("duplicate indicator" in p for p in problems))
+
+    def test_do_notice_column_validated(self):
+        good = nexus.header_line(True) + "\n"
+        problems = nexus.lint_lines(
+            [nexus.header_line(True), "1.2.3.4\tIntel::ADDR\tMISP\t-\t-\tT"],
+            do_notice=True)
+        self.assertEqual(problems, [])
+        problems = nexus.lint_lines(
+            [nexus.header_line(True), "1.2.3.4\tIntel::ADDR\tMISP\t-\t-\tyes"],
+            do_notice=True)
+        self.assertTrue(any("must be T or F" in p for p in problems))
+        self.assertTrue(good)
+
+    def test_writer_output_always_passes_the_linter(self):
+        rows, _ = nexus.build_indicators(sample_records(),
+                                         exclusions=nexus.ExclusionSet())
+        lines = [nexus.header_line()] + nexus.rows_to_lines(rows)
+        self.assertEqual(nexus.lint_lines(lines), [])
+
+
+# ---------------------------------------------------------------------------
+# FILE I/O
+# ---------------------------------------------------------------------------
+
+class TestFileIO(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nexus-test-")
+        self.path = os.path.join(self.tmp, "intel.dat")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, lines):
+        return nexus.write_atomic(self.path, lines)
+
+    def test_exactly_one_trailing_newline(self):
+        self.write([nexus.header_line(), "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"])
+        with open(self.path) as handle:
+            content = handle.read()
+        self.assertTrue(content.endswith("-\n"))
+        self.assertFalse(content.endswith("\n\n"))
+
+    def test_written_file_passes_lint_file(self):
+        self.write([nexus.header_line(), "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"])
+        self.assertEqual(nexus.lint_file(self.path), [])
+
+    def test_lint_file_flags_trailing_blank_line(self):
+        with open(self.path, "w") as handle:
+            handle.write(nexus.header_line() +
+                         "\n1.2.3.4\tIntel::ADDR\tMISP\t-\t-\n\n")
+        self.assertTrue(any("blank line" in p
+                            for p in nexus.lint_file(self.path)))
+
+    def test_lint_file_flags_missing_final_newline(self):
+        with open(self.path, "w") as handle:
+            handle.write(nexus.header_line() +
+                         "\n1.2.3.4\tIntel::ADDR\tMISP\t-\t-")
+        self.assertIn("file does not end with a newline",
+                      nexus.lint_file(self.path))
+
+    def test_atomic_write_preserves_mode(self):
+        self.write([nexus.header_line()])
+        os.chmod(self.path, 0o640)
+        self.write([nexus.header_line(), "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"])
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o640)
+
+    def test_no_temp_files_left_behind(self):
+        self.write([nexus.header_line()])
+        leftovers = [f for f in os.listdir(self.tmp) if f.startswith(".nexus-")]
+        self.assertEqual(leftovers, [])
+
+    def test_read_existing(self):
+        self.write([nexus.header_line(),
+                    "1.2.3.4\tIntel::ADDR\tMISP\t-\t-",
+                    "5.6.7.8\tIntel::ADDR\thand-added\t-\t-"])
+        header, rows = nexus.read_existing(self.path)
+        self.assertTrue(header.startswith("#fields"))
+        self.assertEqual(len(rows), 2)
+
+    def test_read_existing_missing_file(self):
+        header, rows = nexus.read_existing(os.path.join(self.tmp, "nope.dat"))
+        self.assertIsNone(header)
+        self.assertEqual(rows, [])
+
+    def test_merge_preserves_hand_added_rows_only(self):
+        rows = ["1.2.3.4\tIntel::ADDR\tMISP-event-1\t-\t-",
+                "5.6.7.8\tIntel::ADDR\thand-added\t-\t-"]
+        preserved = nexus.merge_preserved(rows, source_prefix="MISP")
+        self.assertEqual(preserved, ["5.6.7.8\tIntel::ADDR\thand-added\t-\t-"])
+
+    def test_additive_merge_never_removes_or_rewrites_existing(self):
+        existing = [
+            "old.example\tIntel::DOMAIN\tMISP-old\told metadata\t-",
+            "manual.example\tIntel::DOMAIN\tmanual\tkeep me\t-",
+        ]
+        fresh = [
+            "old.example\tIntel::DOMAIN\tMISP-new\tnew metadata\t-",
+            "new.example\tIntel::DOMAIN\tMISP-new\tnew IOC\t-",
+        ]
+        self.assertEqual(nexus.merge_additive(existing, fresh),
+                         existing + [fresh[1]])
+
+    def test_backup_and_retention(self):
+        backups = os.path.join(self.tmp, "backups")
+        self.write([nexus.header_line()])
+        first = nexus.backup_file(self.path, backups, retention=2)
+        self.assertTrue(os.path.exists(first))
+        for _ in range(4):
+            nexus.backup_file(self.path, backups, retention=2)
+        self.assertLessEqual(len(os.listdir(backups)), 2)
+
+    def test_backup_of_missing_file_is_a_noop(self):
+        self.assertIsNone(nexus.backup_file(
+            os.path.join(self.tmp, "nope.dat"), self.tmp))
+
+    def test_round_trip_build_write_lint(self):
+        rows, _ = nexus.build_indicators(
+            sample_records(), exclusions=nexus.ExclusionSet(),
+            source_fmt="MISP-event-{event_id}",
+            desc_template="{event_info} | {category}",
+            misp_base_url="https://misp.example")
+        self.write([nexus.header_line()] + nexus.rows_to_lines(rows))
+        self.assertEqual(nexus.lint_file(self.path), [])
+        _, parsed = nexus.read_existing(self.path)
+        self.assertEqual(len(parsed), 4)
+
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT CHECK
+# ---------------------------------------------------------------------------
+
+class TestCheckEnv(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nexus-env-")
+        self.intel = os.path.join(self.tmp, "local")
+        self.default = os.path.join(self.tmp, "default")
+        os.makedirs(self.intel)
+        os.makedirs(self.default)
+        open(os.path.join(self.default, nexus.SO_LOAD_FILE), "w").close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def messages(self, findings, level=None):
+        return [m for lvl, m in findings if level is None or lvl == level]
+
+    def test_missing_load_file_fails_and_suggests_the_fix(self):
+        ok, findings = check = nexus.check_env(self.intel, self.default)
+        self.assertFalse(ok)
+        self.assertTrue(any(nexus.SO_LOAD_FILE in m and "MISSING" in m
+                            for m in self.messages(findings, "error")))
+        self.assertTrue(any(m.startswith("sudo cp")
+                            for m in self.messages(findings, "fix")))
+        self.assertTrue(check)
+
+    def test_load_file_present_passes(self):
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        ok, findings = nexus.check_env(self.intel, self.default)
+        self.assertTrue(ok)
+        self.assertTrue(any("present" in m for m in self.messages(findings)))
+
+    def test_notice_policy_is_detected(self):
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        policy = os.path.join(self.tmp, "policy")
+        os.makedirs(policy)
+        with open(os.path.join(policy, "local.zeek"), "w") as handle:
+            handle.write("@load policy/frameworks/intel/do_notice.zeek\n")
+        _, findings = nexus.check_env(self.intel, self.default, (policy,))
+        self.assertTrue(any("do_notice.zeek is loaded" in m
+                            for m in self.messages(findings, "info")))
+
+    def test_notice_policy_missing_warns(self):
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        _, findings = nexus.check_env(self.intel, self.default, ())
+        self.assertTrue(any("do_notice.zeek is not loaded" in m
+                            for m in self.messages(findings, "warn")))
+
+    def test_missing_intel_dir_fails_early(self):
+        ok, findings = nexus.check_env(os.path.join(self.tmp, "nope"),
+                                       self.default)
+        self.assertFalse(ok)
+        self.assertTrue(any("intel directory missing" in m
+                            for m in self.messages(findings, "error")))
+
+    def test_apply_command_is_the_3x_form(self):
+        _, findings = nexus.check_env(self.intel, self.default)
+        apply_msgs = [m for m in self.messages(findings) if "state.apply" in m]
+        self.assertTrue(apply_msgs)
+        self.assertIn("I@zeek:enabled:true", apply_msgs[0])
+
+
+# ---------------------------------------------------------------------------
+# MISP CLIENT (against a local fake)
+# ---------------------------------------------------------------------------
+
+class FakeMispHandler(BaseHTTPRequestHandler):
+    """Replays canned MISP responses.  Behaviour driven by server.script."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, payload, extra_headers=None):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.server.calls.append(("GET", self.path))
+        if self.headers.get("Authorization") != self.server.token:
+            self._send(403, {"message": "Authentication failed"})
+            return
+        if self.path == "/servers/getVersion":
+            self._send(200, {"version": "2.5.0", "perm_sync": False})
+        elif self.path == "/attributes/describeTypes":
+            self._send(200, {"result": {"types": ["ip-dst", "domain", "ssdeep"],
+                                        "categories": ["Network activity"]}})
+        elif self.path == "/tags":
+            self._send(200, {"Tag": [{"id": "1", "name": "tlp:amber"}]})
+        elif self.path == "/organisations":
+            self._send(200, [{"Organisation": {"id": "1", "name": "CIRCL"}}])
+        elif self.path == "/feeds":
+            self._send(200, getattr(self.server, "feeds", []))
+        else:
+            self._send(404, {"message": "no such endpoint"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        self.server.calls.append(("POST", self.path, body))
+
+        if self.headers.get("Authorization") != self.server.token:
+            self._send(403, {"message": "Authentication failed"})
+            return
+
+        step = self.server.script.pop(0) if self.server.script else ("ok", [])
+        kind = step[0]
+        if kind == "flaky":
+            self._send(503, {"message": "busy"})
+        elif kind == "malformed":
+            raw = b"{not json"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif kind == "count":
+            self._send(200, {"response": {"Attribute": []}},
+                       {"X-Result-Count": str(step[1])})
+        else:
+            self._send(200, {"response": {"Attribute": step[1]}})
+
+
+class FakeMisp(object):
+    def __init__(self, token="test-token-1234", script=None):
+        self.server = HTTPServer(("127.0.0.1", 0), FakeMispHandler)
+        self.server.token = token
+        self.server.script = list(script or [])
+        self.server.feeds = []
+        self.server.calls = []
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    def client(self, token="test-token-1234", **kwargs):
+        params = dict(host="127.0.0.1", token=token, scheme="http",
+                      port=self.port, timeout=5, retries=2)
+        params.update(kwargs)
+        return nexus.MispClient(**params)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def attr(value, misp_type="ip-dst", event_id="1"):
+    return {"value": value, "type": misp_type, "category": "Network activity",
+            "to_ids": "1", "uuid": "u-" + value, "event_id": event_id,
+            "Event": {"id": event_id, "info": "Event %s" % event_id,
+                      "uuid": "e-" + event_id,
+                      "Orgc": {"name": "CIRCL"},
+                      "Tag": [{"name": "tlp:amber"}]}}
+
+
+class TestMispClient(unittest.TestCase):
+
+    def setUp(self):
+        self.misp = None
+
+    def tearDown(self):
+        if self.misp:
+            self.misp.close()
+
+    def test_get_version_and_discovery(self):
+        self.misp = FakeMisp()
+        client = self.misp.client()
+        self.assertEqual(client.get_version()["version"], "2.5.0")
+        self.assertEqual(client.describe_types()["types"],
+                         ["ip-dst", "domain", "ssdeep"])
+        self.assertEqual(client.get_tags()[0]["name"], "tlp:amber")
+        self.assertEqual(client.get_orgs()[0]["name"], "CIRCL")
+
+    def test_bad_token_raises_auth_error(self):
+        self.misp = FakeMisp()
+        client = self.misp.client(token="wrong-token-9999")
+        with self.assertRaises(nexus.MispAuthError):
+            client.get_version()
+
+    def test_unreachable_host_raises_misp_error(self):
+        client = nexus.MispClient(host="127.0.0.1", token="t" * 12,
+                                  scheme="http", port=1, timeout=1, retries=1)
+        with self.assertRaises(nexus.MispError):
+            client.get_version()
+
+    def test_pagination_walks_until_short_page(self):
+        page1 = [attr("45.33.32.%d" % i) for i in range(1, 4)]
+        page2 = [attr("45.33.32.%d" % i) for i in range(4, 6)]
+        self.misp = FakeMisp(script=[("ok", page1), ("ok", page2)])
+        client = self.misp.client(page_size=3)
+        records = list(client.search_attributes({"type": "ip-dst"}))
+        self.assertEqual(len(records), 5)
+        pages = [c[2]["page"] for c in self.misp.server.calls if c[0] == "POST"]
+        self.assertEqual(pages, [1, 2])
+
+    def test_pagination_stops_on_empty_page(self):
+        page1 = [attr("45.33.32.%d" % i) for i in range(1, 4)]
+        self.misp = FakeMisp(script=[("ok", page1), ("ok", [])])
+        client = self.misp.client(page_size=3)
+        self.assertEqual(len(list(client.search_attributes({}))), 3)
+
+    def test_max_results_stops_mid_page(self):
+        page1 = [attr("45.33.32.%d" % i) for i in range(1, 6)]
+        self.misp = FakeMisp(script=[("ok", page1)])
+        client = self.misp.client(page_size=5)
+        records = list(client.search_attributes({}, max_results=2))
+        self.assertEqual(len(records), 2)
+
+    def test_retry_on_503_then_success(self):
+        self.misp = FakeMisp(script=[("flaky",), ("ok", [attr("1.2.3.4")])])
+        client = self.misp.client(retries=3)
+        records = list(client.search_attributes({}))
+        self.assertEqual(len(records), 1)
+
+    def test_malformed_json_raises(self):
+        self.misp = FakeMisp(script=[("malformed",)])
+        client = self.misp.client()
+        with self.assertRaises(nexus.MispError):
+            list(client.search_attributes({}))
+
+    def test_count_type_uses_the_result_count_header(self):
+        self.misp = FakeMisp(script=[("count", 1234)])
+        client = self.misp.client()
+        count, exact = client.count_type("ip-dst")
+        self.assertEqual((count, exact), (1234, True))
+
+    def test_count_type_falls_back_to_a_bounded_probe(self):
+        self.misp = FakeMisp(script=[("ok", [attr("1.2.3.%d" % i)
+                                             for i in range(1, 4)])])
+        client = self.misp.client()
+        count, exact = client.count_type("ip-dst", probe_limit=10)
+        self.assertEqual((count, exact), (3, True))
+
+    def test_count_probe_reports_inexact_at_the_ceiling(self):
+        self.misp = FakeMisp(script=[("ok", [attr("1.2.3.%d" % i)
+                                             for i in range(1, 4)])])
+        client = self.misp.client()
+        count, exact = client.count_type("ip-dst", probe_limit=3)
+        self.assertEqual((count, exact), (3, False))
+
+    def test_end_to_end_fetch_to_intel_lines(self):
+        page = [attr("45.33.32.7"), attr("evil.example", "domain", "2")]
+        self.misp = FakeMisp(script=[("ok", page)])
+        client = self.misp.client(page_size=10)
+        rows, stats = nexus.build_indicators(
+            client.search_attributes({}),
+            exclusions=nexus.ExclusionSet(),
+            source_fmt="MISP-event-{event_id}",
+            desc_template="{event_info} | {tags}",
+            misp_base_url="https://misp.example")
+        lines = nexus.rows_to_lines(rows)
+        self.assertEqual(stats.emitted, 2)
+        self.assertEqual(
+            lines[0],
+            "45.33.32.7\tIntel::ADDR\tMISP-event-1\tEvent 1 | tlp:amber"
+            "\thttps://misp.example/events/view/1")
+        self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
+
+
+class TestFlatten(unittest.TestCase):
+
+    def test_flatten_pulls_event_context_and_tags(self):
+        record = nexus.flatten_attribute(attr("1.2.3.4"))
+        self.assertEqual(record["value"], "1.2.3.4")
+        self.assertEqual(record["event_info"], "Event 1")
+        self.assertEqual(record["event_tags"], ["tlp:amber"])
+        self.assertEqual(record["org"], "CIRCL")
+        self.assertIs(record["to_ids"], True)
+
+    def test_to_ids_string_zero_is_false(self):
+        raw = attr("1.2.3.4")
+        raw["to_ids"] = "0"
+        self.assertIs(nexus.flatten_attribute(raw)["to_ids"], False)
+
+    def test_flatten_tolerates_a_bare_attribute(self):
+        record = nexus.flatten_attribute({"value": "1.2.3.4", "type": "ip-dst"})
+        self.assertEqual(record["event_info"], "")
+        self.assertEqual(record["event_tags"], [])
+
+    def test_attribute_and_event_tags_are_merged_without_duplicates(self):
+        raw = attr("1.2.3.4")
+        raw["Tag"] = [{"name": "tlp:amber"}, {"name": "malware:emotet"}]
+        self.assertEqual(nexus.flatten_attribute(raw)["event_tags"],
+                         ["tlp:amber", "malware:emotet"])
+
+
+# ---------------------------------------------------------------------------
+# REGRESSIONS
+#
+# One test per defect found in review.  Each failed before its fix.
+# ---------------------------------------------------------------------------
+
+class TestRegressions(unittest.TestCase):
+
+    def test_every_mapped_hash_type_survives_a_real_digest(self):
+        # sha224 is 56 hex chars and was missing from VALID_HASH_LENGTHS, so
+        # every sha224 attribute was dropped as hash_bad_length.
+        import hashlib
+        for name in ("md5", "sha1", "sha224", "sha256", "sha384", "sha512"):
+            with self.subTest(algorithm=name):
+                digest = getattr(hashlib, name)(b"nexus").hexdigest()
+                self.assertEqual(nexus.norm_hash(digest), digest)
+                self.assertIn(name, nexus.MISP_TO_ZEEK)
+
+    def test_email_is_rebuilt_from_the_normalised_domain(self):
+        # norm_email validated the domain half but returned the raw input.
+        self.assertEqual(nexus.norm_email("bad@EVIL.com."), "bad@evil.com")
+        self.assertEqual(nexus.norm_email("bad@*.evil.com"), "bad@evil.com")
+
+    def test_email_rejects_a_display_name(self):
+        with self.assertRaises(nexus.Rejected):
+            nexus.norm_email("Bad Person <bad@evil.com>")
+
+    def test_url_strips_userinfo(self):
+        # Credentials never appear in the host header Zeek matches against.
+        self.assertEqual(nexus.norm_url("http://user:pass@evil.com/a"),
+                         "evil.com/a")
+
+    def test_url_host_must_be_a_real_domain_or_address(self):
+        with self.assertRaises(nexus.Rejected):
+            nexus.norm_url("http://.../a")
+
+    def test_subnet_rejects_loopback_multicast_link_local(self):
+        for value, reason in (("127.0.0.0/24", "loopback_subnet"),
+                              ("224.0.0.0/16", "multicast_subnet"),
+                              ("169.254.0.0/16", "link_local_subnet")):
+            with self.subTest(value=value):
+                with self.assertRaises(nexus.Rejected) as ctx:
+                    nexus.norm_subnet(value)
+                self.assertEqual(ctx.exception.reason, reason)
+
+    def test_exclusion_reason_tolerates_an_unnormalised_value(self):
+        # Public method; used to raise ValueError out of ipaddress.
+        self.assertIsNone(nexus.ExclusionSet().reason("not-an-ip",
+                                                      "Intel::ADDR"))
+        self.assertIsNone(nexus.ExclusionSet().reason("junk/24",
+                                                      "Intel::SUBNET"))
+
+    def test_allowlist_matches_normalised_indicators(self):
+        ex = nexus.ExclusionSet(allowlist=["EVIL.com"])
+        self.assertEqual(ex.reason("evil.com", "Intel::DOMAIN"), "allowlisted")
+
+    def test_do_notice_column_survives_rows_built_without_it(self):
+        rows, _ = nexus.build_indicators([{"type": "domain",
+                                           "value": "evil.example"}])
+        lines = [nexus.header_line(True)] + nexus.rows_to_lines(rows,
+                                                                do_notice=True)
+        self.assertEqual(nexus.lint_lines(lines, do_notice=True), [])
+
+    def test_lint_ignores_operator_comments(self):
+        self.assertEqual(
+            nexus.lint_lines([nexus.header_line(), "# operator note",
+                              "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"]), [])
+
+    def test_bad_template_falls_back_instead_of_aborting_the_build(self):
+        source, _, _ = nexus.render_meta({"event_id": "1"},
+                                         source_fmt="TI-{nope}")
+        self.assertEqual(source, "TI-{nope}")
+
+    def test_backup_retention_zero_prunes_everything(self):
+        tmp = tempfile.mkdtemp(prefix="nexus-ret-")
+        try:
+            path = os.path.join(tmp, "intel.dat")
+            nexus.write_atomic(path, [nexus.header_line()])
+            backups = os.path.join(tmp, "backups")
+            os.makedirs(backups)
+            for stamp in ("20260101T000000Z", "20260102T000000Z"):
+                open(os.path.join(backups, "intel.dat." + stamp), "w").close()
+            nexus.backup_file(path, backups, retention=0)
+            self.assertEqual(os.listdir(backups), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_backup_retention_keeps_exactly_n_newest(self):
+        tmp = tempfile.mkdtemp(prefix="nexus-ret-")
+        try:
+            path = os.path.join(tmp, "intel.dat")
+            nexus.write_atomic(path, [nexus.header_line()])
+            backups = os.path.join(tmp, "backups")
+            os.makedirs(backups)
+            stamps = ["2026010%dT000000Z" % i for i in range(1, 6)]
+            for stamp in stamps:
+                open(os.path.join(backups, "intel.dat." + stamp), "w").close()
+            nexus.backup_file(path, backups, retention=3)
+            # 5 pre-existing + 1 fresh, newest 3 kept.
+            self.assertEqual(len(os.listdir(backups)), 3)
+            self.assertNotIn("intel.dat." + stamps[0], os.listdir(backups))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_write_atomic_follows_a_symlink(self):
+        # os.replace on the link would orphan the real file.
+        tmp = tempfile.mkdtemp(prefix="nexus-link-")
+        try:
+            real = os.path.join(tmp, "real.dat")
+            link = os.path.join(tmp, "intel.dat")
+            nexus.write_atomic(real, [nexus.header_line()])
+            os.symlink(real, link)
+            nexus.write_atomic(link, [nexus.header_line(),
+                                      "1.2.3.4\tIntel::ADDR\tMISP\t-\t-"])
+            self.assertTrue(os.path.islink(link))
+            _, rows = nexus.read_existing(real)
+            self.assertEqual(len(rows), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_write_atomic_leaves_no_temp_file_on_failure(self):
+        tmp = tempfile.mkdtemp(prefix="nexus-fail-")
+        try:
+            path = os.path.join(tmp, "intel.dat")
+            with self.assertRaises(TypeError):
+                nexus.write_atomic(path, [nexus.header_line(), object()])
+            self.assertEqual([f for f in os.listdir(tmp)
+                              if f.startswith(".nexus-")], [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_non_ascii_metadata_round_trips(self):
+        tmp = tempfile.mkdtemp(prefix="nexus-utf8-")
+        try:
+            path = os.path.join(tmp, "intel.dat")
+            rows, _ = nexus.build_indicators(
+                [{"type": "domain", "value": "evil.example",
+                  "event_info": "Kampagne \u00fcber M\u00fcnchen"}],
+                desc_template="{event_info}")
+            nexus.write_atomic(path,
+                               [nexus.header_line()] + nexus.rows_to_lines(rows))
+            self.assertEqual(nexus.lint_file(path), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_retries_zero_still_sends_one_request(self):
+        client = nexus.MispClient(host="127.0.0.1", token="t" * 12,
+                                  scheme="http", port=1, timeout=1, retries=0)
+        self.assertEqual(client.retries, 1)
+        with self.assertRaises(nexus.MispError) as ctx:
+            client.get_version()
+        self.assertIn("could not reach", str(ctx.exception))
+
+    def test_pagination_terminates_when_misp_ignores_the_page_parameter(self):
+        # A repeated full page must stop without imposing a global ceiling.
+        full = [attr("45.33.32.%d" % i) for i in range(1, 4)]
+        misp = FakeMisp(script=[("ok", full)] * 20)
+        try:
+            client = misp.client(page_size=3)
+            records = list(client.search_attributes({}, max_pages=5))
+            self.assertEqual(len(records), 3)
+        finally:
+            misp.close()
+
+    def test_traceback_carrying_the_token_is_redacted(self):
+        # Filters run before formatting, so exc_text is None at filter time --
+        # the formatter is what actually catches this.
+        import logging as _logging
+        token = "traceback-secret-token"
+        nexus.REDACTOR.add_secret(token)
+        formatter = nexus.RedactingFormatter("%(message)s")
+        try:
+            raise ValueError("auth failed for " + token)
+        except ValueError:
+            record = _logging.LogRecord("nexus", _logging.ERROR, __file__, 1,
+                                        "request failed", None,
+                                        sys.exc_info())
+        self.assertNotIn(token, formatter.format(record))
+
+    def test_non_string_log_message_is_redacted(self):
+        token = "object-msg-secret-token"
+        nexus.REDACTOR.add_secret(token)
+        formatter = nexus.RedactingFormatter("%(message)s")
+        record = logging_record(ValueError("boom " + token))
+        self.assertNotIn(token, formatter.format(record))
+
+
+# ---------------------------------------------------------------------------
+# LOGGING REDACTION
+# ---------------------------------------------------------------------------
+
+class TestRedaction(unittest.TestCase):
+
+    def test_token_is_scrubbed_from_log_records(self):
+        redactor = nexus.RedactingFilter()
+        redactor.add_secret("supersecrettoken123")
+        record = logging_record("token is supersecrettoken123 here")
+        redactor.filter(record)
+        self.assertNotIn("supersecrettoken123", record.msg)
+        self.assertIn("***REDACTED***", record.msg)
+
+    def test_token_is_scrubbed_from_args(self):
+        redactor = nexus.RedactingFilter()
+        redactor.add_secret("supersecrettoken123")
+        record = logging_record("url %s", ("https://x/?k=supersecrettoken123",))
+        redactor.filter(record)
+        self.assertNotIn("supersecrettoken123", record.args[0])
+
+    def test_short_strings_are_not_treated_as_secrets(self):
+        redactor = nexus.RedactingFilter()
+        redactor.add_secret("abc")
+        record = logging_record("abc def")
+        redactor.filter(record)
+        self.assertEqual(record.msg, "abc def")
+
+    def test_client_registers_its_token_for_redaction(self):
+        token = "another-secret-token"
+        nexus.MispClient(host="127.0.0.1", token=token, scheme="http", port=1)
+        record = logging_record("leaking " + token)
+        nexus.REDACTOR.filter(record)
+        self.assertNotIn(token, record.msg)
+
+
+def logging_record(msg, args=None):
+    import logging
+    return logging.LogRecord("nexus", logging.INFO, __file__, 1, msg, args, None)
+
+
+
+
+# ---------------------------------------------------------------------------
+# HARNESS
+# ---------------------------------------------------------------------------
+
+def scripted(answers, fill=None, limit=500):
+    """Fake `input`.  Replays `answers`, then `fill`, or EOF when fill is None."""
+    state = {"reads": 0, "prompts": []}
+
+    def _input(prompt=""):
+        state["prompts"].append(prompt)
+        state["reads"] += 1
+        if state["reads"] > limit:
+            raise AssertionError("more than %d prompts -- stuck in a loop" % limit)
+        index = state["reads"] - 1
+        if index < len(answers):
+            return answers[index]
+        if fill is None:
+            raise EOFError()
+        return fill
+
+    _input.state = state
+    return _input
+
+
+def by_prompt(rules, fill=""):
+    """Fake `input` that answers on prompt text rather than call order."""
+    def _input(prompt=""):
+        for needle, answer in rules:
+            if needle in prompt:
+                return answer
+        return fill
+    return _input
+
+
+def boom(exc):
+    def _raise(prompt=""):
+        raise exc
+    return _raise
+
+
+class Quiet(unittest.TestCase):
+    """Swallows the prompt output; `self.printed` exposes it for assertions."""
+
+    def setUp(self):
+        self.buffer = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.buffer)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    @property
+    def printed(self):
+        return self.buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# PROMPT PRIMITIVES
+# ---------------------------------------------------------------------------
+
+class TestAsk(Quiet):
+
+    def test_returns_the_typed_answer(self):
+        self.assertEqual(nexus.ask("Host", None, scripted(["a.example"])),
+                         "a.example")
+
+    def test_enter_accepts_the_default(self):
+        self.assertEqual(nexus.ask("Host", "misp.local", scripted([""])),
+                         "misp.local")
+
+    def test_default_is_shown_in_brackets(self):
+        fake = scripted([""])
+        nexus.ask("Host", "misp.local", fake)
+        self.assertIn("[misp.local]", fake.state["prompts"][0])
+
+    def test_no_default_and_no_answer_is_empty(self):
+        self.assertEqual(nexus.ask("Proxy", None, scripted([""])), "")
+
+    def test_answer_is_stripped(self):
+        self.assertEqual(nexus.ask("Host", None, scripted(["  a  "])), "a")
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask("Host", None, boom(EOFError()))
+
+    def test_ctrl_c_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask("Host", None, boom(KeyboardInterrupt()))
+
+    def test_ask_required_reprompts_until_answered(self):
+        fake = scripted(["", "  ", "misp.local"])
+        self.assertEqual(nexus.ask_required("Host", None, fake), "misp.local")
+        self.assertEqual(fake.state["reads"], 3)
+
+
+class TestAskYesNo(Quiet):
+
+    def test_default_true_and_false(self):
+        self.assertIs(nexus.ask_yes_no("ok?", True, scripted([""])), True)
+        self.assertIs(nexus.ask_yes_no("ok?", False, scripted([""])), False)
+
+    def test_accepts_long_and_short_forms(self):
+        for answer, expected in (("y", True), ("Yes", True), ("n", False),
+                                 ("NO", False)):
+            with self.subTest(answer=answer):
+                self.assertIs(nexus.ask_yes_no("ok?", True,
+                                                   scripted([answer])), expected)
+
+    def test_invalid_then_valid(self):
+        fake = scripted(["maybe", "y"])
+        self.assertIs(nexus.ask_yes_no("ok?", False, fake), True)
+        self.assertIn("please answer y or n", self.printed)
+
+    def test_hint_reflects_the_default(self):
+        fake = scripted([""])
+        nexus.ask_yes_no("ok?", False, fake)
+        self.assertIn("[y/N]", fake.state["prompts"][0])
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_yes_no("ok?", True, boom(EOFError()))
+
+
+class TestAskInt(Quiet):
+
+    def test_default_and_value(self):
+        self.assertEqual(nexus.ask_int("N", 30, None, None, scripted([""])),
+                         30)
+        self.assertEqual(nexus.ask_int("N", 30, None, None, scripted(["7"])),
+                         7)
+
+    def test_non_numeric_reprompts(self):
+        fake = scripted(["abc", "12"])
+        self.assertEqual(nexus.ask_int("N", 30, None, None, fake), 12)
+        self.assertIn("not a whole number", self.printed)
+
+    def test_below_minimum_reprompts(self):
+        fake = scripted(["0", "5"])
+        self.assertEqual(nexus.ask_int("N", 30, 1, None, fake), 5)
+        self.assertIn("at least 1", self.printed)
+
+    def test_above_maximum_reprompts(self):
+        fake = scripted(["99999", "443"])
+        self.assertEqual(nexus.ask_int("Port", 443, 1, 65535, fake), 443)
+        self.assertIn("at most 65535", self.printed)
+
+    def test_negative_is_allowed_when_no_minimum(self):
+        self.assertEqual(nexus.ask_int("N", 0, None, None, scripted(["-3"])),
+                         -3)
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_int("N", 1, None, None, boom(EOFError()))
+
+
+class TestAskChoice(Quiet):
+
+    OPTIONS = ["https", "http"]
+
+    def test_pick_by_number(self):
+        self.assertEqual(
+            nexus.ask_choice("Scheme", self.OPTIONS, "https",
+                                 scripted(["2"])), "http")
+
+    def test_enter_accepts_the_default(self):
+        self.assertEqual(
+            nexus.ask_choice("Scheme", self.OPTIONS, "http", scripted([""])),
+            "http")
+
+    def test_out_of_range_then_valid(self):
+        fake = scripted(["9", "nope", "1"])
+        self.assertEqual(
+            nexus.ask_choice("Scheme", self.OPTIONS, "https", fake), "https")
+        self.assertIn("not a valid choice", self.printed)
+
+    def test_no_default_forces_a_pick(self):
+        fake = scripted(["", "2"])
+        self.assertEqual(
+            nexus.ask_choice("Scheme", self.OPTIONS, None, fake), "http")
+        self.assertIn("no default", self.printed)
+
+    def test_annotations_are_shown(self):
+        nexus.ask_choice("Mode", [("both", "domain + ip")], "both",
+                             scripted([""]))
+        self.assertIn("domain + ip", self.printed)
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_choice("Scheme", self.OPTIONS, "https",
+                                 boom(EOFError()))
+
+
+class TestParseSelection(unittest.TestCase):
+
+    def test_single_and_list(self):
+        self.assertEqual(nexus.parse_selection("1", 5), [0])
+        self.assertEqual(nexus.parse_selection("1,3,5", 5), [0, 2, 4])
+
+    def test_range(self):
+        self.assertEqual(nexus.parse_selection("1-4", 5), [0, 1, 2, 3])
+
+    def test_mixed_and_spaced(self):
+        self.assertEqual(nexus.parse_selection(" 1-2 , 5 ", 5), [0, 1, 4])
+
+    def test_duplicates_collapse(self):
+        self.assertEqual(nexus.parse_selection("2,2,1-2", 5), [1, 0])
+
+    def test_invalid_forms_return_none(self):
+        for answer in ("0", "6", "1-9", "4-2", "x", "1,,x", "-2", "1-"):
+            with self.subTest(answer=answer):
+                self.assertIsNone(nexus.parse_selection(answer, 5))
+
+
+class TestAskMulti(Quiet):
+
+    OPTIONS = ["a", "b", "c", "d", "e"]
+
+    def multi(self, answer, preselected=None):
+        return nexus.ask_multi("Pick", self.OPTIONS, preselected,
+                                   scripted([answer]))
+
+    def test_numbers(self):
+        self.assertEqual(self.multi("1,3,5"), ["a", "c", "e"])
+
+    def test_range(self):
+        self.assertEqual(self.multi("1-4"), ["a", "b", "c", "d"])
+
+    def test_all_and_none(self):
+        self.assertEqual(self.multi("all"), self.OPTIONS)
+        self.assertEqual(self.multi("ALL"), self.OPTIONS)
+        self.assertEqual(self.multi("none", ["a"]), [])
+
+    def test_enter_keeps_the_preselected_set(self):
+        self.assertEqual(self.multi("", ["b", "d"]), ["b", "d"])
+
+    def test_result_is_in_option_order_not_typed_order(self):
+        self.assertEqual(self.multi("5,1"), ["a", "e"])
+
+    def test_invalid_then_valid(self):
+        fake = scripted(["7", "2"])
+        self.assertEqual(nexus.ask_multi("Pick", self.OPTIONS, None, fake),
+                         ["b"])
+        self.assertIn("could not read that selection", self.printed)
+
+    def test_preselection_is_marked_in_the_listing(self):
+        self.multi("", ["b"])
+        self.assertIn("[x] b", self.printed)
+        self.assertIn("[ ] a", self.printed)
+
+    def test_annotations_are_shown_per_row(self):
+        nexus.ask_multi("Pick", [("ip-dst", "4,182   -> Intel::ADDR")],
+                            None, scripted([""]))
+        self.assertIn("4,182   -> Intel::ADDR", self.printed)
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_multi("Pick", self.OPTIONS, None, boom(EOFError()))
+
+
+class TestAskListAndDate(Quiet):
+
+    def test_list_splits_and_strips(self):
+        self.assertEqual(
+            nexus.ask_list("Nets", "none", None, scripted([" a , b ,, c "])),
+            ["a", "b", "c"])
+
+    def test_none_words_mean_empty(self):
+        for answer in ("", "none", "-", "NONE"):
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    nexus.ask_list("Nets", "none", None, scripted([answer])),
+                    [])
+
+    def test_validator_reprompts(self):
+        fake = scripted(["not-a-net", "10.0.0.0/8"])
+        self.assertEqual(
+            nexus.ask_list("Nets", "none", nexus._valid_cidr, fake),
+            ["10.0.0.0/8"])
+        self.assertIn("not a network", self.printed)
+
+    def test_path_validator(self):
+        fake = scripted(["/nope/nope.txt", __file__])
+        self.assertEqual(
+            nexus.ask_list("File", "none", nexus._valid_path, fake),
+            [__file__])
+
+    def test_date_accepts_iso_and_relative(self):
+        self.assertEqual(nexus.ask_date("From", "", scripted(["2026-01-02"])),
+                         "2026-01-02")
+        self.assertEqual(nexus.ask_date("From", "", scripted(["30d"])), "30d")
+
+    def test_date_reprompts_on_junk(self):
+        fake = scripted(["02/01/2026", "2026-01-02"])
+        self.assertEqual(nexus.ask_date("From", "", fake), "2026-01-02")
+        self.assertIn("expected YYYY-MM-DD", self.printed)
+
+    def test_date_empty_is_unset(self):
+        self.assertEqual(nexus.ask_date("From", "", scripted([""])), "")
+
+
+class TestAskToken(Quiet):
+
+    def test_reads_without_echo_and_strips(self):
+        self.assertEqual(nexus.ask_token("Token", scripted([" abc123 "])),
+                         "abc123")
+
+    def test_empty_token_reprompts(self):
+        fake = scripted(["", "abc123"])
+        self.assertEqual(nexus.ask_token("Token", fake), "abc123")
+        self.assertIn("cannot be empty", self.printed)
+
+    def test_eof_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_token("Token", boom(EOFError()))
+
+    def test_ctrl_c_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.ask_token("Token", boom(KeyboardInterrupt()))
+
+
+# ---------------------------------------------------------------------------
+# DISCOVERY
+# ---------------------------------------------------------------------------
+
+class StubClient(object):
+    """Enough MispClient surface for stage 1 defaults and stage 2 discovery."""
+
+    host = "misp.example"
+    scheme = "https"
+    port = 8443
+    verify_tls = True
+    token = "stub-token-1234"
+    timeout = 45
+    retries = 2
+
+    def get_version(self):
+        return {"version": "2.5.0"}
+
+    def get_tags(self):
+        return [{"name": "tlp:amber"}, {"name": None}]
+
+    def get_orgs(self):
+        return [{"name": "CIRCL"}]
+
+    def get_sharing_groups(self):
+        return [{"name": "internal"}]
+
+    def get_feeds(self):
+        return [
+            # fixed event -- the most precise provenance
+            {"id": "1", "name": "CIRCL OSINT Feed", "provider": "CIRCL",
+             "enabled": True, "caching_enabled": True, "source_format": "misp",
+             "tag_id": None, "tag_name": "", "orgc_id": None,
+             "fixed_event": True, "event_id": "500"},
+            # tag-identified
+            {"id": "2", "name": "Botvrij.eu", "provider": "Botvrij",
+             "enabled": True, "caching_enabled": False, "source_format": "csv",
+             "tag_id": "12", "tag_name": "osint:source=botvrij",
+             "orgc_id": None, "fixed_event": False, "event_id": None},
+            # org-identified
+            {"id": "3", "name": "Partner Feed", "provider": "Partner",
+             "enabled": False, "caching_enabled": False, "source_format": "misp",
+             "tag_id": None, "tag_name": "", "orgc_id": "9",
+             "fixed_event": False, "event_id": None},
+            # untraceable once ingested
+            {"id": "4", "name": "Anonymous Feed", "provider": "",
+             "enabled": True, "caching_enabled": False, "source_format": "freetext",
+             "tag_id": None, "tag_name": "", "orgc_id": None,
+             "fixed_event": False, "event_id": None},
+        ]
+
+    def describe_types(self):
+        return {"types": ["ip-dst", "domain", "ssdeep"]}
+
+    def count_type(self, misp_type, probe_limit=5000):
+        return (7, True)
+
+
+class BrokenClient(StubClient):
+    def get_tags(self):
+        raise nexus.MispError("boom")
+
+    def describe_types(self):
+        raise nexus.MispError("boom")
+
+
+class TestDiscover(Quiet):
+
+    def test_no_client_returns_empty_lists(self):
+        found = nexus.discover(None)
+        self.assertEqual(found["types"], [])
+        self.assertEqual(found["counts"], {})
+        self.assertEqual(found["tags"], [])
+
+    def test_live_lists_are_flattened_to_names(self):
+        found = nexus.discover(StubClient())
+        self.assertEqual(found["tags"], ["tlp:amber"])
+        self.assertEqual(found["orgs"], ["CIRCL"])
+        self.assertEqual(found["sharing_groups"], ["internal"])
+
+    def test_counts_only_cover_mappable_types_present_on_the_instance(self):
+        found = nexus.discover(StubClient())
+        self.assertEqual(sorted(found["counts"]), ["domain", "ip-dst"])
+        self.assertEqual(found["counts"]["ip-dst"], (7, True))
+
+    def test_a_failing_endpoint_does_not_abort_discovery(self):
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        found = nexus.discover(BrokenClient())
+        self.assertEqual(found["tags"], [])
+        # describeTypes failed, so every mappable type stays on the menu
+        self.assertEqual(len(found["counts"]), len(nexus.mappable_types()))
+
+
+# ---------------------------------------------------------------------------
+# SEARCH PARAMETERS
+# ---------------------------------------------------------------------------
+
+class TestBuildSearchParams(unittest.TestCase):
+
+    def params(self, **kwargs):
+        return nexus.build_search_params(kwargs)
+
+    def test_minimum_config_still_asks_for_event_context(self):
+        params = self.params()
+        self.assertEqual(params["returnFormat"], "json")
+        self.assertTrue(params["includeEventUuid"])
+        self.assertTrue(params["includeEventTags"])
+        self.assertEqual(params["deleted"], 0)
+
+    def test_type_list_is_passed_through(self):
+        self.assertEqual(self.params(types=["ip-dst", "domain"])["type"],
+                         ["ip-dst", "domain"])
+
+    def test_quality_flags_only_appear_when_true(self):
+        params = self.params(to_ids=True, published=True,
+                             enforce_warninglist=True)
+        self.assertEqual((params["to_ids"], params["published"],
+                          params["enforceWarninglist"]), (1, 1, 1))
+        off = self.params(to_ids=False, published=False,
+                          enforce_warninglist=False)
+        for key in ("to_ids", "published", "enforceWarninglist"):
+            self.assertNotIn(key, off)
+
+    def test_deleted_flag(self):
+        self.assertEqual(self.params(exclude_deleted=True)["deleted"], 0)
+        self.assertEqual(self.params(exclude_deleted=False)["deleted"], [0, 1])
+
+    def test_tags_use_or_and_not(self):
+        params = self.params(include_tags=["tlp:amber"],
+                             exclude_tags=["false-positive"])
+        self.assertEqual(params["tags"], {"OR": ["tlp:amber"],
+                                          "NOT": ["false-positive"]})
+
+    def test_only_include_tags(self):
+        self.assertEqual(self.params(include_tags=["a"])["tags"], {"OR": ["a"]})
+
+    def test_only_exclude_tags(self):
+        self.assertEqual(self.params(exclude_tags=["a"])["tags"], {"NOT": ["a"]})
+
+    def test_no_tags_key_when_neither_side_is_set(self):
+        self.assertNotIn("tags", self.params(include_tags=[], exclude_tags=[]))
+
+    def test_last_window_on_attribute_timestamp(self):
+        params = self.params(time_mode="last", days=90,
+                             timestamp_field="timestamp")
+        self.assertEqual(params["timestamp"], "90d")
+        self.assertNotIn("last", params)
+
+    def test_last_window_on_publish_timestamp(self):
+        params = self.params(time_mode="last", days=7,
+                             timestamp_field="publish_timestamp")
+        self.assertEqual(params["last"], "7d")
+        self.assertNotIn("timestamp", params)
+
+    def test_explicit_range(self):
+        params = self.params(time_mode="range", date_from="2026-01-01",
+                             date_to="2026-02-01")
+        self.assertEqual((params["from"], params["to"]),
+                         ("2026-01-01", "2026-02-01"))
+
+    def test_half_open_range(self):
+        params = self.params(time_mode="range", date_from="2026-01-01",
+                             date_to="")
+        self.assertEqual(params["from"], "2026-01-01")
+        self.assertNotIn("to", params)
+
+    def test_all_time_sets_no_window(self):
+        params = self.params(time_mode="all", days=90)
+        for key in ("last", "timestamp", "from", "to"):
+            self.assertNotIn(key, params)
+
+    def test_org_sharing_group_and_event_ids(self):
+        params = self.params(orgs=["CIRCL"], sharing_groups=["internal"],
+                             event_ids=["42", "e-43"])
+        self.assertEqual(params["org"], ["CIRCL"])
+        self.assertEqual(params["sharinggroup"], ["internal"])
+        self.assertEqual(params["eventid"], ["42", "e-43"])
+
+    def test_empty_scope_lists_are_omitted(self):
+        params = self.params(orgs=[], sharing_groups=[], event_ids=[])
+        for key in ("org", "sharinggroup", "eventid"):
+            self.assertNotIn(key, params)
+
+    def test_minimum_threat_level_expands_to_everything_at_or_above_it(self):
+        self.assertEqual(self.params(threat_level=2)["threat_level_id"], [1, 2])
+        self.assertEqual(self.params(threat_level=1)["threat_level_id"], [1])
+        self.assertNotIn("threat_level_id", self.params(threat_level=None))
+
+    def test_analysis_zero_is_kept_not_dropped_as_falsy(self):
+        self.assertEqual(self.params(analysis=0)["analysis"], 0)
+        self.assertNotIn("analysis", self.params(analysis=None))
+
+    def test_lists_are_copied_not_aliased(self):
+        types = ["ip-dst"]
+        params = nexus.build_search_params({"types": types})
+        params["type"].append("domain")
+        self.assertEqual(types, ["ip-dst"])
+
+    def test_is_pure_and_does_not_mutate_the_config(self):
+        config = {"types": ["ip-dst"], "to_ids": True}
+        before = dict(config)
+        nexus.build_search_params(config)
+        self.assertEqual(config, before)
+
+
+# ---------------------------------------------------------------------------
+# FULL INTERVIEW
+# ---------------------------------------------------------------------------
+
+class TestRunInterview(Quiet):
+
+    def run_it(self, input_fn, client=None, token="scripted-token-1234"):
+        return nexus.run_interview(
+            client, input_fn=input_fn, getpass_fn=lambda prompt: token)
+
+    def test_all_defaults_produces_a_usable_config(self):
+        fake = scripted(["misp.example"], fill="")
+        config = self.run_it(fake)
+
+        self.assertEqual(config["misp_host"], "misp.example")
+        self.assertEqual(config["scheme"], "https")
+        self.assertEqual(config["port"], 443)
+        self.assertIs(config["verify_tls"], True)
+        self.assertIsNone(config["proxy"])
+        self.assertEqual(config["token"], "scripted-token-1234")
+        self.assertEqual((config["timeout"], config["retries"]), (30, 3))
+
+        self.assertEqual(config["ioc_classes"], list(nexus.IOC_CLASS_ORDER))
+        expected = [t for _, types in
+                    (nexus.IOC_CLASSES[k] for k in nexus.IOC_CLASS_ORDER)
+                    for t in types if t not in nexus.MISP_OFF_BY_DEFAULT]
+        self.assertEqual(config["types"], expected)
+        self.assertEqual(config["split_composites"], "both")
+        self.assertIs(config["hostname_as_domain"], True)
+        self.assertIs(config["allow_subnet"], True)
+
+        self.assertIs(config["to_ids"], True)
+        self.assertIs(config["published"], True)
+        self.assertIs(config["enforce_warninglist"], True)
+        self.assertIs(config["exclude_deleted"], True)
+        self.assertIsNone(config["threat_level"])
+        self.assertIsNone(config["analysis"])
+
+        self.assertEqual(config["time_mode"], "last")
+        self.assertEqual(config["days"], nexus.DEFAULT_DAYS)
+        self.assertEqual(config["timestamp_field"], "timestamp")
+        self.assertEqual(config["include_tags"], [])
+        self.assertEqual(config["exclude_tags"],
+                         list(nexus.SUGGESTED_EXCLUDE_TAGS))
+        self.assertEqual(config["orgs"], [])
+        self.assertEqual(config["sharing_groups"], [])
+        self.assertEqual(config["event_ids"], [])
+
+        self.assertIs(config["exclude_private"], True)
+        self.assertEqual(config["own_networks"], [])
+        self.assertEqual(config["own_domains"], [])
+        self.assertIsNone(config["allowlist_file"])
+
+        self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
+        self.assertEqual(config["desc_template"],
+                         nexus.DEFAULT_DESC_TEMPLATE)
+        self.assertEqual(config["misp_base_url"], "https://misp.example")
+        self.assertIs(config["do_notice"], False)
+        self.assertEqual(config["meta_maxlen"], 200)
+
+        self.assertEqual(config["output_path"], nexus.SO_INTEL_FILE)
+        self.assertEqual(config["deployment"], "distributed")
+        self.assertEqual(config["merge_mode"], "append-only")
+        self.assertIs(config["backup"], True)
+        self.assertIsNone(config["max_indicators"])
+        self.assertIs(config["dry_run"], False)
+        self.assertEqual(config["profile_path"],
+                         os.path.join(nexus.PROFILE_DIR, "nexus.json"))
+        self.assertIs(config["apply"], False)
+
+    def test_default_config_feeds_a_valid_search_body(self):
+        config = self.run_it(scripted(["misp.example"], fill=""))
+        params = nexus.build_search_params(config)
+        self.assertEqual(params["timestamp"], "90d")
+        self.assertEqual(params["tags"],
+                         {"NOT": list(nexus.SUGGESTED_EXCLUDE_TAGS)})
+        self.assertIn("ip-dst", params["type"])
+        self.assertNotIn("filename", params["type"])
+
+    def test_answers_that_are_not_defaults_are_honoured(self):
+        rules = [
+            ("MISP address", "10.9.8.7"),
+            ("Scheme", "2"),                      # http
+            ("Port", "8080"),
+            ("Verify the TLS", "n"),
+            ("type INSECURE", "INSECURE"),
+            ("HTTP proxy", "http://proxy.local:3128"),
+            ("IOC classes", "1"),                 # network only
+            ("Network -", "1"),                   # first network type
+            ("Composite types", "2"),             # first half only
+            ("Treat hostname", "n"),
+            ("Emit Intel::SUBNET", "n"),
+            ("to_ids", "n"),
+            ("Minimum event threat level", "3"),  # medium
+            ("Event analysis state", "4"),        # completed
+            ("Time window", "3"),                 # all
+            ("Include tags", "tlp:amber, tlp:red"),
+            ("Exclude tags", "none"),
+            ("Restrict to event IDs", "42,e-43"),
+            ("own networks", "10.0.0.0/8"),
+            ("own domain", "corp.example"),
+            ("meta.source format", "4"),          # fixed string
+            ("Fixed meta.source", "OURSOC"),
+            ("Link meta.url", "n"),
+            ("Emit the meta.do_notice", "y"),
+            ("Max metadata field length", "80"),
+            ("Output path", "/tmp/intel.dat"),
+            ("Security Onion deployment", "2"),  # standalone
+            ("Save these answers", "n"),
+            ("Apply to the standalone node", "y"),
+        ]
+        config = self.run_it(by_prompt(rules))
+
+        self.assertEqual(config["misp_host"], "10.9.8.7")
+        self.assertEqual(config["scheme"], "http")
+        self.assertEqual(config["port"], 8080)
+        self.assertIs(config["verify_tls"], False)
+        self.assertEqual(config["proxy"], "http://proxy.local:3128")
+        self.assertEqual(config["ioc_classes"], ["network"])
+        self.assertEqual(config["types"], ["ip-src"])
+        self.assertEqual(config["split_composites"], "first")
+        self.assertIs(config["hostname_as_domain"], False)
+        self.assertIs(config["allow_subnet"], False)
+        self.assertIs(config["to_ids"], False)
+        self.assertEqual(config["threat_level"], 2)
+        self.assertEqual(config["analysis"], 2)
+        self.assertEqual(config["time_mode"], "all")
+        self.assertIsNone(config["days"])
+        self.assertEqual(config["include_tags"], ["tlp:amber", "tlp:red"])
+        self.assertEqual(config["exclude_tags"], [])
+        self.assertEqual(config["event_ids"], ["42", "e-43"])
+        self.assertEqual(config["own_networks"], ["10.0.0.0/8"])
+        self.assertEqual(config["own_domains"], ["corp.example"])
+        self.assertEqual(config["source_fmt"], "OURSOC")
+        self.assertIsNone(config["misp_base_url"])
+        self.assertIs(config["do_notice"], True)
+        self.assertEqual(config["meta_maxlen"], 80)
+        self.assertEqual(config["output_path"], "/tmp/intel.dat")
+        self.assertEqual(config["deployment"], "standalone")
+        self.assertEqual(config["merge_mode"], "append-only")
+        self.assertIsNone(config["profile_path"])
+        self.assertIs(config["apply"], True)
+
+    def test_declining_insecure_confirmation_keeps_verification_on(self):
+        config = self.run_it(by_prompt([("MISP address", "a.example"),
+                                        ("Verify the TLS", "n"),
+                                        ("type INSECURE", "")]))
+        self.assertIs(config["verify_tls"], True)
+
+    def test_hostname_types_are_dropped_when_not_treated_as_domains(self):
+        config = self.run_it(by_prompt([("MISP address", "a.example"),
+                                        ("Treat hostname", "n")]))
+        self.assertNotIn("hostname", config["types"])
+        self.assertNotIn("hostname|port", config["types"])
+        self.assertIn("domain", config["types"])
+
+    def test_explicit_date_range(self):
+        config = self.run_it(by_prompt([("MISP address", "a.example"),
+                                        ("Time window", "2"),
+                                        ("From (", "2026-01-01"),
+                                        ("To (", "2026-02-01")]))
+        self.assertEqual(config["time_mode"], "range")
+        params = nexus.build_search_params(config)
+        self.assertEqual((params["from"], params["to"]),
+                         ("2026-01-01", "2026-02-01"))
+
+    def test_non_standard_port_lands_in_the_meta_url(self):
+        config = self.run_it(by_prompt([("MISP address", "a.example"),
+                                        ("Port", "8443")]))
+        self.assertEqual(config["misp_base_url"], "https://a.example:8443")
+
+    def test_declining_the_summary_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            self.run_it(by_prompt([("MISP address", "a.example"),
+                                   ("Proceed", "n")]))
+
+    def test_eof_partway_through_aborts(self):
+        with self.assertRaises(nexus.InterviewAborted):
+            self.run_it(scripted(["misp.example", "", ""]))
+
+    def test_abort_at_the_token_prompt(self):
+        def refuse(prompt):
+            raise KeyboardInterrupt()
+        with self.assertRaises(nexus.InterviewAborted):
+            nexus.run_interview(None,
+                                    input_fn=scripted(["a.example"], fill=""),
+                                    getpass_fn=refuse)
+
+    def test_a_connected_client_supplies_the_defaults_and_the_token(self):
+        def no_token(prompt):
+            raise AssertionError("must not re-prompt for a known token")
+        config = nexus.run_interview(
+            StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token)
+        self.assertEqual(config["misp_host"], "misp.example")
+        self.assertEqual(config["port"], 8443)
+        self.assertEqual(config["token"], "stub-token-1234")
+        self.assertEqual((config["timeout"], config["retries"]), (45, 2))
+        # describeTypes only advertises ip-dst and domain as mappable
+        self.assertEqual(config["types"], ["ip-dst", "domain"])
+        self.assertEqual(config["include_tags"], [])
+        self.assertEqual(config["exclude_tags"],
+                         list(nexus.SUGGESTED_EXCLUDE_TAGS))
+
+
+# ---------------------------------------------------------------------------
+# SUMMARY
+# ---------------------------------------------------------------------------
+
+class TestSummarise(Quiet):
+
+    def config(self):
+        return nexus.run_interview(
+            None, input_fn=scripted(["misp.example"], fill=""),
+            getpass_fn=lambda prompt: "scripted-token-1234")
+
+    def test_summary_covers_every_stage(self):
+        text = nexus.summarise_config(self.config())
+        for needle in ("MISP", "IOC types", "quality", "window", "exclusions",
+                       "meta.source", "meta.desc", "output", "restSearch"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+
+    def test_summary_never_prints_the_token(self):
+        self.assertNotIn("scripted-token-1234",
+                         nexus.summarise_config(self.config()))
+
+    def test_summary_survives_a_sparse_config(self):
+        text = nexus.summarise_config({})
+        self.assertIn("Pre-flight summary", text)
+        self.assertIn("all time", text)
+
+
+
+
+def row(indicator, zeek_type):
+    """A minimal build_indicators()-shaped row for the broad-indicator tests."""
+    return (indicator, zeek_type, "MISP", "desc", "-", None)
+
+
+# ---------------------------------------------------------------------------
+# GuardrailVerdict
+# ---------------------------------------------------------------------------
+
+class TestGuardrailVerdict(unittest.TestCase):
+
+    def test_ok_and_warn_are_truthy_block_is_not(self):
+        self.assertTrue(nexus.GuardrailVerdict("ok", "fine"))
+        self.assertTrue(nexus.GuardrailVerdict("warn", "careful"))
+        self.assertFalse(nexus.GuardrailVerdict("block", "no"))
+
+    def test_ok_mirrors_level(self):
+        self.assertTrue(nexus.GuardrailVerdict("ok", "fine").ok)
+        self.assertTrue(nexus.GuardrailVerdict("warn", "careful").ok)
+        self.assertFalse(nexus.GuardrailVerdict("block", "no").ok)
+
+
+# ---------------------------------------------------------------------------
+# check_size
+# ---------------------------------------------------------------------------
+
+class TestCheckSize(unittest.TestCase):
+
+    def test_below_warn_at_is_ok(self):
+        v = nexus.check_size(99999, warn_at=100000, cap=250000)
+        self.assertEqual(v.level, "ok")
+
+    def test_exactly_at_warn_at_is_ok(self):
+        v = nexus.check_size(100000, warn_at=100000, cap=250000)
+        self.assertEqual(v.level, "ok")
+
+    def test_one_over_warn_at_is_warn(self):
+        v = nexus.check_size(100001, warn_at=100000, cap=250000)
+        self.assertEqual(v.level, "warn")
+
+    def test_exactly_at_cap_is_warn_not_block(self):
+        v = nexus.check_size(250000, warn_at=100000, cap=250000)
+        self.assertEqual(v.level, "warn")
+        self.assertTrue(v)
+
+    def test_one_over_cap_is_block(self):
+        v = nexus.check_size(250001, warn_at=100000, cap=250000)
+        self.assertEqual(v.level, "block")
+        self.assertFalse(v)
+
+    def test_default_has_no_hard_cap(self):
+        self.assertEqual(nexus.check_size(50).level, "ok")
+        self.assertEqual(nexus.check_size(150000).level, "warn")
+        self.assertEqual(nexus.check_size(300000).level, "warn")
+
+
+# ---------------------------------------------------------------------------
+# check_not_empty
+# ---------------------------------------------------------------------------
+
+class TestCheckNotEmpty(unittest.TestCase):
+
+    def test_empty_over_populated_blocks(self):
+        v = nexus.check_not_empty(0, 5000)
+        self.assertEqual(v.level, "block")
+        self.assertFalse(v)
+
+    def test_near_empty_over_populated_blocks_with_min_absolute(self):
+        v = nexus.check_not_empty(3, 5000, min_absolute=10)
+        self.assertEqual(v.level, "block")
+
+    def test_exactly_at_min_absolute_is_ok(self):
+        v = nexus.check_not_empty(10, 5000, min_absolute=10)
+        self.assertEqual(v.level, "ok")
+
+    def test_no_existing_file_is_noop(self):
+        v = nexus.check_not_empty(0, None)
+        self.assertEqual(v.level, "ok")
+
+    def test_existing_count_zero_is_noop(self):
+        v = nexus.check_not_empty(0, 0)
+        self.assertEqual(v.level, "ok")
+
+    def test_populated_new_set_over_populated_existing_is_ok(self):
+        v = nexus.check_not_empty(4000, 5000)
+        self.assertEqual(v.level, "ok")
+
+
+# ---------------------------------------------------------------------------
+# check_delta
+# ---------------------------------------------------------------------------
+
+class TestCheckDelta(unittest.TestCase):
+
+    def test_no_existing_file_is_noop(self):
+        v = nexus.check_delta(0, None)
+        self.assertEqual(v.level, "ok")
+
+    def test_existing_count_zero_is_noop(self):
+        v = nexus.check_delta(0, 0)
+        self.assertEqual(v.level, "ok")
+
+    def test_growth_is_ok(self):
+        v = nexus.check_delta(6000, 5000, max_drop_pct=25.0)
+        self.assertEqual(v.level, "ok")
+
+    def test_exactly_at_max_drop_pct_is_ok(self):
+        # 25% of 1000 is 250; dropping to 750 is exactly the limit.
+        v = nexus.check_delta(750, 1000, max_drop_pct=25.0)
+        self.assertEqual(v.level, "ok")
+
+    def test_one_indicator_over_the_limit_blocks(self):
+        v = nexus.check_delta(749, 1000, max_drop_pct=25.0)
+        self.assertEqual(v.level, "block")
+        self.assertFalse(v)
+
+    def test_small_drop_within_limit_is_ok(self):
+        v = nexus.check_delta(900, 1000, max_drop_pct=25.0)
+        self.assertEqual(v.level, "ok")
+
+
+# ---------------------------------------------------------------------------
+# check_load_file
+# ---------------------------------------------------------------------------
+
+class TestCheckLoadFile(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_load_file_blocks(self):
+        v = nexus.check_load_file(self.tmp)
+        self.assertEqual(v.level, "block")
+        self.assertFalse(v)
+
+    def test_present_load_file_is_ok(self):
+        open(os.path.join(self.tmp, nexus.SO_LOAD_FILE), "w").close()
+        v = nexus.check_load_file(self.tmp)
+        self.assertEqual(v.level, "ok")
+
+    def test_custom_load_filename(self):
+        open(os.path.join(self.tmp, "custom.zeek"), "w").close()
+        v = nexus.check_load_file(self.tmp, load_filename="custom.zeek")
+        self.assertEqual(v.level, "ok")
+
+
+# ---------------------------------------------------------------------------
+# check_broad_indicators
+# ---------------------------------------------------------------------------
+
+class TestCheckBroadIndicators(unittest.TestCase):
+
+    def test_no_offenders_is_ok(self):
+        rows = [
+            row("1.2.3.4", "Intel::ADDR"),
+            row("192.0.2.0/24", "Intel::SUBNET"),
+            row("evil.example.com", "Intel::DOMAIN"),
+            row("evil.example.com/path", "Intel::URL"),
+        ]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "ok")
+
+    def test_subnet_at_min_prefix_v4_warns(self):
+        rows = [row("10.0.0.0/16", "Intel::SUBNET")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "warn")
+        self.assertIn("10.0.0.0/16", v.message)
+
+    def test_subnet_narrower_than_min_prefix_v4_is_fine(self):
+        rows = [row("10.0.0.0/24", "Intel::SUBNET")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "ok")
+
+    def test_subnet_at_prefix_32_v6_warns(self):
+        rows = [row("2001:db8::1/32", "Intel::SUBNET")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "warn")
+        self.assertIn("2001:db8::1/32", v.message)
+
+    def test_single_label_domain_warns(self):
+        rows = [row("localdomain", "Intel::DOMAIN")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "warn")
+        self.assertIn("localdomain", v.message)
+
+    def test_url_with_dotless_host_warns(self):
+        rows = [row("localhost/path", "Intel::URL")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "warn")
+        self.assertIn("localhost/path", v.message)
+
+    def test_offenders_capped_at_ten_in_message(self):
+        rows = [row("bad%d" % i, "Intel::DOMAIN") for i in range(15)]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "warn")
+        self.assertIn("15 overly broad indicator(s)", v.message)
+        self.assertIn("...and 5 more", v.message)
+        for i in range(10):
+            self.assertIn("bad%d" % i, v.message)
+
+
+# ---------------------------------------------------------------------------
+# run_guardrails
+# ---------------------------------------------------------------------------
+
+class TestRunGuardrails(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_all_clean_run_is_all_ok(self):
+        rows = [row("evil.example.com", "Intel::DOMAIN")]
+        open(os.path.join(self.tmp, nexus.SO_LOAD_FILE), "w").close()
+        verdicts = nexus.run_guardrails(rows, existing_count=1, intel_dir=self.tmp)
+        self.assertTrue(all(v.level == "ok" for v in verdicts))
+
+    def test_worst_level_sorts_first(self):
+        # Empty new set over a populated existing file blocks on two fronts
+        # (check_not_empty and check_delta); a warn-worthy broad domain rides
+        # alongside.  Block verdicts must lead the list.
+        rows = []
+        verdicts = nexus.run_guardrails(rows, existing_count=1000, intel_dir=None)
+        self.assertEqual(verdicts[0].level, "block")
+        levels = [v.level for v in verdicts]
+        # once we hit the first "ok" nothing after it should be block/warn
+        first_ok = levels.index("ok") if "ok" in levels else len(levels)
+        self.assertNotIn("block", levels[first_ok:])
+        self.assertNotIn("warn", levels[first_ok:])
+
+    def test_load_file_skipped_when_intel_dir_none(self):
+        rows = [row("evil.example.com", "Intel::DOMAIN")]
+        verdicts = nexus.run_guardrails(rows, existing_count=1, intel_dir=None)
+        # 4 checks run: size, not_empty, delta, broad -- no load-file check.
+        self.assertEqual(len(verdicts), 4)
+
+    def test_load_file_included_when_intel_dir_given(self):
+        rows = [row("evil.example.com", "Intel::DOMAIN")]
+        verdicts = nexus.run_guardrails(rows, existing_count=1, intel_dir=self.tmp)
+        self.assertEqual(len(verdicts), 5)
+
+    def test_missing_load_file_blocks_and_leads(self):
+        rows = [row("evil.example.com", "Intel::DOMAIN")]
+        verdicts = nexus.run_guardrails(rows, existing_count=1, intel_dir=self.tmp)
+        self.assertEqual(verdicts[0].level, "block")
+
+    def test_thresholds_are_forwarded(self):
+        rows = [row("bad%d" % i, "Intel::FILE_NAME") for i in range(5)]
+        verdicts = nexus.run_guardrails(
+            rows, existing_count=None, intel_dir=None, warn_at=3, cap=10)
+        size_verdicts = [v for v in verdicts if "indicators" in v.message and "warn threshold" in v.message]
+        self.assertTrue(any(v.level == "warn" for v in size_verdicts))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+
+# ---------------------------------------------------------------------------
+# FEEDS
+# ---------------------------------------------------------------------------
+
+def feed(name="F", tag="", org=None, fixed=False, event=None, enabled=True):
+    return {"id": "1", "name": name, "provider": "P", "enabled": enabled,
+            "caching_enabled": False, "source_format": "misp",
+            "tag_id": None, "tag_name": tag, "orgc_id": org,
+            "fixed_event": fixed, "event_id": event}
+
+
+class TestFeedProvenance(unittest.TestCase):
+
+    def test_fixed_event_wins_over_tag_and_org(self):
+        f = feed(tag="osint:x", org="9", fixed=True, event="500")
+        self.assertEqual(nexus.feed_provenance(f)[:2], ("fixed_event", "500"))
+
+    def test_tag_beats_org(self):
+        f = feed(tag="osint:x", org="9")
+        self.assertEqual(nexus.feed_provenance(f)[:2], ("tag", "osint:x"))
+
+    def test_org_is_the_last_resort(self):
+        self.assertEqual(nexus.feed_provenance(feed(org="9"))[:2], ("org", "9"))
+
+    def test_untraceable_feed_returns_none(self):
+        # No fixed event, no tag, no org: nothing distinguishes its
+        # attributes from the rest of MISP after ingest.
+        self.assertIsNone(nexus.feed_provenance(feed()))
+        self.assertFalse(nexus.feed_is_selectable(feed()))
+
+    def test_fixed_event_without_an_event_id_is_untraceable(self):
+        self.assertIsNone(nexus.feed_provenance(feed(fixed=True, event=None)))
+
+    def test_every_provenance_kind_is_in_the_documented_order(self):
+        for f in (feed(fixed=True, event="1"), feed(tag="t"), feed(org="9")):
+            self.assertIn(nexus.feed_provenance(f)[0],
+                          nexus.FEED_PROVENANCE_ORDER)
+
+
+class TestApplyFeedToParams(unittest.TestCase):
+
+    def test_fixed_event_constrains_by_event_id(self):
+        out = nexus.apply_feed_to_params({}, feed(fixed=True, event="500"))
+        self.assertEqual(out["eventid"], ["500"])
+
+    def test_org_feed_constrains_by_org(self):
+        self.assertEqual(nexus.apply_feed_to_params({}, feed(org="9"))["org"],
+                         ["9"])
+
+    def test_tag_feed_takes_the_tags_or_slot(self):
+        out = nexus.apply_feed_to_params({}, feed(tag="osint:botvrij"))
+        self.assertEqual(out["tags"]["OR"], ["osint:botvrij"])
+
+    def test_tag_feed_preserves_exclude_tags(self):
+        base = {"tags": {"OR": ["tlp:amber"], "NOT": ["false-positive"]}}
+        out = nexus.apply_feed_to_params(base, feed(tag="osint:botvrij"))
+        self.assertEqual(out["tags"]["OR"], ["osint:botvrij"])
+        self.assertEqual(out["tags"]["NOT"], ["false-positive"])
+
+    def test_other_filters_survive_untouched(self):
+        base = {"to_ids": 1, "enforceWarninglist": 1, "timestamp": "90d",
+                "type": ["ip-dst"]}
+        out = nexus.apply_feed_to_params(base, feed(fixed=True, event="500"))
+        for key, value in base.items():
+            self.assertEqual(out[key], value)
+
+    def test_the_base_params_are_not_mutated(self):
+        base = {"to_ids": 1}
+        nexus.apply_feed_to_params(base, feed(fixed=True, event="500"))
+        self.assertEqual(base, {"to_ids": 1})
+
+    def test_an_untraceable_feed_raises(self):
+        with self.assertRaises(ValueError):
+            nexus.apply_feed_to_params({}, feed())
+
+
+class TestFetchRecords(unittest.TestCase):
+    """_fetch_records issues one restSearch per feed and merges the results."""
+
+    class Recorder(object):
+        def __init__(self, per_query):
+            self.per_query = per_query
+            self.queries = []
+
+        def search_attributes(self, params, max_results=None):
+            self.queries.append(params)
+            for record in self.per_query:
+                yield dict(record)
+
+    def rec(self, value, tags=None):
+        return {"value": value, "type": "ip-dst", "event_tags": tags or [],
+                "event_id": "1"}
+
+    def test_no_feeds_means_one_query_and_no_feed_label(self):
+        client = self.Recorder([self.rec("45.33.32.1")])
+        out = list(nexus._fetch_records(client, {"types": ["ip-dst"]}))
+        self.assertEqual(len(client.queries), 1)
+        self.assertNotIn("feed", out[0])
+
+    def test_one_query_per_feed_each_labelled(self):
+        client = self.Recorder([self.rec("45.33.32.1")])
+        config = {"types": ["ip-dst"],
+                  "feeds": [feed(name="CIRCL", fixed=True, event="500"),
+                            feed(name="Botvrij", tag="osint:botvrij")]}
+        out = list(nexus._fetch_records(client, config))
+        self.assertEqual(len(client.queries), 2)
+        self.assertEqual([r["feed"] for r in out], ["CIRCL", "Botvrij"])
+        self.assertEqual(client.queries[0]["eventid"], ["500"])
+        self.assertEqual(client.queries[1]["tags"]["OR"], ["osint:botvrij"])
+
+    def test_include_tags_are_post_filtered_for_a_tag_feed(self):
+        # The feed tag consumed tags.OR, so the operator's include-tags can
+        # only be honoured client-side.
+        client = self.Recorder([self.rec("45.33.32.1", ["tlp:amber"]),
+                                self.rec("45.33.32.2", ["tlp:green"])])
+        config = {"include_tags": ["tlp:amber"],
+                  "feeds": [feed(name="Botvrij", tag="osint:botvrij")]}
+        out = list(nexus._fetch_records(client, config))
+        self.assertEqual([r["value"] for r in out], ["45.33.32.1"])
+
+    def test_include_tags_stay_server_side_for_an_event_feed(self):
+        client = self.Recorder([self.rec("45.33.32.1", ["tlp:green"])])
+        config = {"include_tags": ["tlp:amber"],
+                  "feeds": [feed(name="CIRCL", fixed=True, event="500")]}
+        out = list(nexus._fetch_records(client, config))
+        self.assertEqual(len(out), 1)  # MISP already applied the tag filter
+
+    def test_the_indicator_budget_is_shared_across_feeds(self):
+        client = self.Recorder([self.rec("45.33.32.%d" % i) for i in range(5)])
+        config = {"max_indicators": 3,
+                  "feeds": [feed(name="A", fixed=True, event="1"),
+                            feed(name="B", fixed=True, event="2")]}
+        list(nexus._fetch_records(client, config))
+        self.assertEqual(len(client.queries), 1)  # budget spent on feed A
+
+
+class TestFeedMetadata(unittest.TestCase):
+
+    def test_feed_name_reaches_meta_source(self):
+        source, _, _ = nexus.render_meta(
+            {"feed": "CIRCL OSINT Feed", "event_id": "1"},
+            source_fmt="MISP-feed-{feed}")
+        self.assertEqual(source, "MISP-feed-CIRCL-OSINT-Feed")
+
+    def test_feed_slug_never_breaks_the_tab_format(self):
+        source, _, _ = nexus.render_meta(
+            {"feed": "bad\tname\nhere/slashes", "event_id": "1"},
+            source_fmt="MISP-feed-{feed}")
+        self.assertNotIn("\t", source)
+        self.assertEqual(source, "MISP-feed-bad-name-here-slashes")
+
+    def test_missing_feed_renders_as_none_not_a_crash(self):
+        source, _, _ = nexus.render_meta({"event_id": "1"},
+                                         source_fmt="MISP-feed-{feed}")
+        self.assertEqual(source, "MISP-feed-none")
+
+    def test_feed_lines_lint_clean(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "ip-dst", "value": "45.33.32.7", "feed": "CIRCL OSINT",
+              "event_id": "1"}],
+            source_fmt="MISP-feed-{feed}", exclusions=nexus.ExclusionSet())
+        lines = [nexus.header_line()] + nexus.rows_to_lines(rows)
+        self.assertEqual(nexus.lint_lines(lines), [])
+        self.assertIn("MISP-feed-CIRCL-OSINT", lines[1])
+
+
+class TestFeedDiscovery(Quiet):
+
+    def test_feeds_are_discovered_and_split_by_selectability(self):
+        found = nexus.discover(StubClient())
+        self.assertEqual(len(found["feeds"]), 4)
+        selectable = [f for f in found["feeds"] if nexus.feed_is_selectable(f)]
+        self.assertEqual([f["name"] for f in selectable],
+                         ["CIRCL OSINT Feed", "Botvrij.eu", "Partner Feed"])
+
+    def test_get_feeds_parses_the_misp_envelope(self):
+        misp = FakeMisp()
+        try:
+            misp.server.feeds = [
+                {"Feed": {"id": "1", "name": "CIRCL", "provider": "CIRCL",
+                          "enabled": "1", "caching_enabled": "0",
+                          "source_format": "misp", "fixed_event": "1",
+                          "event_id": "500"},
+                 "Tag": {"name": "osint:circl"}}]
+            feeds = misp.client().get_feeds()
+        finally:
+            misp.close()
+        self.assertEqual(len(feeds), 1)
+        self.assertEqual(feeds[0]["name"], "CIRCL")
+        self.assertIs(feeds[0]["enabled"], True)      # "1" -> True
+        self.assertIs(feeds[0]["caching_enabled"], False)  # "0" -> False
+        self.assertEqual(feeds[0]["tag_name"], "osint:circl")
+
+
+class TestMispBool(unittest.TestCase):
+
+    def test_misp_string_booleans(self):
+        for value in ("1", "true", 1, True):
+            self.assertIs(nexus._misp_bool(value), True)
+        for value in ("0", "", "false", 0, False, None):
+            self.assertIs(nexus._misp_bool(value), False)
+
+
+
+
+# ---------------------------------------------------------------------------
+# APPLY
+# ---------------------------------------------------------------------------
+
+class ApplyBase(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nexus-apply-")
+        self.intel = os.path.join(self.tmp, "local")
+        self.default = os.path.join(self.tmp, "default")
+        self.runtime = os.path.join(self.tmp, "runtime")
+        for path in (self.intel, self.default, self.runtime):
+            os.makedirs(path)
+        self.reporter = os.path.join(self.tmp, "reporter.log")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_default(self, name, text=""):
+        with open(os.path.join(self.default, name), "w") as handle:
+            handle.write(text)
+
+    def write_intel(self, directory, count):
+        rows = ["45.33.32.%d\tIntel::ADDR\tMISP\t-\t-" % i
+                for i in range(1, count + 1)]
+        nexus.write_atomic(os.path.join(directory, "intel.dat"),
+                           [nexus.header_line()] + rows)
+
+    def runner(self, rc=0, out="", err="", record=None):
+        def _run(argv, timeout):
+            if record is not None:
+                record.append((argv, timeout))
+            return rc, out, err
+        return _run
+
+
+class TestSeedLoadFile(ApplyBase):
+
+    def test_seeds_both_default_files(self):
+        self.write_default(nexus.SO_LOAD_FILE, "@load ./intel.dat\n")
+        self.write_default("intel.dat", nexus.header_line() + "\n")
+        copied = nexus.seed_load_file(self.intel, self.default)
+        self.assertEqual(len(copied), 2)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.intel, nexus.SO_LOAD_FILE)))
+
+    def test_never_overwrites_an_existing_intel_dat(self):
+        # The operator's file is the whole point; clobbering it would be the
+        # worst possible behaviour for a "seed" helper.
+        self.write_default("intel.dat", "DEFAULT\n")
+        self.write_default(nexus.SO_LOAD_FILE, "@load ./intel.dat\n")
+        self.write_intel(self.intel, 3)
+        copied = nexus.seed_load_file(self.intel, self.default)
+        self.assertEqual([os.path.basename(p) for p in copied],
+                         [nexus.SO_LOAD_FILE])
+        _, rows = nexus.read_existing(os.path.join(self.intel, "intel.dat"))
+        self.assertEqual(len(rows), 3)
+
+    def test_seeding_twice_is_a_noop(self):
+        self.write_default(nexus.SO_LOAD_FILE, "x")
+        nexus.seed_load_file(self.intel, self.default)
+        self.assertEqual(nexus.seed_load_file(self.intel, self.default), [])
+
+    def test_missing_defaults_raise(self):
+        with self.assertRaises(OSError):
+            nexus.seed_load_file(self.intel, os.path.join(self.tmp, "nope"))
+
+
+class TestLogScanning(ApplyBase):
+
+    def test_offset_of_a_missing_log_is_zero(self):
+        self.assertEqual(nexus.log_offset(self.reporter), 0)
+
+    def test_only_lines_appended_after_the_offset_are_read(self):
+        with open(self.reporter, "w") as handle:
+            handle.write("error: intel.dat old problem\n")
+        offset = nexus.log_offset(self.reporter)
+        with open(self.reporter, "a") as handle:
+            handle.write("error: intel.dat new problem\n")
+        errors = nexus.log_errors_since(self.reporter, offset)
+        self.assertEqual(errors, ["error: intel.dat new problem"])
+
+    def test_unrelated_errors_are_ignored(self):
+        with open(self.reporter, "w") as handle:
+            handle.write("error: something about pcap\n"
+                         "error: Intel::ADDR parse failure\n"
+                         "info: intel loaded fine\n")
+        errors = nexus.log_errors_since(self.reporter, 0)
+        self.assertEqual(errors, ["error: Intel::ADDR parse failure"])
+
+    def test_warnings_count_too(self):
+        with open(self.reporter, "w") as handle:
+            handle.write("warning: intel file line 4 malformed\n")
+        self.assertEqual(len(nexus.log_errors_since(self.reporter, 0)), 1)
+
+    def test_missing_log_yields_no_errors(self):
+        self.assertEqual(nexus.log_errors_since(self.reporter, 0), [])
+
+
+class TestVerifyRuntime(ApplyBase):
+
+    def test_missing_runtime_file_fails(self):
+        ok, message = nexus.verify_runtime(self.runtime)
+        self.assertFalse(ok)
+        self.assertIn("did not reach this node", message)
+
+    def test_count_mismatch_fails(self):
+        self.write_intel(self.runtime, 3)
+        ok, message = nexus.verify_runtime(self.runtime, expected=5)
+        self.assertFalse(ok)
+        self.assertIn("expected 5", message)
+
+    def test_matching_count_passes(self):
+        self.write_intel(self.runtime, 4)
+        ok, _ = nexus.verify_runtime(self.runtime, expected=4)
+        self.assertTrue(ok)
+
+
+class TestSaltApply(ApplyBase):
+
+    def test_runner_receives_the_argv_not_a_shell_string(self):
+        record = []
+        nexus.salt_apply(runner=self.runner(record=record))
+        argv, _ = record[0]
+        self.assertEqual(argv, nexus.SO_APPLY_ARGV)
+        self.assertIn("I@zeek:enabled:true", argv)
+        # No shell means no quoting for the compound target to get wrong.
+        self.assertNotIn("'", " ".join(argv))
+
+    def test_return_code_is_passed_through(self):
+        rc, out, err = nexus.salt_apply(runner=self.runner(rc=2, err="boom"))
+        self.assertEqual((rc, err), (2, "boom"))
+
+
+class TestApplyToGrid(ApplyBase):
+
+    def apply(self, **kwargs):
+        params = dict(intel_dir=self.intel, runtime_dir=self.runtime,
+                      reporter_log=self.reporter, runner=self.runner())
+        params.update(kwargs)
+        return nexus.apply_to_grid(**params)
+
+    def ready(self):
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        self.write_intel(self.intel, 2)
+        self.write_intel(self.runtime, 2)
+
+    def levels(self, steps):
+        return [level for level, _ in steps]
+
+    def test_missing_load_file_blocks_before_running_salt(self):
+        record = []
+        ok, steps = self.apply(runner=self.runner(record=record))
+        self.assertFalse(ok)
+        self.assertEqual(record, [])  # salt never ran
+        self.assertIn("__load__.Zeek", steps[0][1])
+
+    def test_happy_path(self):
+        self.ready()
+        ok, steps = self.apply(expected=2)
+        self.assertTrue(ok)
+        messages = " ".join(m for _, m in steps)
+        self.assertIn("completed", messages)
+        self.assertIn("no intel errors", messages)
+        self.assertNotIn("error", self.levels(steps))
+
+    def test_salt_failure_reports_and_stops(self):
+        self.ready()
+        ok, steps = self.apply(runner=self.runner(rc=1, err="minion down"))
+        self.assertFalse(ok)
+        self.assertIn("salt exited 1", steps[1][1])
+
+    def test_salt_missing_falls_back_to_printing_the_command(self):
+        self.ready()
+        def explode(argv, timeout):
+            raise OSError("salt not found on PATH")
+        ok, steps = self.apply(runner=explode)
+        self.assertFalse(ok)
+        self.assertIn("fix", self.levels(steps))
+        self.assertIn(nexus.SO_APPLY_CMD, [m for _, m in steps])
+
+    def test_reporter_errors_after_a_clean_salt_run_still_fail(self):
+        # A clean state.apply proves nothing: Zeek rejects a bad intel file
+        # through the reporter log, not through salt.
+        self.ready()
+        with open(self.reporter, "w") as handle:
+            handle.write("old noise\n")
+        def noisy(argv, timeout):
+            with open(self.reporter, "a") as handle:
+                handle.write("error: intel.dat line 3 malformed\n")
+            return 0, "", ""
+        ok, steps = self.apply(runner=noisy)
+        self.assertFalse(ok)
+        self.assertIn("malformed", " ".join(m for _, m in steps))
+
+    def test_preexisting_reporter_errors_do_not_fail_the_run(self):
+        self.ready()
+        with open(self.reporter, "w") as handle:
+            handle.write("error: intel.dat from a previous run\n")
+        ok, _ = self.apply(expected=2)
+        self.assertTrue(ok)
+
+    def test_runtime_mismatch_warns_without_blocking_the_report(self):
+        self.ready()
+        self.write_intel(self.runtime, 1)
+        ok, steps = self.apply(expected=2)
+        self.assertFalse(ok)
+        self.assertIn("warn", self.levels(steps))
+
+
+
+
+# ---------------------------------------------------------------------------
+# PROFILES
+# ---------------------------------------------------------------------------
+
+class TestProfiles(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nexus-profile-")
+        self.path = os.path.join(self.tmp, "daily.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def config(self, **extra):
+        base = {"misp_host": "misp.example", "scheme": "https", "port": 443,
+                "token": "super-secret-token-value", "types": ["ip-dst"],
+                "to_ids": True, "days": 90, "time_mode": "last",
+                "discovery": {"tags": [{"name": "tlp:amber"}] * 500}}
+        base.update(extra)
+        return base
+
+    def test_round_trip_preserves_the_answers(self):
+        nexus.save_profile(self.config(), self.path)
+        loaded = nexus.load_profile(self.path)
+        self.assertEqual(loaded["misp_host"], "misp.example")
+        self.assertEqual(loaded["types"], ["ip-dst"])
+        self.assertIs(loaded["to_ids"], True)
+
+    def test_the_token_never_reaches_disk(self):
+        nexus.save_profile(self.config(), self.path)
+        with open(self.path) as handle:
+            raw = handle.read()
+        self.assertNotIn("super-secret-token-value", raw)
+        self.assertNotIn("token", json.loads(raw)["config"])
+
+    def test_discovery_cache_is_not_persisted(self):
+        # Live MISP lists are stale the moment they are written.
+        nexus.save_profile(self.config(), self.path)
+        self.assertNotIn("discovery", nexus.load_profile(self.path))
+
+    def test_profile_is_written_0600(self):
+        nexus.save_profile(self.config(), self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_overwriting_a_loose_profile_tightens_its_mode(self):
+        open(self.path, "w").close()
+        os.chmod(self.path, 0o644)
+        nexus.save_profile(self.config(), self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_a_hand_added_token_is_dropped_on_load(self):
+        nexus.save_profile(self.config(), self.path)
+        payload = json.load(open(self.path))
+        payload["config"]["token"] = "injected"
+        json.dump(payload, open(self.path, "w"))
+        self.assertNotIn("token", nexus.load_profile(self.path))
+
+    def test_version_mismatch_is_refused(self):
+        nexus.save_profile(self.config(), self.path)
+        payload = json.load(open(self.path))
+        payload["profile_version"] = 99
+        json.dump(payload, open(self.path, "w"))
+        with self.assertRaises(ValueError):
+            nexus.load_profile(self.path)
+
+    def test_a_foreign_json_file_is_refused(self):
+        json.dump({"something": "else"}, open(self.path, "w"))
+        with self.assertRaises(ValueError):
+            nexus.load_profile(self.path)
+
+    def test_saved_profile_still_builds_search_params(self):
+        nexus.save_profile(self.config(), self.path)
+        params = nexus.build_search_params(nexus.load_profile(self.path))
+        self.assertEqual(params["type"], ["ip-dst"])
+        self.assertEqual(params["timestamp"], "90d")
+
+    def test_feeds_survive_a_round_trip(self):
+        feeds = [feed(name="CIRCL", fixed=True, event="500")]
+        nexus.save_profile(self.config(feeds=feeds), self.path)
+        loaded = nexus.load_profile(self.path)
+        self.assertEqual(nexus.feed_provenance(loaded["feeds"][0])[:2],
+                         ("fixed_event", "500"))
+
+    def test_bare_name_resolves_under_nexus_home(self):
+        self.assertEqual(nexus.profile_path("daily"),
+                         os.path.join(nexus.NEXUS_HOME, "profiles",
+                                      "daily.json"))
+
+    def test_a_path_is_taken_as_given(self):
+        self.assertEqual(nexus.profile_path("/tmp/x.json"), "/tmp/x.json")
+
+
+# ---------------------------------------------------------------------------
+# DIFF
+# ---------------------------------------------------------------------------
+
+class TestDiff(unittest.TestCase):
+
+    def rows(self, *pairs):
+        return ["%s\tIntel::%s\tMISP\tdesc\t-" % p for p in pairs]
+
+    def test_added_and_removed(self):
+        before = self.rows(("1.1.1.1", "ADDR"), ("a.example", "DOMAIN"))
+        after = [nexus.header_line()] + self.rows(("1.1.1.1", "ADDR"),
+                                                  ("b.example", "DOMAIN"))
+        added, removed = nexus.indicator_delta(before, after)
+        self.assertEqual(len(added), 1)
+        self.assertIn("b.example", added[0])
+        self.assertIn("a.example", removed[0])
+
+    def test_a_changed_description_is_not_an_add_plus_a_delete(self):
+        # Keyed on (indicator, type), so metadata churn stays invisible.
+        before = ["1.1.1.1\tIntel::ADDR\tMISP\told desc\t-"]
+        after = [nexus.header_line(), "1.1.1.1\tIntel::ADDR\tMISP\tnew desc\t-"]
+        added, removed = nexus.indicator_delta(before, after)
+        self.assertEqual((added, removed), ([], []))
+
+    def test_same_indicator_different_type_is_a_real_change(self):
+        before = ["evil.example\tIntel::DOMAIN\tMISP\t-\t-"]
+        after = [nexus.header_line(), "evil.example\tIntel::URL\tMISP\t-\t-"]
+        added, removed = nexus.indicator_delta(before, after)
+        self.assertEqual((len(added), len(removed)), (1, 1))
+
+    def test_header_is_never_counted_as_an_indicator(self):
+        added, _ = nexus.indicator_delta([], [nexus.header_line()])
+        self.assertEqual(added, [])
+
+    def test_summary_counts(self):
+        before = self.rows(("1.1.1.1", "ADDR"), ("2.2.2.2", "ADDR"))
+        after = [nexus.header_line()] + self.rows(("1.1.1.1", "ADDR"),
+                                                  ("3.3.3.3", "ADDR"))
+        text = nexus.summarise_delta(before, after)
+        self.assertIn("1 added, 1 removed, 1 unchanged", text)
+
+    def test_summary_caps_the_sample(self):
+        after = [nexus.header_line()] + self.rows(
+            *[("1.1.1.%d" % i, "ADDR") for i in range(1, 30)])
+        text = nexus.summarise_delta([], after, sample=5)
+        self.assertIn("...and 24 more", text)
+
+    def test_unified_diff_is_produced(self):
+        before = self.rows(("1.1.1.1", "ADDR"))
+        after = [nexus.header_line()] + self.rows(("2.2.2.2", "ADDR"))
+        diff = nexus.unified_intel_diff(before, after, "/x/intel.dat")
+        self.assertTrue(any(l.startswith("+") for l in diff))
+        self.assertTrue(any(l.startswith("-") for l in diff))
+
+    def test_identical_bodies_produce_no_diff(self):
+        rows = self.rows(("1.1.1.1", "ADDR"))
+        self.assertEqual(
+            nexus.unified_intel_diff(rows, [nexus.header_line()] + rows, "/x"),
+            [])
+
+
+class TestResolveToken(unittest.TestCase):
+
+    class Args(object):
+        token_file = None
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nexus-token-")
+        self.args = self.Args()
+        self.saved_home = nexus.NEXUS_HOME
+        nexus.NEXUS_HOME = self.tmp
+        self.saved_env = os.environ.pop("NEXUS_MISP_TOKEN", None)
+
+    def tearDown(self):
+        nexus.NEXUS_HOME = self.saved_home
+        if self.saved_env is not None:
+            os.environ["NEXUS_MISP_TOKEN"] = self.saved_env
+        else:
+            os.environ.pop("NEXUS_MISP_TOKEN", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_token_file_wins(self):
+        path = os.path.join(self.tmp, "tok")
+        with open(path, "w") as handle:
+            handle.write("  from-file  \n")
+        self.args.token_file = path
+        self.assertEqual(nexus.resolve_token(self.args), "from-file")
+
+    def test_env_is_used_next(self):
+        os.environ["NEXUS_MISP_TOKEN"] = "from-env"
+        self.assertEqual(nexus.resolve_token(self.args), "from-env")
+
+    def test_unreadable_token_file_does_not_traceback(self):
+        self.args.token_file = os.path.join(self.tmp, "nope")
+        os.environ["NEXUS_MISP_TOKEN"] = "from-env"
+        with self.assertLogs(nexus.log, level="WARNING"):
+            self.assertEqual(nexus.resolve_token(self.args), "from-env")
+
+    def test_non_interactive_returns_empty_instead_of_prompting(self):
+        # --yes must fail loudly, never block on a prompt nobody will answer.
+        with self.assertLogs(nexus.log, level="ERROR"):
+            self.assertEqual(
+                nexus.resolve_token(self.args, interactive=False), "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

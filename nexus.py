@@ -1,0 +1,3238 @@
+#!/usr/bin/env python3
+"""nexus.py - build a Zeek intel.dat from MISP, for Security Onion 3.2.
+
+Phases 0-3 and 5: environment check, MISP client, the mapping/normalise/write
+core, the interactive interview, and the safety guardrails.
+
+Standard library only.  Python 3.6+.
+"""
+
+import argparse
+import difflib
+import getpass
+import ipaddress
+import json
+import logging
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+__version__ = "0.2.0-dev"
+
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Security Onion 3.2 paths.  The manager-side source of truth is under
+# saltstack/local; `salt -C 'I@zeek:enabled:true' state.apply zeek` syncs it to
+# the runtime path on each node.
+SO_INTEL_DIR = "/opt/so/saltstack/local/salt/zeek/policy/intel"
+SO_INTEL_DEFAULT_DIR = "/opt/so/saltstack/default/salt/zeek/policy/intel"
+SO_INTEL_RUNTIME_DIR = "/opt/so/conf/zeek/policy/intel"
+SO_INTEL_FILE = os.path.join(SO_INTEL_DIR, "intel.dat")
+SO_LOAD_FILE = "__load__.Zeek"
+SO_VERSION_FILES = ("/etc/soversion", "/opt/so/saltstack/local/pillar/global.sls")
+# argv rather than a shell string -- nothing here needs a shell, and the
+# compound target contains quotes that a shell would have to be trusted with.
+SO_APPLY_ARGV = ["sudo", "salt", "-C", "I@zeek:enabled:true",
+                 "state.apply", "zeek"]
+SO_APPLY_CMD = "sudo salt -C 'I@zeek:enabled:true' state.apply zeek"
+SO_REPORTER_LOG = "/nsm/zeek/logs/current/reporter.log"
+SO_INTEL_LOG = "/nsm/zeek/logs/current/intel.log"
+SO_ZEEK_POLICY_DIRS = (
+    "/opt/so/saltstack/local/salt/zeek/policy",
+    "/opt/so/conf/zeek/policy",
+)
+
+# Nexus working state.
+NEXUS_HOME = "/opt/nexus"
+
+PROFILE_VERSION = 1
+# Never persisted.  The token is a secret; `discovery` is a cache of live MISP
+# lists that would be stale the moment it is written.
+PROFILE_EXCLUDED_KEYS = ("token", "discovery")
+
+# Zeek Intel framework.  This is the complete Intel::Type set.
+ZEEK_TYPES = (
+    "Intel::ADDR",
+    "Intel::SUBNET",
+    "Intel::URL",
+    "Intel::SOFTWARE",
+    "Intel::EMAIL",
+    "Intel::DOMAIN",
+    "Intel::USER_NAME",
+    "Intel::CERT_HASH",
+    "Intel::PUBKEY_HASH",
+    "Intel::FILE_HASH",
+    "Intel::FILE_NAME",
+)
+
+INTEL_FIELDS = ("indicator", "indicator_type", "meta.source", "meta.desc", "meta.url")
+NULL_FIELD = "-"
+
+# Reject subnets broader than these -- a stray /8 in MISP would arm Zeek
+# against a sixteenth of the internet.
+MIN_PREFIX_V4 = 16
+MIN_PREFIX_V6 = 32
+
+# md5 32, sha1 40, sha224 56, sha256 64, sha384 96, sha512 128.
+VALID_HASH_LENGTHS = frozenset((32, 40, 56, 64, 96, 128))
+
+DEFAULT_META_MAXLEN = 200
+DEFAULT_SOURCE_PREFIX = "MISP"
+
+# MISP attribute type -> [(value part index, Zeek Intel type), ...]
+# Composite MISP types ("domain|ip") carry two indicators separated by "|";
+# the part index selects which half feeds which Zeek type.
+MISP_TO_ZEEK = {
+    # -- network -----------------------------------------------------------
+    "ip-src": [(0, "Intel::ADDR")],
+    "ip-dst": [(0, "Intel::ADDR")],
+    "ip-src|port": [(0, "Intel::ADDR")],
+    "ip-dst|port": [(0, "Intel::ADDR")],
+    "domain": [(0, "Intel::DOMAIN")],
+    "hostname": [(0, "Intel::DOMAIN")],
+    "domain|ip": [(0, "Intel::DOMAIN"), (1, "Intel::ADDR")],
+    "hostname|port": [(0, "Intel::DOMAIN")],
+    "url": [(0, "Intel::URL")],
+    "uri": [(0, "Intel::URL")],
+    "link": [(0, "Intel::URL")],
+    # -- file --------------------------------------------------------------
+    "md5": [(0, "Intel::FILE_HASH")],
+    "sha1": [(0, "Intel::FILE_HASH")],
+    "sha224": [(0, "Intel::FILE_HASH")],
+    "sha256": [(0, "Intel::FILE_HASH")],
+    "sha384": [(0, "Intel::FILE_HASH")],
+    "sha512": [(0, "Intel::FILE_HASH")],
+    "filename": [(0, "Intel::FILE_NAME")],
+    "filename|md5": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    "filename|sha1": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    "filename|sha224": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    "filename|sha256": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    "filename|sha384": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    "filename|sha512": [(0, "Intel::FILE_NAME"), (1, "Intel::FILE_HASH")],
+    # -- email -------------------------------------------------------------
+    "email": [(0, "Intel::EMAIL")],
+    "email-src": [(0, "Intel::EMAIL")],
+    "email-dst": [(0, "Intel::EMAIL")],
+    "email-reply-to": [(0, "Intel::EMAIL")],
+    "target-email": [(0, "Intel::EMAIL")],
+    "whois-registrant-email": [(0, "Intel::EMAIL")],
+    # -- tls ---------------------------------------------------------------
+    "x509-fingerprint-sha1": [(0, "Intel::CERT_HASH")],
+    # -- host --------------------------------------------------------------
+    "user-agent": [(0, "Intel::SOFTWARE")],
+    "target-user": [(0, "Intel::USER_NAME")],
+    "github-username": [(0, "Intel::USER_NAME")],
+    "whois-registrant-name": [(0, "Intel::USER_NAME")],
+}
+
+# Types deliberately dropped, with the reason surfaced in the run report so
+# nothing disappears silently.
+MISP_UNMAPPABLE = {
+    "x509-fingerprint-md5": "Intel::CERT_HASH is SHA-1 only",
+    "x509-fingerprint-sha256": "Intel::CERT_HASH is SHA-1 only",
+    "ssdeep": "fuzzy hash, no Zeek equivalent",
+    "imphash": "no Zeek equivalent",
+    "authentihash": "no Zeek equivalent",
+    "vhash": "no Zeek equivalent",
+    "tlsh": "fuzzy hash, no Zeek equivalent",
+    "pehash": "no Zeek equivalent",
+}
+
+# Noisy or low-value by default; the interview turns these on explicitly.
+MISP_OFF_BY_DEFAULT = frozenset(
+    ("filename", "link", "target-user", "github-username", "whois-registrant-name")
+)
+
+# IOC classes offered in the interview (phase 3 consumes this).
+IOC_CLASSES = {
+    "network": ("Network - IP / subnet / domain / URL",
+                ["ip-src", "ip-dst", "ip-src|port", "ip-dst|port", "domain",
+                 "hostname", "domain|ip", "hostname|port", "url", "uri", "link"]),
+    "file": ("File - hashes / filenames",
+             ["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "filename",
+              "filename|md5", "filename|sha1", "filename|sha224",
+              "filename|sha256", "filename|sha384", "filename|sha512"]),
+    "email": ("Email - addresses",
+              ["email", "email-src", "email-dst", "email-reply-to",
+               "target-email", "whois-registrant-email"]),
+    "tls": ("TLS - certificate hashes", ["x509-fingerprint-sha1"]),
+    "host": ("Host - user agents / usernames",
+             ["user-agent", "target-user", "github-username",
+              "whois-registrant-name"]),
+}
+
+log = logging.getLogger("nexus")
+
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+
+class RedactingFilter(logging.Filter):
+    """Scrub secrets out of every log record.
+
+    The API token reaches a surprising number of places -- exception text from
+    urllib, debug dumps of request headers -- so redaction happens at the
+    logging layer rather than at each call site.
+    """
+
+    def __init__(self):
+        super(RedactingFilter, self).__init__()
+        self._secrets = []
+
+    def add_secret(self, secret):
+        if secret and len(secret) >= 8:
+            self._secrets.append(secret)
+
+    def scrub(self, text):
+        for secret in self._secrets:
+            text = text.replace(secret, "***REDACTED***")
+        return text
+
+    _scrub = scrub  # retained: callers predate the public name
+
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            record.msg = self._scrub(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = dict(
+                    (k, self._scrub(v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                )
+            else:
+                record.args = tuple(
+                    self._scrub(a) if isinstance(a, str) else a for a in record.args
+                )
+        if record.exc_text:
+            record.exc_text = self._scrub(record.exc_text)
+        return True
+
+
+REDACTOR = RedactingFilter()
+
+
+class RedactingFormatter(logging.Formatter):
+    """Scrub the fully rendered record, tracebacks included.
+
+    RedactingFilter alone is not enough: logging runs filters before
+    formatting, so `record.exc_text` is still None at filter time and an
+    exception carrying the token would reach the handler unredacted.
+    """
+
+    def format(self, record):
+        return REDACTOR.scrub(logging.Formatter.format(self, record))
+
+
+def setup_logging(verbose=False, logfile=None, required=True):
+    """Configure the nexus logger.
+
+    `required` is False when the log path is just the built-in default -- an
+    offline `--lint` on a workstation should not nag about /opt/nexus.
+    """
+    root = logging.getLogger("nexus")
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    root.handlers = []
+
+    stream = logging.StreamHandler(sys.stderr)
+    stream.setFormatter(RedactingFormatter("%(levelname)s %(message)s"))
+    stream.addFilter(REDACTOR)
+    root.addHandler(stream)
+
+    if logfile:
+        try:
+            os.makedirs(os.path.dirname(logfile), exist_ok=True)
+            fh = logging.FileHandler(logfile)
+            fh.setFormatter(
+                RedactingFormatter("%(asctime)s %(levelname)s %(message)s")
+            )
+            fh.addFilter(REDACTOR)
+            root.addHandler(fh)
+        except OSError as exc:
+            log_at = root.warning if required else root.debug
+            log_at("could not open log file %s: %s", logfile, exc)
+    return root
+
+
+# ---------------------------------------------------------------------------
+# MISP CLIENT
+# ---------------------------------------------------------------------------
+
+def _is_loopback(host):
+    """Plain HTTP to localhost is a lab setup, not a token disclosure."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+class NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that would leak the Authorization header.
+
+    urllib's default handler forwards all headers on a 3xx, so a compromised
+    or merely misconfigured MISP could bounce the request -- and the API
+    token with it -- to an arbitrary host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_host = urllib.parse.urlparse(req.full_url).netloc
+        new_host = urllib.parse.urlparse(newurl).netloc
+        if new_host and new_host != old_host:
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                "refusing cross-host redirect to %s (would leak the API token)"
+                % newurl, headers, fp)
+        return urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+
+
+class MispError(Exception):
+    """Any failure talking to MISP."""
+
+
+class MispAuthError(MispError):
+    """401/403 -- bad or unprivileged token."""
+
+
+class MispClient(object):
+    """Minimal MISP REST client over urllib.
+
+    Only this class speaks HTTP.  Everything downstream sees flattened dicts.
+    """
+
+    RETRY_STATUS = frozenset((429, 500, 502, 503, 504))
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, page_size=1000):
+        self.host = host
+        self.scheme = scheme
+        self.port = port
+        self.token = token
+        self.verify_tls = verify_tls
+        self.timeout = timeout
+        self.retries = max(1, retries)  # retries=0 would send no request at all
+        self.page_size = page_size
+        REDACTOR.add_secret(token)
+
+        netloc = host if not port else "%s:%d" % (host, port)
+        self.base_url = "%s://%s" % (scheme, netloc)
+
+        handlers = []
+        if scheme == "https":
+            if verify_tls:
+                ctx = ssl.create_default_context()
+            else:
+                ctx = ssl._create_unverified_context()
+                log.warning(
+                    "TLS certificate verification is DISABLED for %s", self.base_url
+                )
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        if scheme == "http" and not _is_loopback(host):
+            log.warning("using plain HTTP for %s -- the API token is sent in "
+                        "cleartext", self.base_url)
+        handlers.append(NoCrossHostRedirect())
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
+
+    # -- transport ---------------------------------------------------------
+
+    def _request(self, method, path, body=None):
+        """Return (parsed_json, headers).  Retries on transient failures."""
+        url = urllib.parse.urljoin(self.base_url, path)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {
+            "Authorization": self.token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "nexus/%s" % __version__,
+        }
+
+        last_exc = None
+        for attempt in range(1, self.retries + 1):
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with self._opener.open(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                    # Keep the Message object -- its lookup is case-insensitive.
+                    return self._decode(raw, url), resp.headers
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    raise MispAuthError(
+                        "MISP rejected the API token (HTTP %d) for %s" % (exc.code, url)
+                    )
+                if exc.code in self.RETRY_STATUS and attempt < self.retries:
+                    last_exc = exc
+                    self._backoff(attempt, "HTTP %d" % exc.code)
+                    continue
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", "replace")[:500]
+                except Exception:  # pragma: no cover - best effort only
+                    pass
+                raise MispError("HTTP %d from %s %s" % (exc.code, url, detail))
+            except (urllib.error.URLError, ssl.SSLError, OSError) as exc:
+                if attempt < self.retries:
+                    last_exc = exc
+                    self._backoff(attempt, str(exc))
+                    continue
+                raise MispError("could not reach %s: %s" % (url, exc))
+        raise MispError("giving up on %s after %d attempts: %s"
+                        % (url, self.retries, last_exc))
+
+    @staticmethod
+    def _decode(raw, url):
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise MispError("malformed JSON from %s: %s" % (url, exc))
+
+    @staticmethod
+    def _backoff(attempt, reason):
+        delay = min(2 ** attempt, 30)
+        log.debug("retrying in %ss (%s)", delay, reason)
+        time.sleep(delay)
+
+    # -- discovery ---------------------------------------------------------
+
+    def get_version(self):
+        data, _ = self._request("GET", "/servers/getVersion")
+        return data
+
+    def describe_types(self):
+        data, _ = self._request("GET", "/attributes/describeTypes")
+        result = data.get("result", data)
+        return {
+            "types": result.get("types", []),
+            "categories": result.get("categories", []),
+        }
+
+    def get_tags(self):
+        data, _ = self._request("GET", "/tags")
+        tags = data.get("Tag", data if isinstance(data, list) else [])
+        return [
+            {"id": t.get("id"), "name": t.get("name"), "colour": t.get("colour")}
+            for t in tags
+            if isinstance(t, dict) and t.get("name")
+        ]
+
+    def get_orgs(self):
+        data, _ = self._request("GET", "/organisations")
+        out = []
+        for row in data if isinstance(data, list) else []:
+            org = row.get("Organisation", row)
+            if org.get("name"):
+                out.append({"id": org.get("id"), "name": org.get("name"),
+                            "uuid": org.get("uuid")})
+        return out
+
+    def get_feeds(self):
+        """Configured feeds, enabled or not.
+
+        A feed's own record is the only place that says how its data can be
+        recognised once ingested -- restSearch has no feed_id filter.
+        """
+        data, _ = self._request("GET", "/feeds")
+        # MISP returns a bare list here on some versions, an envelope on others.
+        rows = data if isinstance(data, list) else data.get("response", [])
+        out = []
+        for row in rows:
+            feed = row.get("Feed", row) if isinstance(row, dict) else {}
+            if not feed.get("id"):
+                continue
+            tag = (row.get("Tag") or {}) if isinstance(row, dict) else {}
+            out.append({
+                "id": str(feed.get("id")),
+                "name": feed.get("name") or "feed %s" % feed.get("id"),
+                "provider": feed.get("provider") or "",
+                "url": feed.get("url") or "",
+                "enabled": _misp_bool(feed.get("enabled")),
+                "caching_enabled": _misp_bool(feed.get("caching_enabled")),
+                "source_format": feed.get("source_format") or "",
+                "tag_id": feed.get("tag_id"),
+                "tag_name": tag.get("name") or "",
+                "orgc_id": feed.get("orgc_id"),
+                "fixed_event": _misp_bool(feed.get("fixed_event")),
+                "event_id": feed.get("event_id"),
+            })
+        return out
+
+    def get_sharing_groups(self):
+        data, _ = self._request("GET", "/sharing_groups")
+        # MISP returns a bare list here on some versions, an envelope on others.
+        rows = data if isinstance(data, list) else data.get("response", [])
+        out = []
+        for row in rows:
+            sg = row.get("SharingGroup", row)
+            if sg.get("name"):
+                out.append({"id": sg.get("id"), "name": sg.get("name")})
+        return out
+
+    # -- search ------------------------------------------------------------
+
+    def count_type(self, misp_type, base_params=None, probe_limit=5000):
+        """Return (count, exact).
+
+        MISP does not reliably report a total, so trust the X-Result-Count
+        header when it is present and fall back to a bounded probe otherwise.
+        `exact` is False when the probe hit its ceiling.
+        """
+        params = dict(base_params or {})
+        params.update({"type": misp_type, "limit": probe_limit, "page": 1,
+                       "returnFormat": "json"})
+        data, headers = self._request("POST", "/attributes/restSearch", params)
+
+        header_count = headers.get("X-Result-Count")
+        if header_count is not None:
+            try:
+                return int(header_count), True
+            except (TypeError, ValueError):
+                pass
+
+        attrs = self._extract_attributes(data)
+        return len(attrs), len(attrs) < probe_limit
+
+    def search_attributes(self, params, max_results=None, max_pages=None):
+        """Yield flattened attribute records, paging until MISP runs dry."""
+        page = 1
+        yielded = 0
+        previous_signature = None
+        while max_pages is None or page <= max_pages:
+            body = dict(params)
+            body.update({"returnFormat": "json", "limit": self.page_size,
+                         "page": page})
+            data, _ = self._request("POST", "/attributes/restSearch", body)
+            attrs = self._extract_attributes(data)
+            if not attrs:
+                return
+
+            signature = tuple((a.get("uuid"), a.get("id"), a.get("value"))
+                              for a in attrs)
+            if signature == previous_signature:
+                log.warning("stopped because MISP repeated page %d -- does "
+                            "this instance honour the `page` parameter?", page)
+                return
+            previous_signature = signature
+
+            for attr in attrs:
+                yield flatten_attribute(attr)
+                yielded += 1
+                if max_results is not None and yielded >= max_results:
+                    log.info("stopped at max_results=%d", max_results)
+                    return
+
+            if len(attrs) < self.page_size:
+                return
+            page += 1
+        log.warning("stopped at the explicit %d page ceiling", max_pages)
+
+    @staticmethod
+    def _extract_attributes(data):
+        if not isinstance(data, dict):
+            return []
+        response = data.get("response", data)
+        if isinstance(response, dict):
+            attrs = response.get("Attribute", [])
+        elif isinstance(response, list):
+            attrs = response
+        else:
+            attrs = []
+        return [a for a in attrs if isinstance(a, dict)]
+
+
+def _misp_bool(value):
+    """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""
+    if isinstance(value, str):
+        return value not in ("0", "", "false", "False")
+    return bool(value)
+
+
+def flatten_attribute(attr):
+    """MISP attribute JSON -> the internal record the rest of Nexus uses."""
+    event = attr.get("Event") or {}
+    tags = []
+    for source in (attr.get("Tag") or [], event.get("Tag") or []):
+        for tag in source:
+            name = tag.get("name") if isinstance(tag, dict) else None
+            if name and name not in tags:
+                tags.append(name)
+
+    to_ids = attr.get("to_ids")
+    if isinstance(to_ids, str):
+        to_ids = to_ids not in ("0", "", "false", "False")
+
+    return {
+        "value": attr.get("value") or "",
+        "type": attr.get("type") or "",
+        "category": attr.get("category") or "",
+        "to_ids": bool(to_ids),
+        "uuid": attr.get("uuid") or "",
+        "timestamp": attr.get("timestamp") or "",
+        "comment": attr.get("comment") or "",
+        "event_id": str(attr.get("event_id") or event.get("id") or ""),
+        "event_uuid": attr.get("event_uuid") or event.get("uuid") or "",
+        "event_info": event.get("info") or "",
+        "event_tags": tags,
+        "org": (event.get("Orgc") or {}).get("name") or event.get("org_id") or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# FEEDS
+# ---------------------------------------------------------------------------
+
+# Once a feed's data is ingested it is just attributes -- restSearch has no
+# feed_id.  These are the three traces a feed can leave, most precise first.
+FEED_PROVENANCE_ORDER = ("fixed_event", "tag", "org")
+
+
+def feed_provenance(feed):
+    """How this feed's ingested attributes can be recognised, or None.
+
+    Returns (kind, value, description).  A feed with no fixed event, no
+    default tag and no dedicated org leaves nothing behind to filter on --
+    its attributes are indistinguishable from the rest of MISP, so it is
+    reported untraceable rather than silently matching everything.
+    """
+    if feed.get("fixed_event") and feed.get("event_id"):
+        return ("fixed_event", str(feed["event_id"]),
+                "all its data lands in event %s" % feed["event_id"])
+    if feed.get("tag_name"):
+        return ("tag", feed["tag_name"], "tagged %s" % feed["tag_name"])
+    if feed.get("orgc_id"):
+        return ("org", str(feed["orgc_id"]),
+                "created as org %s" % feed["orgc_id"])
+    return None
+
+
+def feed_is_selectable(feed):
+    return feed_provenance(feed) is not None
+
+
+def apply_feed_to_params(params, feed):
+    """AND a feed's provenance onto an existing restSearch body.
+
+    Returns a new dict -- the caller runs one query per feed and merges, since
+    two feeds identified by different mechanisms (one by event, one by tag)
+    cannot be expressed as a single restSearch body.
+    """
+    provenance = feed_provenance(feed)
+    if provenance is None:
+        raise ValueError("feed %r is not traceable after ingest" % feed.get("name"))
+
+    kind, value, _ = provenance
+    merged = dict(params)
+    if kind == "fixed_event":
+        merged["eventid"] = [value]
+    elif kind == "tag":
+        # restSearch ORs a tag list, so the feed's tag and the operator's own
+        # include-tags cannot both be *required* in one body.  The feed tag is
+        # the narrower selector and goes to MISP; the operator's include-tags
+        # are then applied client-side by _fetch_records().
+        tags = dict(merged.get("tags") or {})
+        tags["OR"] = [value]
+        merged["tags"] = tags
+    elif kind == "org":
+        merged["org"] = [value]
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# MAPPING
+# ---------------------------------------------------------------------------
+
+def mappable_types():
+    """MISP attribute types Nexus can turn into Zeek intel."""
+    return sorted(MISP_TO_ZEEK)
+
+
+def zeek_type_for(misp_type):
+    """Human-readable target type(s), for the interview's annotated list."""
+    spec = MISP_TO_ZEEK.get(misp_type)
+    if not spec:
+        return None
+    seen = []
+    for _, ztype in spec:
+        if ztype not in seen:
+            seen.append(ztype)
+    return " + ".join(seen)
+
+
+def map_attribute(record, split_composites="both", allow_subnet=True):
+    """Record -> [(raw_indicator, zeek_type), ...] before normalisation.
+
+    `split_composites` is "both", "first" or "second" and decides which halves
+    of a composite MISP value (domain|ip, filename|md5) become indicators.
+    """
+    spec = MISP_TO_ZEEK.get(record.get("type"))
+    if not spec:
+        return []
+
+    value = (record.get("value") or "").strip()
+    if not value:
+        return []
+
+    parts = value.split("|") if "|" in record.get("type", "") else [value]
+
+    wanted = set(idx for idx, _ in spec)
+    if len(spec) > 1 and split_composites != "both":
+        wanted = {0} if split_composites == "first" else {1}
+
+    out = []
+    for idx, ztype in spec:
+        if idx not in wanted or idx >= len(parts):
+            continue
+        part = parts[idx].strip()
+        if not part:
+            continue
+        # A CIDR value in an ip-src/ip-dst attribute is a subnet, not a host.
+        if ztype == "Intel::ADDR" and "/" in part:
+            if not allow_subnet:
+                continue
+            ztype = "Intel::SUBNET"
+        out.append((part, ztype))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# NORMALISE / VALIDATE
+# ---------------------------------------------------------------------------
+
+class Rejected(Exception):
+    """An indicator did not survive normalisation.  Carries a tally reason."""
+
+    def __init__(self, reason):
+        super(Rejected, self).__init__(reason)
+        self.reason = reason
+
+
+_CONTROL_RE = re.compile(r"[\t\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LABEL_RE = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$")
+_HEX_RE = re.compile(r"^[0-9a-f]+$")
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+# Defanging seen in the wild.  MISP normally stores fanged values, but
+# copy-paste from reports leaks these through often enough to be worth undoing.
+_DEFANG = (
+    ("[.]", "."), ("(.)", "."), ("{.}", "."), ("[dot]", "."), ("(dot)", "."),
+    ("[:]", ":"), ("[at]", "@"), ("(at)", "@"), ("[@]", "@"),
+    ("hxxps", "https"), ("hxxp", "http"),
+)
+
+
+def defang_repair(value):
+    """Undo common defanging.
+
+    Only applied to network indicators -- a filename may legitimately contain
+    something like "report(dot)exe" and must not be rewritten.
+    """
+    out = value
+    for needle, replacement in _DEFANG:
+        if needle in out:
+            out = out.replace(needle, replacement)
+        upper = needle.upper()
+        if upper != needle and upper in out:
+            out = out.replace(upper, replacement)
+    return out
+
+
+def _reject_control(value):
+    """Tabs and newlines would split a record into garbage columns."""
+    if _CONTROL_RE.search(value):
+        raise Rejected("control_char")
+    return value
+
+
+def _prepare(value, defang=False):
+    if value is None:
+        raise Rejected("empty")
+    value = value.strip()
+    if defang:
+        value = defang_repair(value)
+    if not value:
+        raise Rejected("empty")
+    return _reject_control(value)
+
+
+def norm_addr(value):
+    value = _prepare(value, defang=True)
+    if "/" in value:
+        raise Rejected("cidr_in_addr")
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        raise Rejected("invalid_ip")
+    if addr.is_unspecified:
+        raise Rejected("unspecified_ip")
+    if addr.is_loopback:
+        raise Rejected("loopback_ip")
+    if addr.is_multicast:
+        raise Rejected("multicast_ip")
+    if addr.is_link_local:
+        raise Rejected("link_local_ip")
+    return str(addr)
+
+
+def norm_subnet(value):
+    value = _prepare(value, defang=True)
+    if "/" not in value:
+        raise Rejected("not_a_cidr")
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        raise Rejected("invalid_cidr")
+    if net.prefixlen == 0:
+        raise Rejected("default_route")
+    minimum = MIN_PREFIX_V4 if net.version == 4 else MIN_PREFIX_V6
+    if net.prefixlen < minimum:
+        raise Rejected("subnet_too_broad")
+    # Mirror norm_addr: a loopback or multicast range is never a real IOC.
+    if net.is_loopback:
+        raise Rejected("loopback_subnet")
+    if net.is_multicast:
+        raise Rejected("multicast_subnet")
+    if net.is_link_local:
+        raise Rejected("link_local_subnet")
+    return str(net)
+
+
+def norm_domain(value):
+    value = _prepare(value, defang=True).lower().rstrip(".")
+    if value.startswith("*."):
+        value = value[2:]
+    if not value:
+        raise Rejected("empty")
+    if "/" in value or " " in value:
+        raise Rejected("not_a_domain")
+    try:
+        ipaddress.ip_address(value)
+        raise Rejected("ip_as_domain")
+    except ValueError:
+        pass
+
+    if any(ord(ch) > 127 for ch in value):
+        try:
+            value = value.encode("idna").decode("ascii").lower()
+        except (UnicodeError, UnicodeDecodeError):
+            raise Rejected("idna_failed")
+
+    if len(value) > 253:
+        raise Rejected("domain_too_long")
+    labels = value.split(".")
+    if len(labels) < 2:
+        raise Rejected("bare_tld")
+    for label in labels:
+        if not _LABEL_RE.match(label):
+            raise Rejected("invalid_label")
+    if labels[-1].isdigit():
+        raise Rejected("numeric_tld")
+    return value
+
+
+def norm_url(value):
+    """Strip the scheme -- Zeek matches host+uri with no protocol prefix."""
+    value = _prepare(value, defang=True)
+    value = _SCHEME_RE.sub("", value)
+    value = value.lstrip("/")
+    value = value.split("#", 1)[0]
+    if not value:
+        raise Rejected("empty_url")
+    if " " in value:
+        raise Rejected("whitespace_in_url")
+
+    host, sep, rest = value.partition("/")
+    if not host:
+        raise Rejected("empty_url")
+    # user:pass@host -- credentials never appear in the host header Zeek
+    # matches against, so drop them rather than emit an indicator that cannot
+    # possibly fire.
+    authority = host.rpartition("@")[2]
+    host_only = authority.split(":", 1)[0]
+    try:
+        norm_domain(host_only)
+    except Rejected:
+        try:
+            norm_addr(host_only)
+        except Rejected:
+            raise Rejected("url_no_host")
+    host = authority
+    # Zeek builds the match candidate as host+uri, and a uri always starts
+    # with "/".  A pathless indicator would therefore never fire.
+    if not sep:
+        return host.lower() + "/"
+    return host.lower() + "/" + rest
+
+
+def norm_hash(value):
+    value = _prepare(value).lower().replace(":", "")
+    if not _HEX_RE.match(value):
+        raise Rejected("hash_not_hex")
+    if len(value) not in VALID_HASH_LENGTHS:
+        raise Rejected("hash_bad_length")
+    return value
+
+
+def norm_cert_hash(value):
+    value = _prepare(value).lower().replace(":", "")
+    if not _HEX_RE.match(value):
+        raise Rejected("cert_not_hex")
+    if len(value) != 40:
+        raise Rejected("cert_not_sha1")
+    return value
+
+
+def norm_email(value):
+    value = _prepare(value, defang=True).lower()
+    value = value.strip("<>")
+    if value.count("@") != 1:
+        raise Rejected("invalid_email")
+    local, _, domain = value.partition("@")
+    if not local or _CONTROL_RE.search(local) or " " in local:
+        raise Rejected("invalid_email")
+    if any(ch in local for ch in "<>,;"):
+        raise Rejected("invalid_email")
+    # Rebuild from the normalised domain -- returning the raw input would
+    # keep a trailing dot, a wildcard label, or mixed case.
+    return local + "@" + norm_domain(domain)
+
+
+def norm_filename(value, reason="filename_too_long"):
+    value = _prepare(value)
+    if len(value) > 255:
+        raise Rejected(reason)
+    return value
+
+
+def norm_freeform(value):
+    return norm_filename(value, reason="value_too_long")
+
+
+NORMALISERS = {
+    "Intel::ADDR": norm_addr,
+    "Intel::SUBNET": norm_subnet,
+    "Intel::DOMAIN": norm_domain,
+    "Intel::URL": norm_url,
+    "Intel::FILE_HASH": norm_hash,
+    "Intel::CERT_HASH": norm_cert_hash,
+    "Intel::EMAIL": norm_email,
+    "Intel::FILE_NAME": norm_filename,
+    "Intel::SOFTWARE": norm_freeform,
+    "Intel::USER_NAME": norm_freeform,
+}
+
+
+def normalise(indicator, zeek_type):
+    """Canonicalise, or raise Rejected with a tally-able reason."""
+    fn = NORMALISERS.get(zeek_type)
+    if fn is None:
+        raise Rejected("unknown_intel_type")
+    return fn(indicator)
+
+
+def sanitize_meta(value, maxlen=DEFAULT_META_MAXLEN):
+    """Metadata is freeform, so it is the most likely thing to hold a tab."""
+    if value is None:
+        return NULL_FIELD
+    text = _CONTROL_RE.sub(" ", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return NULL_FIELD
+    if len(text) > maxlen:
+        text = text[:maxlen].rstrip()
+    return text or NULL_FIELD
+
+
+# ---------------------------------------------------------------------------
+# FILTERS
+# ---------------------------------------------------------------------------
+
+class ExclusionSet(object):
+    """Local exclusions -- keeps Nexus from arming Zeek against your own kit."""
+
+    def __init__(self, exclude_private=True, own_networks=None, own_domains=None,
+                 allowlist=None):
+        self.exclude_private = exclude_private
+        self.own_networks = []
+        for cidr in own_networks or []:
+            try:
+                self.own_networks.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                log.warning("ignoring invalid exclusion network %r", cidr)
+        self.own_domains = [d.strip().lower().lstrip(".")
+                            for d in (own_domains or []) if d.strip()]
+        # Indicators arrive normalised (lowercased), so match both forms.
+        entries = set(a.strip() for a in (allowlist or []) if a.strip())
+        self.allowlist = entries | set(a.lower() for a in entries)
+
+    def _domain_excluded(self, domain):
+        for own in self.own_domains:
+            if domain == own or domain.endswith("." + own):
+                return "own_domain"
+        return None
+
+    def reason(self, indicator, zeek_type):
+        """Return an exclusion reason, or None to keep the indicator."""
+        if indicator in self.allowlist or indicator.lower() in self.allowlist:
+            return "allowlisted"
+
+        # `own_network` is reported ahead of `private_ip` because it is the
+        # more actionable answer when an operator's own space is also RFC1918.
+        #
+        # Note that Python's `is_private` is broader than RFC1918: it also
+        # covers the documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+        # 203.0.113.0/24, 2001:db8::/32), benchmarking, and carrier-grade NAT.
+        # That is what we want -- none of those belong in threat intel -- but
+        # it does mean example addresses get dropped, which surprises people.
+        try:
+            return self._reason(indicator, zeek_type)
+        except ValueError:
+            # Callers are expected to pass normalised indicators; an
+            # unnormalised one is not this method's problem to reject.
+            return None
+
+    def _reason(self, indicator, zeek_type):
+        if zeek_type == "Intel::ADDR":
+            addr = ipaddress.ip_address(indicator)
+            for net in self.own_networks:
+                if addr.version == net.version and addr in net:
+                    return "own_network"
+            if self.exclude_private and (addr.is_private or addr.is_reserved):
+                return "private_ip"
+
+        elif zeek_type == "Intel::SUBNET":
+            net = ipaddress.ip_network(indicator, strict=False)
+            for own in self.own_networks:
+                if net.version == own.version and net.overlaps(own):
+                    return "own_network"
+            if self.exclude_private and net.is_private:
+                return "private_subnet"
+
+        elif zeek_type == "Intel::DOMAIN":
+            return self._domain_excluded(indicator)
+
+        elif zeek_type == "Intel::URL":
+            host = indicator.split("/", 1)[0].split(":", 1)[0]
+            return self._domain_excluded(host)
+
+        elif zeek_type == "Intel::EMAIL":
+            return self._domain_excluded(indicator.partition("@")[2])
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# INTEL FILE
+# ---------------------------------------------------------------------------
+
+def header_line(do_notice=False):
+    fields = list(INTEL_FIELDS)
+    if do_notice:
+        fields.append("meta.do_notice")
+    return "#fields\t" + "\t".join(fields)
+
+
+def _slug(text):
+    """meta.source must survive as a single tab-free field."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "none"
+
+
+def _safe_format(template, **fields):
+    """Apply a user-supplied template, falling back to it literally.
+
+    An unknown placeholder is an operator typo, not a reason to abandon a
+    fetch that may have taken minutes.
+    """
+    try:
+        return template.format(**fields)
+    except (KeyError, IndexError, ValueError) as exc:
+        log.warning("template %r is invalid (%s); using it literally",
+                    template, exc)
+        return template
+
+
+def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
+                misp_base_url=None, maxlen=DEFAULT_META_MAXLEN):
+    """Build (source, desc, url) for one record."""
+    source = _safe_format(
+        source_fmt,
+        org=record.get("org") or "unknown",
+        event_id=record.get("event_id") or "0",
+        event_uuid=record.get("event_uuid") or "",
+        feed=_slug(record.get("feed") or "none"),
+    ) if "{" in source_fmt else source_fmt
+
+    if desc_template:
+        desc = _safe_format(
+            desc_template,
+            event_info=record.get("event_info") or "",
+            category=record.get("category") or "",
+            tags=", ".join(record.get("event_tags") or []),
+            comment=record.get("comment") or "",
+            type=record.get("type") or "",
+            org=record.get("org") or "",
+            uuid=record.get("uuid") or "",
+            feed=record.get("feed") or "",
+        )
+    else:
+        desc = record.get("event_info") or ""
+
+    url = ""
+    if misp_base_url and record.get("event_id"):
+        url = "%s/events/view/%s" % (misp_base_url.rstrip("/"), record["event_id"])
+
+    return (sanitize_meta(source, maxlen),
+            sanitize_meta(desc, maxlen),
+            sanitize_meta(url, maxlen))
+
+
+def render_line(indicator, zeek_type, source, desc, url, do_notice=None):
+    fields = [indicator, zeek_type,
+              source or NULL_FIELD, desc or NULL_FIELD, url or NULL_FIELD]
+    if do_notice is not None:
+        fields.append("T" if do_notice else "F")
+    return "\t".join(fields)
+
+
+class BuildStats(object):
+    """Everything the pre-write summary needs to be honest about."""
+
+    def __init__(self):
+        self.fetched = 0
+        self.emitted = 0
+        self.by_type = {}
+        self.rejected = {}
+        self.excluded = {}
+        self.unmapped = {}
+        self.duplicates = 0
+
+    def _bump(self, bucket, key):
+        bucket[key] = bucket.get(key, 0) + 1
+
+    def reject(self, reason):
+        self._bump(self.rejected, reason)
+
+    def exclude(self, reason):
+        self._bump(self.excluded, reason)
+
+    def unmap(self, misp_type):
+        self._bump(self.unmapped, misp_type)
+
+    def emit(self, zeek_type):
+        self._bump(self.by_type, zeek_type)
+        self.emitted += 1
+
+    def report(self):
+        lines = ["fetched %d attributes -> %d indicators"
+                 % (self.fetched, self.emitted)]
+        for label, bucket in (("by type", self.by_type),
+                              ("rejected", self.rejected),
+                              ("excluded", self.excluded),
+                              ("unmapped MISP types", self.unmapped)):
+            if bucket:
+                lines.append("  %s:" % label)
+                for key in sorted(bucket, key=lambda k: -bucket[k]):
+                    lines.append("    %-24s %d" % (key, bucket[key]))
+        if self.duplicates:
+            lines.append("  deduplicated: %d" % self.duplicates)
+        return "\n".join(lines)
+
+
+def build_indicators(records, types=None, exclusions=None, stats=None,
+                     split_composites="both", allow_subnet=True,
+                     source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
+                     misp_base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
+                     do_notice=None):
+    """Records -> deduplicated intel rows.  Pure: no I/O, no network.
+
+    Returns (rows, stats) where each row is
+    (indicator, zeek_type, source, desc, url, do_notice).
+    """
+    stats = stats or BuildStats()
+    allowed = set(types) if types is not None else None
+    seen = {}
+    rows = []
+
+    for record in records:
+        stats.fetched += 1
+        misp_type = record.get("type") or ""
+
+        if allowed is not None and misp_type not in allowed:
+            continue
+        if misp_type not in MISP_TO_ZEEK:
+            stats.unmap(misp_type or "<empty>")
+            continue
+
+        meta = render_meta(record, source_fmt, desc_template, misp_base_url,
+                           meta_maxlen)
+
+        for raw, zeek_type in map_attribute(record, split_composites, allow_subnet):
+            try:
+                indicator = normalise(raw, zeek_type)
+            except Rejected as exc:
+                stats.reject(exc.reason)
+                continue
+
+            if exclusions is not None:
+                reason = exclusions.reason(indicator, zeek_type)
+                if reason:
+                    stats.exclude(reason)
+                    continue
+
+            key = (indicator, zeek_type)
+            if key in seen:
+                stats.duplicates += 1
+                continue
+            seen[key] = True
+
+            rows.append((indicator, zeek_type) + meta + (do_notice,))
+            stats.emit(zeek_type)
+
+    return rows, stats
+
+
+def rows_to_lines(rows, do_notice=False):
+    # bool() so rows built with do_notice=None still emit a valid "F".
+    return [render_line(*row[:5], do_notice=bool(row[5]) if do_notice else None)
+            for row in rows]
+
+
+def lint_lines(lines, do_notice=False):
+    """Validate an intel.dat body.  Returns a list of human-readable problems.
+
+    Security Onion's docs are explicit that Zeek is strict here, and a bad
+    file fails at load time on the sensor rather than at write time here.
+    """
+    problems = []
+    expected = header_line(do_notice)
+    expected_cols = len(INTEL_FIELDS) + (1 if do_notice else 0)
+
+    if not lines:
+        return ["file is empty"]
+    if lines[0] != expected:
+        problems.append("line 1: header must be exactly %r, got %r"
+                        % (expected, lines[0]))
+
+    seen = set()
+    for num, line in enumerate(lines[1:], start=2):
+        if line == "":
+            problems.append("line %d: blank line" % num)
+            continue
+        if line.startswith("#"):
+            continue  # operator comment; read_existing skips these too
+        if line != line.strip():
+            problems.append("line %d: leading or trailing whitespace" % num)
+        # A filename indicator may legitimately contain spaces, so only flag
+        # whitespace touching a tab separator.
+        if " \t" in line or "\t " in line:
+            problems.append("line %d: space adjacent to a tab separator" % num)
+
+        fields = line.split("\t")
+        if len(fields) != expected_cols:
+            problems.append("line %d: expected %d tab-separated fields, got %d"
+                            % (num, expected_cols, len(fields)))
+            continue
+        if "" in fields:
+            problems.append("line %d: empty field (use %r for null)"
+                            % (num, NULL_FIELD))
+        if fields[1] not in ZEEK_TYPES:
+            problems.append("line %d: %r is not a valid Intel::Type"
+                            % (num, fields[1]))
+        if do_notice and fields[-1] not in ("T", "F"):
+            problems.append("line %d: meta.do_notice must be T or F, got %r"
+                            % (num, fields[-1]))
+
+        key = (fields[0], fields[1])
+        if key in seen:
+            problems.append("line %d: duplicate indicator %s (%s)"
+                            % (num, fields[0], fields[1]))
+        seen.add(key)
+
+    return problems
+
+
+def lint_file(path, do_notice=False):
+    with open(path, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    lines = content.split("\n")
+    problems = []
+    if content and not content.endswith("\n"):
+        problems.append("file does not end with a newline")
+    if content.endswith("\n\n"):
+        problems.append("file ends with a blank line")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return problems + lint_lines(lines, do_notice)
+
+
+def read_existing(path):
+    """Parse an existing intel.dat into (header, rows).  Missing file -> empty."""
+    if not os.path.exists(path):
+        return None, []
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = [l.rstrip("\n") for l in handle]
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        return None, []
+    header = lines[0] if lines[0].startswith("#fields") else None
+    body = lines[1:] if header else lines
+    return header, [l for l in body if l.strip() and not l.startswith("#")]
+
+
+def merge_preserved(existing_rows, source_prefix=DEFAULT_SOURCE_PREFIX):
+    """Keep hand-maintained lines -- anything whose meta.source is not ours."""
+    preserved = []
+    for line in existing_rows:
+        fields = line.split("\t")
+        source = fields[2] if len(fields) > 2 else ""
+        if not source.startswith(source_prefix):
+            preserved.append(line)
+    return preserved
+
+
+def merge_additive(existing_rows, new_rows):
+    """Preserve every existing indicator and append only genuinely new keys.
+
+    Identity is (indicator, Intel::Type), matching indicator_delta().  The
+    existing line wins when MISP returns changed metadata for the same IOC.
+    """
+    merged = list(existing_rows)
+    seen = set(_row_key(line) for line in existing_rows if line.strip())
+    for line in new_rows:
+        if not line.strip() or line.startswith("#fields"):
+            continue
+        key = _row_key(line)
+        if key not in seen:
+            merged.append(line)
+            seen.add(key)
+    return merged
+
+
+def backup_file(path, backup_dir, retention=10):
+    if not os.path.exists(path):
+        return None
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(backup_dir, "%s.%s" % (os.path.basename(path), stamp))
+    shutil.copy2(path, dest)
+
+    prefix = os.path.basename(path) + "."
+    old = sorted(f for f in os.listdir(backup_dir) if f.startswith(prefix))
+    keep = max(0, retention)  # old[:-0] is empty, which would prune nothing
+    for stale in old[:len(old) - keep]:
+        try:
+            os.remove(os.path.join(backup_dir, stale))
+        except OSError:
+            pass
+    return dest
+
+
+def write_atomic(path, lines):
+    """Write via a same-directory temp file and os.replace.
+
+    Zeek may be reading this file at any moment; it must never observe a
+    partial write.
+    """
+    # Operators do symlink the salt path elsewhere; os.replace would clobber
+    # the link itself and silently orphan the real file.
+    path = os.path.realpath(path)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    mode, uid, gid = 0o644, -1, -1
+    if os.path.exists(path):
+        st = os.stat(path)
+        mode, uid, gid = st.st_mode & 0o777, st.st_uid, st.st_gid
+
+    body = "\n".join(lines) + "\n"  # exactly one trailing newline
+
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".nexus-", suffix=".tmp")
+    try:
+        os.close(fd)  # reopened below; closing here keeps the failure path simple
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        if uid != -1 and os.geteuid() == 0:
+            try:
+                os.chown(tmp, uid, gid)
+            except OSError as exc:
+                log.warning("could not preserve ownership on %s: %s", path, exc)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+    # fsync the directory so the rename itself is durable.
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    return path
+
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT CHECK
+# ---------------------------------------------------------------------------
+
+def detect_so_version():
+    for path in SO_VERSION_FILES:
+        try:
+            with open(path, "r") as handle:
+                text = handle.read()
+        except (OSError, IOError):
+            continue
+        match = re.search(r"\b(\d+\.\d+\.\d+)\b", text)
+        if match:
+            return match.group(1)
+        stripped = text.strip()
+        if stripped:
+            return stripped.splitlines()[0][:40]
+    return None
+
+
+def notice_policy_loaded(policy_dirs=SO_ZEEK_POLICY_DIRS):
+    """Return True when an active Zeek policy loads intel/do_notice.zeek.
+
+    Security Onion policy layouts vary across 3.x releases, so inspect the
+    configured policy trees instead of assuming one point-release path.
+    """
+    load_re = re.compile(
+        r"^\s*@load\s+(?:policy/)?frameworks/intel/do_notice(?:\.zeek)?\s*$")
+    for root in policy_dirs:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.endswith((".zeek", ".bro")):
+                    continue
+                path = os.path.join(dirpath, filename)
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        for line in handle:
+                            if not line.lstrip().startswith("#") and load_re.match(line):
+                                return True
+                except (OSError, IOError, UnicodeDecodeError):
+                    continue
+    return False
+
+
+def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
+              policy_dirs=SO_ZEEK_POLICY_DIRS):
+    """Stage 0.  Returns (ok, findings) where each finding is (level, message)."""
+    findings = []
+    ok = True
+
+    version = detect_so_version()
+    if version:
+        findings.append(("info", "Security Onion version: %s" % version))
+        if not version.startswith("3."):
+            findings.append(("warn", "Nexus targets Security Onion 3.2; "
+                                     "verify paths before applying"))
+    else:
+        findings.append(("warn", "could not detect the Security Onion version "
+                                 "(not running on a manager?)"))
+
+    if not os.path.isdir(intel_dir):
+        findings.append(("error", "intel directory missing: %s" % intel_dir))
+        ok = False
+        return ok, findings
+    findings.append(("info", "intel directory: %s" % intel_dir))
+
+    load_path = os.path.join(intel_dir, SO_LOAD_FILE)
+    if os.path.exists(load_path):
+        findings.append(("info", "%s present" % SO_LOAD_FILE))
+    else:
+        ok = False
+        default_load = os.path.join(default_dir, SO_LOAD_FILE)
+        msg = ("%s is MISSING from %s -- Zeek will not load intel.dat without it"
+               % (SO_LOAD_FILE, intel_dir))
+        findings.append(("error", msg))
+        if os.path.exists(default_load):
+            findings.append(("fix", "sudo cp %s/* %s/" % (default_dir, intel_dir)))
+        else:
+            findings.append(("warn", "defaults not found at %s either" % default_dir))
+
+    if notice_policy_loaded(policy_dirs):
+        findings.append(("info", "policy/frameworks/intel/do_notice.zeek is loaded"))
+    else:
+        findings.append(("warn", "policy/frameworks/intel/do_notice.zeek is not loaded; "
+                                 "meta.do_notice will have no effect"))
+
+    intel_path = os.path.join(intel_dir, "intel.dat")
+    if os.path.exists(intel_path):
+        st = os.stat(intel_path)
+        _, rows = read_existing(intel_path)
+        findings.append(("info", "intel.dat present: %d indicators, mode %o, %d bytes"
+                                 % (len(rows), st.st_mode & 0o777, st.st_size)))
+        try:
+            problems = lint_file(intel_path)
+        except (OSError, UnicodeDecodeError) as exc:
+            problems = ["unreadable: %s" % exc]
+        if problems:
+            findings.append(("warn", "existing intel.dat has %d lint problem(s); "
+                                     "run --lint for detail" % len(problems)))
+    else:
+        findings.append(("warn", "intel.dat does not exist yet at %s" % intel_path))
+
+    if os.path.isdir(SO_INTEL_RUNTIME_DIR):
+        findings.append(("info", "runtime intel dir: %s" % SO_INTEL_RUNTIME_DIR))
+    else:
+        findings.append(("warn", "runtime dir %s not found (not a sensor node?)"
+                                 % SO_INTEL_RUNTIME_DIR))
+
+    findings.append(("info", "apply command: %s" % SO_APPLY_CMD))
+    return ok, findings
+
+
+# ---------------------------------------------------------------------------
+# GUARDRAILS
+# ---------------------------------------------------------------------------
+
+class GuardrailVerdict(object):
+    """The outcome of one guardrail check.
+
+    A plain data holder, not an exception -- a guardrail firing is not
+    automatically fatal.  "warn" is still truthy: it means "proceed, but the
+    operator should see this," while only "block" flips `.ok` (and the
+    object itself, in a boolean context) to false.
+    """
+
+    def __init__(self, level, message):
+        self.level = level  # "ok" / "warn" / "block"
+        self.message = message
+        self.ok = level != "block"
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        return "GuardrailVerdict(%s, %r)" % (self.level, self.message)
+
+
+def check_size(count, warn_at=100000, cap=None):
+    """Warn past warn_at; optionally enforce an operator-selected cap.
+
+    Every indicator is resident in every Zeek worker's memory -- this is the
+    difference between a working grid and an OOM, so the cap is a hard stop
+    rather than a confirmation prompt.
+    """
+    if cap is not None and count > cap:
+        return GuardrailVerdict(
+            "block",
+            "%d indicators exceeds the hard cap of %d -- every indicator is "
+            "resident in every Zeek worker's memory; narrow the query or "
+            "raise the cap deliberately" % (count, cap))
+    if count > warn_at:
+        return GuardrailVerdict(
+            "warn",
+            "%d indicators is past the %d warn threshold -- every indicator "
+            "is resident in every Zeek worker's memory" % (count, warn_at))
+    return GuardrailVerdict("ok", "%d indicators" % count)
+
+
+def check_not_empty(new_count, existing_count, min_absolute=1):
+    """Refuse to write an empty or near-empty file over a populated one.
+
+    A MISP outage, a broken filter, or a bad token must not silently wipe
+    out intel that took real work to build.  A no-op when there is nothing
+    populated yet to protect.
+    """
+    if not existing_count:
+        return GuardrailVerdict("ok", "no existing populated file to protect")
+    if new_count < min_absolute:
+        return GuardrailVerdict(
+            "block",
+            "new set has %d indicator(s) (below the minimum of %d) but the "
+            "existing file has %d -- refusing to overwrite populated intel "
+            "with an empty or near-empty one" % (new_count, min_absolute, existing_count))
+    return GuardrailVerdict("ok", "%d indicators, not empty" % new_count)
+
+
+def check_delta(new_count, existing_count, max_drop_pct=25.0):
+    """Block a run that would drop more than max_drop_pct of the previous set.
+
+    A broken tag filter or a MISP-side purge should surface as a
+    confirmation prompt, not a quiet write.  No-op when there is no existing
+    file -- there is nothing yet to compare against.
+    """
+    if not existing_count:
+        return GuardrailVerdict("ok", "no existing file to compare against")
+    drop_pct = (existing_count - new_count) * 100.0 / existing_count
+    if drop_pct > max_drop_pct:
+        return GuardrailVerdict(
+            "block",
+            "new set drops %.1f%% of the existing %d indicators (new count: "
+            "%d), over the %.1f%% limit" % (drop_pct, existing_count, new_count, max_drop_pct))
+    if drop_pct <= 0:
+        return GuardrailVerdict(
+            "ok", "new set grew from %d to %d indicators" % (existing_count, new_count))
+    return GuardrailVerdict(
+        "ok", "%.1f%% drop, within the %.1f%% limit" % (drop_pct, max_drop_pct))
+
+
+def check_load_file(intel_dir, load_filename=SO_LOAD_FILE):
+    """Block if __load__.Zeek is absent -- without it Zeek never loads intel.dat.
+
+    Touches the filesystem, unlike the checks above, so it is kept separate
+    and callers only run it once a real intel_dir is known.
+    """
+    path = os.path.join(intel_dir, load_filename)
+    if not os.path.exists(path):
+        return GuardrailVerdict(
+            "block",
+            "%s is missing from %s -- Zeek will not load intel.dat without "
+            "it; the write would silently do nothing" % (load_filename, intel_dir))
+    return GuardrailVerdict("ok", "%s present" % load_filename)
+
+
+def check_broad_indicators(rows):
+    """Warn on indicators broad enough to be a liability rather than a signal.
+
+    `rows` is the (indicator, zeek_type, source, desc, url, do_notice) tuples
+    from build_indicators().  Everything flagged here already fails
+    normalisation on the way in (norm_subnet enforces MIN_PREFIX_V4/V6,
+    norm_domain rejects bare TLDs, norm_url rejects a hostless URL) -- this
+    is a second, independent look at whatever actually ended up in `rows`,
+    so a future caller that builds rows some other way is still covered.
+    """
+    offenders = []
+    for row in rows:
+        indicator, zeek_type = row[0], row[1]
+        if zeek_type == "Intel::SUBNET":
+            try:
+                net = ipaddress.ip_network(indicator, strict=False)
+            except ValueError:
+                continue
+            minimum = MIN_PREFIX_V4 if net.version == 4 else MIN_PREFIX_V6
+            if net.prefixlen <= minimum:
+                offenders.append(
+                    "%s (subnet at or broader than /%d)" % (indicator, minimum))
+        elif zeek_type == "Intel::DOMAIN":
+            if "." not in indicator:
+                offenders.append("%s (single-label domain)" % indicator)
+        elif zeek_type == "Intel::URL":
+            host = indicator.split("/", 1)[0].split(":", 1)[0]
+            if "." not in host:
+                offenders.append("%s (URL host has no dot)" % indicator)
+
+    if not offenders:
+        return GuardrailVerdict("ok", "no overly broad indicators")
+
+    shown = offenders[:10]
+    message = "%d overly broad indicator(s): %s" % (len(offenders), "; ".join(shown))
+    if len(offenders) > 10:
+        message += "; ...and %d more" % (len(offenders) - 10)
+    return GuardrailVerdict("warn", message)
+
+
+_LEVEL_ORDER = {"block": 0, "warn": 1, "ok": 2}
+
+
+def run_guardrails(rows, existing_count, intel_dir=None, append_only=False,
+                   **thresholds):
+    """Run every guardrail, worst verdict first.
+
+    A flat ordered list rather than a dict -- the pre-write confirmation
+    prompt wants to lead with whatever is most likely to make an operator
+    stop and look.  `check_load_file` is skipped when intel_dir is None
+    (e.g. a --dry-run against a scratch path with no real SO layout).
+    """
+    new_count = len(rows) + (existing_count or 0) if append_only else len(rows)
+    verdicts = [check_size(new_count, thresholds.get("warn_at", 100000),
+                           thresholds.get("cap")),
+                check_broad_indicators(rows)]
+    if not append_only:
+        verdicts.extend([
+            check_not_empty(new_count, existing_count,
+                            thresholds.get("min_absolute", 1)),
+            check_delta(new_count, existing_count,
+                        thresholds.get("max_drop_pct", 25.0)),
+        ])
+    if intel_dir is not None:
+        verdicts.append(check_load_file(
+            intel_dir, thresholds.get("load_filename", SO_LOAD_FILE)))
+    verdicts.sort(key=lambda v: _LEVEL_ORDER[v.level])
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
+# INTERVIEW
+# ---------------------------------------------------------------------------
+
+# Display order for stage 3.  IOC_CLASSES is keyed for lookup, not for reading
+# aloud, and sorted() would put "email" before "network".
+IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
+
+# Pre-suggested exclusions for stage 5.  These two tags account for most of the
+# noise in a typical MISP: known false positives and bulk OSINT imports.
+SUGGESTED_EXCLUDE_TAGS = ("false-positive", "type:OSINT")
+
+THREAT_LEVELS = (("any", None), ("high", 1), ("medium", 2), ("low", 3),
+                 ("undefined", 4))
+ANALYSIS_STATES = (("any", None), ("initial", 0), ("ongoing", 1),
+                   ("completed", 2))
+
+SOURCE_FORMATS = (
+    ("MISP-event-{event_id}", "MISP-event-42"),
+    ("MISP-{org}", "MISP-CIRCL"),
+    ("MISP", "MISP"),
+    ("fixed string", "type your own"),
+)
+
+DEFAULT_DESC_TEMPLATE = "{event_info} | {category}"
+DEFAULT_DAYS = 90
+DEFAULT_MAX_INDICATORS = None
+PROFILE_DIR = os.path.join(NEXUS_HOME, "profiles")
+
+NONE_WORDS = frozenset(("", "none", "-", "no", "any", "all time"))
+
+
+class InterviewAborted(Exception):
+    """Ctrl-C or EOF at a prompt.  Callers unwind and exit without a traceback."""
+
+
+# -- prompt primitives ------------------------------------------------------
+
+def _read(prompt, input_fn):
+    """Single funnel for stdin so abort handling lives in exactly one place."""
+    try:
+        return input_fn(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise InterviewAborted("interview aborted at: %s" % prompt.strip())
+
+
+def _opt_parts(option):
+    """An option is either a bare value or (value, annotation)."""
+    if isinstance(option, (tuple, list)) and len(option) == 2:
+        return str(option[0]), str(option[1])
+    return str(option), ""
+
+
+def _opt_values(options):
+    return [_opt_parts(o)[0] for o in options]
+
+
+def ask(prompt, default=None, input_fn=input):
+    text = "%s [%s]: " % (prompt, default) if default is not None else "%s: " % prompt
+    answer = _read(text, input_fn).strip()
+    if not answer:
+        return default if default is not None else ""
+    return answer
+
+
+def ask_required(prompt, default=None, input_fn=input):
+    """`ask` that will not take silence for an answer."""
+    while True:
+        answer = ask(prompt, default, input_fn)
+        if answer:
+            return answer
+        print("  a value is required")
+
+
+def ask_yes_no(prompt, default=True, input_fn=input):
+    hint = "Y/n" if default else "y/N"
+    while True:
+        answer = _read("%s [%s]: " % (prompt, hint), input_fn).strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("  please answer y or n")
+
+
+def ask_int(prompt, default, minimum=None, maximum=None, input_fn=input):
+    while True:
+        answer = _read("%s [%s]: " % (prompt, default), input_fn).strip()
+        if not answer and default is not None:
+            return default
+        try:
+            value = int(answer)
+        except ValueError:
+            print("  not a whole number: %r" % answer)
+            continue
+        if minimum is not None and value < minimum:
+            print("  must be at least %d" % minimum)
+            continue
+        if maximum is not None and value > maximum:
+            print("  must be at most %d" % maximum)
+            continue
+        return value
+
+
+def ask_choice(prompt, options, default=None, input_fn=input):
+    """Numbered single-select.  Returns the chosen option's value."""
+    values = _opt_values(options)
+    default_index = values.index(default) + 1 if default in values else None
+
+    while True:
+        print(prompt)
+        for number, option in enumerate(options, 1):
+            value, note = _opt_parts(option)
+            print("   %2d) %-30s %s" % (number, value, note))
+        suffix = " [%d]" % default_index if default_index else ""
+        # The title is repeated on the read line so a scripted or piped
+        # session can tell two consecutive choices apart.
+        answer = _read("  %s -- choose 1-%d%s: "
+                       % (prompt, len(options), suffix), input_fn).strip()
+        if not answer:
+            if default_index:
+                return values[default_index - 1]
+            print("  no default -- pick a number")
+            continue
+        if answer.isdigit() and 1 <= int(answer) <= len(values):
+            return values[int(answer) - 1]
+        print("  not a valid choice: %r" % answer)
+
+
+def parse_selection(answer, count):
+    """Parse "1,3,5" / "1-4" / "2-3,7" to zero-based indexes; None if invalid."""
+    picked = []
+    for token in answer.replace(" ", "").split(","):
+        if not token:
+            continue
+        if "-" in token:
+            start, _, end = token.partition("-")
+            if not start.isdigit() or not end.isdigit():
+                return None
+            span = range(int(start), int(end) + 1)
+            if int(start) > int(end):
+                return None
+        elif token.isdigit():
+            span = [int(token)]
+        else:
+            return None
+        for number in span:
+            if number < 1 or number > count:
+                return None
+            if number - 1 not in picked:
+                picked.append(number - 1)
+    return picked
+
+
+def ask_multi(prompt, options, preselected=None, input_fn=input):
+    """Numbered multi-select.  Enter keeps the preselected set.
+
+    Accepts "1,3,5", "1-4", a mix of both, "all" and "none".  Returns values in
+    option order, not in the order they were typed, so downstream output is
+    stable regardless of how the operator typed the selection.
+    """
+    values = _opt_values(options)
+    chosen = [v for v in values if v in set(preselected or ())]
+
+    while True:
+        print(prompt)
+        for number, option in enumerate(options, 1):
+            value, note = _opt_parts(option)
+            mark = "x" if value in chosen else " "
+            print("   %2d) [%s] %-24s %s" % (number, mark, value, note))
+        answer = _read("  %s -- select (numbers, ranges, all, none) [%s]: "
+                       % (prompt, ",".join(chosen) if chosen else "none"),
+                       input_fn).strip().lower()
+
+        if not answer:
+            return list(chosen)
+        if answer == "all":
+            return list(values)
+        if answer == "none":
+            return []
+        picked = parse_selection(answer, len(values))
+        if picked is None:
+            print("  could not read that selection: %r" % answer)
+            continue
+        return [values[i] for i in sorted(picked)]
+
+
+def ask_list(prompt, default="none", validator=None, input_fn=input):
+    """Comma-separated free text.  `validator` returns an error string or None."""
+    while True:
+        answer = ask(prompt, default, input_fn)
+        if answer.strip().lower() in NONE_WORDS:
+            return []
+        items = [part.strip() for part in answer.split(",") if part.strip()]
+        errors = [validator(item) for item in items] if validator else []
+        errors = [e for e in errors if e]
+        if errors:
+            for error in errors:
+                print("  " + error)
+            continue
+        return items
+
+
+def ask_date(prompt, default=None, input_fn=input):
+    """ISO date, or a MISP relative window like 30d.  Empty means unset."""
+    while True:
+        answer = ask(prompt, default, input_fn)
+        if not answer or answer.lower() in NONE_WORDS:
+            return ""
+        if answer[:-1].isdigit() and answer[-1] in "dhm":
+            return answer
+        try:
+            datetime.strptime(answer, "%Y-%m-%d")
+            return answer
+        except ValueError:
+            print("  expected YYYY-MM-DD or a window like 30d")
+
+
+def ask_token(prompt="MISP API token", getpass_fn=getpass.getpass):
+    """Read the token without echo.  Never returned to any log or summary."""
+    while True:
+        try:
+            token = getpass_fn("%s: " % prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            raise InterviewAborted("interview aborted at the token prompt")
+        if token:
+            return token
+        print("  the token cannot be empty")
+
+
+def _valid_cidr(text):
+    try:
+        ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return "not a network: %r" % text
+    return None
+
+
+def _valid_path(text):
+    return None if os.path.exists(text) else "no such file: %s" % text
+
+
+def _stage(number, title):
+    print("")
+    print("-- Stage %d: %s" % (number, title))
+
+
+def _count_label(misp_type, counts):
+    count, exact = counts.get(misp_type, (None, True))
+    if count is None:
+        return "?"
+    return format(count, ",d") + ("" if exact else "+")
+
+
+def _type_annotation(misp_type, counts):
+    return "%9s  -> %s%s" % (
+        _count_label(misp_type, counts), zeek_type_for(misp_type),
+        "   (noisy)" if misp_type in MISP_OFF_BY_DEFAULT else "")
+
+
+# -- stage 2: discovery -----------------------------------------------------
+
+def discover(client, probe_limit=5000):
+    """Stage 2.  The live lists stages 3 and 5 select from.
+
+    Counts are deliberately unfiltered: the quality filters are not chosen
+    until stage 4, so these are ceilings, not predictions.
+    """
+    found = {"version": {}, "types": [], "counts": {}, "tags": [], "orgs": [],
+             "sharing_groups": [], "feeds": []}
+    if client is None:
+        return found
+
+    for label, key, call in (
+            ("version", "version", client.get_version),
+            ("tags", "tags", client.get_tags),
+            ("organisations", "orgs", client.get_orgs),
+            ("sharing groups", "sharing_groups", client.get_sharing_groups),
+            ("feeds", "feeds", client.get_feeds)):
+        try:
+            found[key] = call()
+        except MispError as exc:
+            log.warning("could not fetch %s: %s", label, exc)
+
+    try:
+        found["types"] = client.describe_types().get("types") or []
+    except MispError as exc:
+        log.warning("could not fetch attribute types: %s", exc)
+
+    known = set(found["types"])
+    for misp_type in mappable_types():
+        if known and misp_type not in known:
+            continue
+        try:
+            found["counts"][misp_type] = client.count_type(
+                misp_type, probe_limit=probe_limit)
+        except MispError as exc:
+            log.warning("count for %s failed: %s", misp_type, exc)
+
+    found["tags"] = [t.get("name") for t in found["tags"] if t.get("name")]
+    found["orgs"] = [o.get("name") for o in found["orgs"] if o.get("name")]
+    found["sharing_groups"] = [s.get("name") for s in found["sharing_groups"]
+                               if s.get("name")]
+    return found
+
+
+# -- stages -----------------------------------------------------------------
+
+def _stage1_connection(config, client, input_fn, getpass_fn):
+    """Stage 1.  Collects connection answers only -- main() builds the client."""
+    _stage(1, "Connection")
+    config["misp_host"] = ask_required(
+        "MISP address (IP or hostname)",
+        client.host if client is not None else None, input_fn)
+    config["scheme"] = ask_choice(
+        "Scheme", ["https", "http"],
+        client.scheme if client is not None else "https", input_fn)
+    default_port = 443 if config["scheme"] == "https" else 80
+    if client is not None and client.port:
+        default_port = client.port
+    config["port"] = ask_int("Port", default_port, 1, 65535, input_fn)
+
+    verify_default = client.verify_tls if client is not None else True
+    verify = ask_yes_no("Verify the TLS certificate?", verify_default, input_fn)
+    if not verify:
+        print("  WARNING: disabling verification exposes this session to a "
+              "man-in-the-middle.")
+        typed = ask("  type INSECURE to confirm, anything else keeps "
+                    "verification on", "", input_fn)
+        verify = typed.strip() != "INSECURE"
+        if verify:
+            print("  keeping certificate verification enabled")
+    config["verify_tls"] = verify
+
+    proxy = ask("HTTP proxy URL", "none", input_fn)
+    config["proxy"] = None if proxy.strip().lower() in NONE_WORDS else proxy
+
+    # An existing client already holds a working token; re-prompting for it
+    # would only be a chance to fat-finger it.
+    config["token"] = (client.token if client is not None
+                       else ask_token(getpass_fn=getpass_fn))
+
+    config["timeout"] = ask_int(
+        "Request timeout (seconds)",
+        client.timeout if client is not None else 30, 1, 3600, input_fn)
+    config["retries"] = ask_int(
+        "Retries on transient failure",
+        client.retries if client is not None else 3, 1, 10, input_fn)
+    return config
+
+
+def _stage_feeds(config, discovery, input_fn):
+    """Stage 2b: which MISP feeds to pull from.
+
+    Runs after discovery so the list is live, and before the IOC types so the
+    operator narrows by source first and by type second.
+    """
+    feeds = discovery.get("feeds") or []
+    config["feeds"] = []
+    if not feeds:
+        return
+
+    print("")
+    print("-- Stage 2b: MISP feeds")
+
+    selectable, blocked = [], []
+    for feed in feeds:
+        (selectable if feed_is_selectable(feed) else blocked).append(feed)
+
+    if not ask_yes_no("Restrict to specific feeds? (no = all of MISP)",
+                      False, input_fn):
+        return
+
+    if not selectable:
+        print("  No feed can be traced after ingest; pulling from all of MISP.")
+    else:
+        options = []
+        for feed in selectable:
+            _, _, why = feed_provenance(feed)
+            state = "enabled" if feed["enabled"] else "disabled"
+            options.append((
+                feed["id"],
+                feed["name"],
+                "%s, %s, %s" % (feed["provider"] or "no provider", state, why),
+            ))
+        chosen = ask_multi("Feeds to pull from", options, [], input_fn)
+        by_id = dict((f["id"], f) for f in selectable)
+        config["feeds"] = [by_id[fid] for fid in chosen if fid in by_id]
+
+    if blocked:
+        print("")
+        print("  Not selectable -- no fixed event, default tag or dedicated")
+        print("  org, so their attributes cannot be told apart after ingest:")
+        for feed in blocked:
+            print("    %-32s %s" % (feed["name"][:32],
+                                    feed["provider"] or ""))
+
+    if config["feeds"]:
+        # meta.source carries the feed so an intel.log hit names its origin.
+        config["source_fmt"] = "MISP-feed-{feed}"
+
+
+def _stage3_iocs(config, discovery, input_fn):
+    _stage(3, "What IOCs do you want?")
+    counts = discovery.get("counts") or {}
+    known = set(discovery.get("types") or ())
+
+    order = [k for k in IOC_CLASS_ORDER if k in IOC_CLASSES]
+    class_options = [(k, IOC_CLASSES[k][0]) for k in order]
+    config["ioc_classes"] = ask_multi("IOC classes", class_options,
+                                      preselected=order, input_fn=input_fn)
+
+    selected = []
+    for key in order:
+        if key not in config["ioc_classes"]:
+            continue
+        label, types = IOC_CLASSES[key]
+        # An empty `known` means discovery was skipped, not that MISP is empty.
+        candidates = [t for t in types if not known or t in known]
+        if not candidates:
+            print("  no %s attribute types exist on this instance" % key)
+            continue
+        options = [(t, _type_annotation(t, counts)) for t in candidates]
+        preselected = [t for t in candidates
+                       if t not in MISP_OFF_BY_DEFAULT
+                       and counts.get(t, (1, True))[0] != 0]
+        selected.extend(ask_multi(label, options, preselected, input_fn))
+
+    config["split_composites"] = ask_choice(
+        "Composite types (domain|ip, filename|md5): emit which half?",
+        [("both", "domain + ip"), ("first", "domain only"),
+         ("second", "ip only")], "both", input_fn)
+    config["hostname_as_domain"] = ask_yes_no(
+        "Treat hostname as Intel::DOMAIN?", True, input_fn)
+    if not config["hostname_as_domain"]:
+        selected = [t for t in selected if not t.startswith("hostname")]
+    config["allow_subnet"] = ask_yes_no(
+        "Emit Intel::SUBNET for CIDR values in IP attributes?", True, input_fn)
+
+    config["types"] = selected
+    return config
+
+
+def _stage4_quality(config, input_fn):
+    _stage(4, "Quality filters")
+    config["to_ids"] = ask_yes_no(
+        "to_ids-flagged attributes only?", True, input_fn)
+    config["published"] = ask_yes_no("Published events only?", True, input_fn)
+    config["enforce_warninglist"] = ask_yes_no(
+        "Enforce MISP warninglists (strip known-good)?", True, input_fn)
+    config["exclude_deleted"] = ask_yes_no(
+        "Exclude deleted attributes?", True, input_fn)
+
+    levels = dict(THREAT_LEVELS)
+    config["threat_level"] = levels[ask_choice(
+        "Minimum event threat level", [name for name, _ in THREAT_LEVELS],
+        "any", input_fn)]
+    states = dict(ANALYSIS_STATES)
+    config["analysis"] = states[ask_choice(
+        "Event analysis state", [name for name, _ in ANALYSIS_STATES],
+        "any", input_fn)]
+    return config
+
+
+def _ask_names(prompt, live, preselected=None, input_fn=input):
+    """Multi-select off a live list, or free text when discovery found none."""
+    if not live:
+        return ask_list("%s (comma-separated, none = all)" % prompt,
+                        ",".join(preselected or ()) or "none",
+                        input_fn=input_fn)
+    return ask_multi(prompt, list(live), preselected, input_fn)
+
+
+def _stage5_scope(config, discovery, input_fn):
+    _stage(5, "Scope")
+    config["time_mode"] = ask_choice(
+        "Time window", [("last", "last N days"), ("range", "explicit from/to"),
+                        ("all", "everything")], "last", input_fn)
+    config["days"] = None
+    config["date_from"] = ""
+    config["date_to"] = ""
+    if config["time_mode"] == "last":
+        config["days"] = ask_int("How many days back", DEFAULT_DAYS, 1,
+                                 None, input_fn)
+    elif config["time_mode"] == "range":
+        config["date_from"] = ask_date("From (YYYY-MM-DD)", "", input_fn)
+        config["date_to"] = ask_date("To (YYYY-MM-DD)", "", input_fn)
+
+    config["timestamp_field"] = ask_choice(
+        "Which timestamp does that window mean?",
+        [("timestamp", "attribute last-edited"),
+         ("publish_timestamp", "event published")], "timestamp", input_fn)
+
+    tags = discovery.get("tags") or []
+    config["include_tags"] = _ask_names("Include tags (OR, none = all)", tags,
+                                        None, input_fn)
+    exclude_options = list(tags)
+    for name in SUGGESTED_EXCLUDE_TAGS:
+        if name not in exclude_options:
+            exclude_options.append(name)
+    config["exclude_tags"] = _ask_names(
+        "Exclude tags (NOT)", exclude_options if tags else [],
+        list(SUGGESTED_EXCLUDE_TAGS), input_fn)
+
+    config["orgs"] = _ask_names("Restrict to organisations",
+                                discovery.get("orgs") or [], None, input_fn)
+    config["sharing_groups"] = _ask_names(
+        "Restrict to sharing groups", discovery.get("sharing_groups") or [],
+        None, input_fn)
+    config["event_ids"] = ask_list("Restrict to event IDs or UUIDs",
+                                   "none", None, input_fn)
+    return config
+
+
+def _stage6_exclusions(config, input_fn):
+    _stage(6, "Local exclusions")
+    config["exclude_private"] = ask_yes_no(
+        "Exclude RFC1918 / loopback / link-local / multicast?", True, input_fn)
+    config["own_networks"] = ask_list("Your own networks (CIDR list)", "none",
+                                      _valid_cidr, input_fn)
+    config["own_domains"] = ask_list("Your own domain suffixes", "none",
+                                     None, input_fn)
+    paths = ask_list("Extra allowlist file to subtract", "none", _valid_path,
+                     input_fn)
+    config["allowlist_file"] = paths[0] if paths else None
+    return config
+
+
+def _stage7_metadata(config, input_fn):
+    _stage(7, "Metadata")
+    choice = ask_choice("meta.source format", list(SOURCE_FORMATS),
+                        "MISP-event-{event_id}", input_fn)
+    if choice == "fixed string":
+        choice = ask_required("Fixed meta.source value", "MISP", input_fn)
+    config["source_fmt"] = choice
+
+    config["desc_template"] = ask(
+        "meta.desc template ({event_info} {category} {tags} {comment} "
+        "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
+
+    if ask_yes_no("Link meta.url back to the MISP event?", True, input_fn):
+        netloc = config.get("misp_host") or ""
+        port = config.get("port")
+        if port and port not in (80, 443):
+            netloc = "%s:%d" % (netloc, port)
+        config["misp_base_url"] = "%s://%s" % (config.get("scheme", "https"),
+                                               netloc)
+    else:
+        config["misp_base_url"] = None
+
+    config["do_notice"] = ask_yes_no(
+        "Emit the meta.do_notice column?", False, input_fn)
+    if config["do_notice"]:
+        if notice_policy_loaded():
+            print("  detected: policy/frameworks/intel/do_notice.zeek is loaded")
+        else:
+            print("  WARNING: policy/frameworks/intel/do_notice.zeek was not "
+                  "detected; meta.do_notice will have no effect.")
+    config["meta_maxlen"] = ask_int("Max metadata field length", 200, 20,
+                                    4096, input_fn)
+    return config
+
+
+def _stage8_output(config, input_fn):
+    _stage(8, "Output and apply")
+    config["deployment"] = ask_choice(
+        "Security Onion deployment",
+        [("distributed", "manager plus sensor grid"),
+         ("standalone", "one standalone node")],
+        "distributed", input_fn)
+    config["output_path"] = ask_required("Output path", SO_INTEL_FILE, input_fn)
+    config["merge_mode"] = "append-only"
+    config["backup"] = ask_yes_no("Back up the existing file first?", True,
+                                  input_fn)
+    cap = ask("Optional hard cap on indicator count (none = unlimited)",
+              "none", input_fn).strip().lower()
+    while cap not in NONE_WORDS and (not cap.isdigit() or int(cap) < 1):
+        print("  enter a positive integer or none")
+        cap = ask("Optional hard cap on indicator count (none = unlimited)",
+                  "none", input_fn).strip().lower()
+    config["max_indicators"] = None if cap in NONE_WORDS else int(cap)
+    config["dry_run"] = ask_yes_no(
+        "Dry run (write to a temp file and show a diff)?", False, input_fn)
+
+    config["profile_path"] = None
+    if ask_yes_no("Save these answers as a profile?", True, input_fn):
+        name = ask_required("Profile name", "nexus", input_fn)
+        if not name.endswith(".json"):
+            name += ".json"
+        config["profile_path"] = os.path.join(PROFILE_DIR, name)
+
+    target = "standalone node" if config["deployment"] == "standalone" else "grid"
+    config["apply"] = ask_yes_no(
+        "Apply to the %s after writing?" % target, False, input_fn)
+    return config
+
+
+def run_interview(client, input_fn=input, getpass_fn=getpass.getpass):
+    """Walk stages 1-8 and return a plain dict config.
+
+    `client` may be None, which skips discovery so the interview is runnable
+    (and testable) with no MISP in reach.
+    """
+    config = {}
+    _stage1_connection(config, client, input_fn, getpass_fn)
+
+    _stage(2, "Discovery")
+    discovery = discover(client)
+    if client is None:
+        print("  skipped -- no MISP connection, offering the full type list")
+    else:
+        print("  %d attribute types, %d tags, %d orgs, %d sharing groups"
+              % (len(discovery["types"]), len(discovery["tags"]),
+                 len(discovery["orgs"]), len(discovery["sharing_groups"])))
+    config["discovery"] = discovery
+
+    _stage_feeds(config, discovery, input_fn)
+    _stage3_iocs(config, discovery, input_fn)
+    _stage4_quality(config, input_fn)
+    _stage5_scope(config, discovery, input_fn)
+    _stage6_exclusions(config, input_fn)
+    _stage7_metadata(config, input_fn)
+    _stage8_output(config, input_fn)
+
+    if config.get("feeds") and "{feed}" not in (config.get("source_fmt") or ""):
+        log.info("feeds selected but meta.source has no {feed} placeholder; "
+                 "an intel.log hit will not name its feed")
+
+    print("")
+    print(summarise_config(config))
+    if not ask_yes_no("Proceed with this configuration?", True, input_fn):
+        raise InterviewAborted("operator declined the pre-flight summary")
+    return config
+
+
+# -- derived output ---------------------------------------------------------
+
+def build_search_params(config):
+    """Interview answers -> the /attributes/restSearch body.  Pure, no I/O."""
+    params = {
+        "returnFormat": "json",
+        # flatten_attribute() reads meta.source/desc/url out of the event
+        # block, which MISP only ships when these are asked for.
+        "includeEventUuid": True,
+        "includeEventTags": True,
+    }
+
+    if config.get("types"):
+        params["type"] = list(config["types"])
+    if config.get("to_ids"):
+        params["to_ids"] = 1
+    if config.get("published"):
+        params["published"] = 1
+    if config.get("enforce_warninglist"):
+        params["enforceWarninglist"] = 1
+    # MISP defaults to excluding deleted attributes; [0, 1] is how you ask for
+    # both, and there is no way to ask for "deleted too" with a single flag.
+    params["deleted"] = 0 if config.get("exclude_deleted", True) else [0, 1]
+
+    tags = {}
+    if config.get("include_tags"):
+        tags["OR"] = list(config["include_tags"])
+    if config.get("exclude_tags"):
+        tags["NOT"] = list(config["exclude_tags"])
+    if tags:
+        params["tags"] = tags
+
+    mode = config.get("time_mode") or "all"
+    if mode == "last" and config.get("days"):
+        # `last` is publish_timestamp-based in MISP; `timestamp` is the
+        # attribute's own edit time.  Stage 5 question 19 picks between them.
+        key = ("last" if config.get("timestamp_field") == "publish_timestamp"
+               else "timestamp")
+        params[key] = "%dd" % config["days"]
+    elif mode == "range":
+        if config.get("date_from"):
+            params["from"] = config["date_from"]
+        if config.get("date_to"):
+            params["to"] = config["date_to"]
+
+    if config.get("orgs"):
+        params["org"] = list(config["orgs"])
+    if config.get("feed_org_ids"):
+        params["org"] = list(config["feed_org_ids"])
+    if config.get("sharing_groups"):
+        params["sharinggroup"] = list(config["sharing_groups"])
+    if config.get("event_ids"):
+        params["eventid"] = list(config["event_ids"])
+    if config.get("threat_level"):
+        # "minimum threat level medium" means high or medium, and MISP counts
+        # 1 = high down to 4 = undefined, so the wanted set counts up to it.
+        params["threat_level_id"] = list(range(1, config["threat_level"] + 1))
+    if config.get("analysis") is not None:
+        params["analysis"] = config["analysis"]
+    return params
+
+
+def _yes_no(flag):
+    return "yes" if flag else "no"
+
+
+def summarise_config(config):
+    """The pre-flight summary.  Deliberately never shows the API token."""
+    port = config.get("port")
+    scheme = config.get("scheme", "https")
+    shown_port = "" if port in (None, 80, 443) else ":%d" % port
+    lines = ["Pre-flight summary", ""]
+
+    lines.append("  MISP        : %s://%s%s (verify TLS: %s)"
+                 % (scheme, config.get("misp_host", "?"), shown_port,
+                    _yes_no(config.get("verify_tls"))))
+    if config.get("proxy"):
+        lines.append("  proxy       : %s" % config["proxy"])
+
+    feeds = config.get("feeds") or []
+    if feeds:
+        lines.append("  feeds       : %d selected (one query each)" % len(feeds))
+        for feed in feeds:
+            kind, value, _ = feed_provenance(feed)
+            lines.append("                  %-28s via %s=%s"
+                         % (feed["name"][:28], kind, value))
+    else:
+        lines.append("  feeds       : all of MISP (no feed restriction)")
+
+    types = config.get("types") or []
+    lines.append("  IOC types   : %d selected%s"
+                 % (len(types), " (%s)" % ", ".join(types[:6]) if types else ""))
+    lines.append("  composites  : emit %s, subnets %s, hostname %s"
+                 % (config.get("split_composites", "both"),
+                    "on" if config.get("allow_subnet") else "off",
+                    "as DOMAIN" if config.get("hostname_as_domain") else "dropped"))
+
+    lines.append("  quality     : to_ids=%s published=%s warninglist=%s "
+                 "deleted=%s" % (_yes_no(config.get("to_ids")),
+                                 _yes_no(config.get("published")),
+                                 _yes_no(config.get("enforce_warninglist")),
+                                 "excluded" if config.get("exclude_deleted")
+                                 else "included"))
+    if config.get("threat_level") or config.get("analysis") is not None:
+        lines.append("  event state : threat_level<=%s analysis=%s"
+                     % (config.get("threat_level"), config.get("analysis")))
+
+    mode = config.get("time_mode") or "all"
+    if mode == "last":
+        window = "last %s days (%s)" % (config.get("days"),
+                                        config.get("timestamp_field"))
+    elif mode == "range":
+        window = "%s .. %s" % (config.get("date_from") or "beginning",
+                               config.get("date_to") or "now")
+    else:
+        window = "all time"
+    lines.append("  window      : %s" % window)
+
+    for label, key in (("include tags", "include_tags"),
+                       ("exclude tags", "exclude_tags"),
+                       ("orgs", "orgs"), ("sharing groups", "sharing_groups"),
+                       ("event ids", "event_ids")):
+        values = config.get(key) or []
+        if values:
+            lines.append("  %-12s: %s" % (label, ", ".join(values)))
+
+    lines.append("  exclusions  : private=%s networks=%s domains=%s allowlist=%s"
+                 % (_yes_no(config.get("exclude_private")),
+                    ",".join(config.get("own_networks") or []) or "none",
+                    ",".join(config.get("own_domains") or []) or "none",
+                    config.get("allowlist_file") or "none"))
+
+    lines.append("  meta.source : %s" % config.get("source_fmt"))
+    lines.append("  meta.desc   : %s" % config.get("desc_template"))
+    lines.append("  meta.url    : %s" % (config.get("misp_base_url") or "none"))
+    lines.append("  do_notice   : %s  (max meta length %s)"
+                 % (_yes_no(config.get("do_notice")), config.get("meta_maxlen")))
+
+    lines.append("  output      : %s (append-only; existing indicators retained)"
+                 % config.get("output_path"))
+    lines.append("  deployment=%s backup=%s dry_run=%s cap=%s apply=%s"
+                 % (config.get("deployment", "distributed"),
+                    _yes_no(config.get("backup")), _yes_no(config.get("dry_run")),
+                    config.get("max_indicators") or "unlimited",
+                    _yes_no(config.get("apply"))))
+    if config.get("profile_path"):
+        lines.append("  profile     : %s" % config["profile_path"])
+
+    lines.append("")
+    lines.append("  restSearch  : %s"
+                 % json.dumps(build_search_params(config), sort_keys=True))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PROFILES
+# ---------------------------------------------------------------------------
+
+def profile_path(name):
+    """A bare name resolves under NEXUS_HOME; a path is taken as given."""
+    if os.sep in name or name.endswith(".json"):
+        return name
+    return os.path.join(NEXUS_HOME, "profiles", "%s.json" % name)
+
+
+def save_profile(config, path):
+    """Persist the interview answers, minus anything secret or stale.
+
+    Written 0600 before any content lands in it: a profile records which MISP
+    an operator queries and how, which is not worth leaking even without the
+    token in it.
+    """
+    payload = {"profile_version": PROFILE_VERSION,
+               "nexus_version": __version__,
+               "saved_utc": datetime.now(timezone.utc).strftime(
+                   "%Y-%m-%dT%H:%M:%SZ"),
+               "config": dict((k, v) for k, v in config.items()
+                              if k not in PROFILE_EXCLUDED_KEYS)}
+
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(path, 0o600)  # an existing file keeps its old mode through O_CREAT
+    return path
+
+
+def load_profile(path):
+    """Read a saved profile back into a config dict."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    if not isinstance(payload, dict) or "config" not in payload:
+        raise ValueError("%s is not a nexus profile" % path)
+    version = payload.get("profile_version")
+    if version != PROFILE_VERSION:
+        raise ValueError("%s is profile version %r, this nexus writes %d"
+                         % (path, version, PROFILE_VERSION))
+
+    config = dict(payload["config"])
+    for key in PROFILE_EXCLUDED_KEYS:
+        config.pop(key, None)  # a hand-edited profile does not get to inject one
+    return config
+
+
+# ---------------------------------------------------------------------------
+# DIFF
+# ---------------------------------------------------------------------------
+
+def _row_key(line):
+    fields = line.split("\t")
+    return (fields[0], fields[1]) if len(fields) > 1 else (line, "")
+
+
+def indicator_delta(existing_rows, new_rows):
+    """(added, removed) indicator keys between two intel bodies.
+
+    Keyed on (indicator, type) rather than the whole line, so a changed
+    description does not read as a delete plus an add.
+    """
+    before = dict((_row_key(l), l) for l in existing_rows if l.strip())
+    after = dict((_row_key(l), l) for l in new_rows
+                 if l.strip() and not l.startswith("#"))
+    added = [after[k] for k in after if k not in before]
+    removed = [before[k] for k in before if k not in after]
+    return sorted(added), sorted(removed)
+
+
+def summarise_delta(existing_rows, new_rows, sample=10):
+    """Human-readable indicator delta for --dry-run."""
+    added, removed = indicator_delta(existing_rows, new_rows)
+    lines = ["%d added, %d removed, %d unchanged"
+             % (len(added), len(removed),
+                len(existing_rows) - len(removed))]
+    for label, rows in (("+", added), ("-", removed)):
+        for line in rows[:sample]:
+            lines.append("  %s %s" % (label, line.split("\t")[0]))
+        if len(rows) > sample:
+            lines.append("  %s ...and %d more" % (label, len(rows) - sample))
+    return "\n".join(lines)
+
+
+def unified_intel_diff(existing_rows, new_rows, path):
+    """Full line diff, for --diff."""
+    return list(difflib.unified_diff(
+        existing_rows, [l for l in new_rows if not l.startswith("#fields")],
+        fromfile="%s (current)" % path, tofile="%s (new)" % path, lineterm=""))
+
+
+# ---------------------------------------------------------------------------
+# APPLY
+# ---------------------------------------------------------------------------
+
+# Zeek reports a bad intel file through the reporter log rather than failing
+# the salt run, so a clean `state.apply` proves nothing on its own.
+REPORTER_ERROR_HINTS = ("intel", "Intel::")
+
+
+def seed_load_file(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR):
+    """Copy the default intel files into the local dir, without clobbering.
+
+    A fresh Security Onion leaves the local intel directory empty.  Writing
+    intel.dat there without __load__.Zeek produces a file Zeek never reads --
+    the failure looks exactly like success, which is why this is a guard
+    rather than a convenience.
+    """
+    copied = []
+    if not os.path.isdir(default_dir):
+        raise OSError("defaults not found at %s" % default_dir)
+    os.makedirs(intel_dir, exist_ok=True)
+    for name in os.listdir(default_dir):
+        dest = os.path.join(intel_dir, name)
+        if os.path.exists(dest):
+            continue  # never overwrite intel.dat the operator already has
+        shutil.copy2(os.path.join(default_dir, name), dest)
+        copied.append(dest)
+    return copied
+
+
+def log_offset(path):
+    """Byte offset to read a log from after an action.
+
+    Size-based rather than time-based so the "did this run produce errors?"
+    question stays deterministic and testable.
+    """
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def log_errors_since(path, offset, hints=REPORTER_ERROR_HINTS):
+    """Intel-related error lines appended to a log after `offset`."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            tail = handle.read()
+    except OSError:
+        return []
+    found = []
+    for line in tail.splitlines():
+        lowered = line.lower()
+        if "error" not in lowered and "warning" not in lowered:
+            continue
+        if any(hint.lower() in lowered for hint in hints):
+            found.append(line.strip())
+    return found
+
+
+def salt_apply(argv=None, timeout=900, runner=None):
+    """Run the state.apply.  Returns (returncode, stdout, stderr).
+
+    `runner` is injectable so the whole apply path is testable without salt.
+    """
+    argv = list(argv or SO_APPLY_ARGV)
+    if runner is None:
+        if shutil.which(argv[0]) is None and shutil.which("salt") is None:
+            raise OSError("salt not found on PATH")
+        runner = _run_subprocess
+    return runner(argv, timeout)
+
+
+def _run_subprocess(argv, timeout):
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise OSError("salt timed out after %ds" % timeout)
+    return proc.returncode, out, err
+
+
+def verify_runtime(runtime_dir=SO_INTEL_RUNTIME_DIR, expected=None):
+    """Confirm the file reached the node-local path salt syncs it to."""
+    path = os.path.join(runtime_dir, "intel.dat")
+    if not os.path.exists(path):
+        return (False, "%s does not exist -- the sync did not reach this node"
+                       % path)
+    _, rows = read_existing(path)
+    if expected is not None and len(rows) != expected:
+        return (False, "%s has %d indicators, expected %d"
+                       % (path, len(rows), expected))
+    return (True, "%s has %d indicators" % (path, len(rows)))
+
+
+def apply_to_grid(intel_dir=SO_INTEL_DIR, runtime_dir=SO_INTEL_RUNTIME_DIR,
+                  reporter_log=SO_REPORTER_LOG, expected=None, runner=None,
+                  argv=None):
+    """Seed check, salt apply, runtime verify, reporter check.
+
+    Returns (ok, steps) where steps is [(level, message), ...] in the order
+    they happened, so a partial failure still shows what did work.
+    """
+    steps = []
+
+    verdict = check_load_file(intel_dir)
+    if not verdict.ok:
+        return False, [("error", verdict.message)]
+    steps.append(("info", verdict.message))
+
+    offset = log_offset(reporter_log)
+
+    try:
+        rc, out, err = salt_apply(argv=argv, runner=runner)
+    except OSError as exc:
+        steps.append(("error", "could not run salt: %s" % exc))
+        steps.append(("fix", SO_APPLY_CMD))
+        return False, steps
+
+    if rc != 0:
+        steps.append(("error", "salt exited %d" % rc))
+        for line in (err or out or "").splitlines()[-5:]:
+            steps.append(("error", "  " + line.strip()))
+        return False, steps
+    steps.append(("info", "salt state.apply zeek completed"))
+
+    ok, message = verify_runtime(runtime_dir, expected)
+    steps.append(("info" if ok else "warn", message))
+
+    errors = log_errors_since(reporter_log, offset)
+    if errors:
+        steps.append(("error", "%s reported %d intel problem(s):"
+                               % (reporter_log, len(errors))))
+        for line in errors[:10]:
+            steps.append(("error", "  " + line))
+        return False, steps
+    steps.append(("info", "no intel errors in %s" % reporter_log))
+    steps.append(("info", "confirm hits in %s" % SO_INTEL_LOG))
+    return ok, steps
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+LEVEL_PREFIX = {"info": "  [ok]   ", "warn": "  [warn] ",
+                "error": "  [FAIL] ", "fix": "  [fix]  "}
+
+
+def resolve_token(args, interactive=True):
+    """Token from --token-file, env, credentials.json, then the operator.
+
+    `interactive=False` under --yes: an unattended run must fail loudly rather
+    than block forever on a getpass prompt nobody will ever answer.
+    """
+    if args.token_file:
+        try:
+            with open(args.token_file, "r", encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            log.warning("could not read %s: %s", args.token_file, exc)
+            token = ""
+        if token:
+            return token
+    env = os.environ.get("NEXUS_MISP_TOKEN")
+    if env:
+        return env.strip()
+    cred_path = os.path.join(NEXUS_HOME, "credentials.json")
+    if os.path.exists(cred_path):
+        try:
+            with open(cred_path, "r", encoding="utf-8") as handle:
+                token = json.load(handle).get("token")
+            if token:
+                return token.strip()
+        except (ValueError, OSError) as exc:
+            log.warning("could not read %s: %s", cred_path, exc)
+    if not interactive:
+        log.error("no token in --token-file, NEXUS_MISP_TOKEN or %s/"
+                  "credentials.json, and --yes cannot prompt", NEXUS_HOME)
+        return ""
+    return getpass.getpass("MISP API token: ").strip()
+
+
+def cmd_check_env(args):
+    ok, findings = check_env()
+    print("Nexus environment check")
+    for level, message in findings:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    if not ok:
+        print("\nEnvironment is not ready.  Address the [FAIL] items above.")
+        return 1
+    print("\nEnvironment looks ready.")
+    return 0
+
+
+def cmd_lint(args):
+    try:
+        problems = lint_file(args.lint, do_notice=args.do_notice)
+    except (OSError, IOError, UnicodeDecodeError) as exc:
+        print("cannot read %s: %s" % (args.lint, exc), file=sys.stderr)
+        return 2
+    if not problems:
+        _, rows = read_existing(args.lint)
+        print("%s: OK (%d indicators)" % (args.lint, len(rows)))
+        return 0
+    print("%s: %d problem(s)" % (args.lint, len(problems)))
+    for problem in problems:
+        print("  " + problem)
+    return 1
+
+
+def cmd_explain(args):
+    """Show exactly what would be asked of MISP, without asking it."""
+    if not args.profile:
+        print("--explain requires --profile", file=sys.stderr)
+        return 2
+    try:
+        config = load_profile(profile_path(args.profile))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        print("could not load profile: %s" % exc, file=sys.stderr)
+        return 2
+
+    print(summarise_config(config))
+    base = build_search_params(config)
+    feeds = config.get("feeds") or []
+    print("")
+    if not feeds:
+        print("One query to POST /attributes/restSearch:")
+        print("  " + json.dumps(base, indent=2, sort_keys=True))
+        return 0
+
+    print("%d queries to POST /attributes/restSearch, one per feed:" % len(feeds))
+    for feed in feeds:
+        print("\n  -- %s" % feed["name"])
+        print("  " + json.dumps(apply_feed_to_params(base, feed),
+                                indent=2, sort_keys=True).replace("\n", "\n  "))
+    return 0
+
+
+def cmd_seed(args):
+    try:
+        copied = seed_load_file()
+    except OSError as exc:
+        print("could not seed: %s" % exc, file=sys.stderr)
+        return 1
+    if not copied:
+        print("Nothing to do -- %s is already populated." % SO_INTEL_DIR)
+    for path in copied:
+        print("copied %s" % path)
+    return 0
+
+
+def cmd_apply(args):
+    _, rows = read_existing(SO_INTEL_FILE)
+    print("Applying %s (%d indicators)" % (SO_INTEL_FILE, len(rows)))
+    print("  %s" % SO_APPLY_CMD)
+    applied, steps = apply_to_grid(expected=len(rows))
+    for level, message in steps:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    return 0 if applied else 1
+
+
+def cmd_probe(args):
+    token = resolve_token(args)
+    if not token:
+        print("no API token supplied", file=sys.stderr)
+        return 2
+
+    client = MispClient(
+        host=args.misp, token=token, scheme=args.scheme, port=args.port,
+        verify_tls=not args.insecure, proxy=args.proxy, timeout=args.timeout,
+        retries=args.retries,
+    )
+
+    try:
+        version = client.get_version()
+    except MispAuthError as exc:
+        print("authentication failed: %s" % exc, file=sys.stderr)
+        return 2
+    except MispError as exc:
+        print("connection failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("Connected to %s" % client.base_url)
+    print("  MISP version : %s" % version.get("version", "unknown"))
+    for key in ("perm_sync", "perm_sighting", "perm_galaxy_editor", "role_name"):
+        if key in version:
+            print("  %-13s: %s" % (key, version[key]))
+
+    try:
+        described = client.describe_types()
+        tags = client.get_tags()
+        orgs = client.get_orgs()
+    except MispError as exc:
+        print("discovery failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    known = set(described.get("types") or [])
+    print("\nDiscovery")
+    print("  attribute types known to this MISP : %d" % len(known))
+    print("  tags                               : %d" % len(tags))
+    print("  organisations                      : %d" % len(orgs))
+
+    base = {}
+    if args.to_ids:
+        base["to_ids"] = 1
+    if args.published:
+        base["published"] = 1
+    if args.days:
+        base["last"] = "%dd" % args.days
+
+    candidates = [t for t in mappable_types() if not known or t in known]
+    print("\nMappable attribute types (filters: %s)"
+          % (", ".join("%s=%s" % kv for kv in sorted(base.items())) or "none"))
+    print("  %-24s %10s  %s" % ("misp type", "count", "zeek type"))
+
+    total = 0
+    for misp_type in candidates:
+        try:
+            count, exact = client.count_type(misp_type, base,
+                                             probe_limit=args.probe_limit)
+        except MispError as exc:
+            print("  %-24s %10s  %s" % (misp_type, "ERR", exc))
+            continue
+        if count == 0 and not args.show_empty:
+            continue
+        total += count
+        marker = "" if exact else "+"
+        flag = "" if misp_type not in MISP_OFF_BY_DEFAULT else "   (off by default)"
+        print("  %-24s %9d%s  %s%s"
+              % (misp_type, count, marker, zeek_type_for(misp_type), flag))
+
+    print("\n  approximate total indicators available: %d%s"
+          % (total, "" if total < args.probe_limit else "+"))
+    unmapped = sorted(t for t in known if t in MISP_UNMAPPABLE)
+    if unmapped:
+        print("\nPresent in MISP but not mappable to Zeek:")
+        for misp_type in unmapped:
+            print("  %-24s %s" % (misp_type, MISP_UNMAPPABLE[misp_type]))
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="nexus",
+        description="Build a Zeek intel.dat from MISP, for Security Onion 3.2.",
+    )
+    parser.add_argument("--version", action="version",
+                        version="nexus %s" % __version__)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--log-file", default=None,
+                        help="run log (default %s/logs/nexus.log)" % NEXUS_HOME)
+
+    mode = parser.add_argument_group("modes")
+    mode.add_argument("--check-env", action="store_true",
+                      help="stage 0 only: verify SO paths and __load__.Zeek")
+    mode.add_argument("--lint", metavar="PATH",
+                      help="validate an intel.dat and exit")
+    mode.add_argument("--apply", action="store_true",
+                      help="push the existing intel.dat to the grid and check "
+                           "the reporter log; builds nothing")
+    mode.add_argument("--seed", action="store_true",
+                      help="copy the Security Onion default intel files "
+                           "(including __load__.Zeek) into the local dir")
+    mode.add_argument("--explain", action="store_true",
+                      help="print the resolved MISP query for a profile and "
+                           "exit; contacts nothing")
+    mode.add_argument("--probe", action="store_true",
+                      help="connect to MISP and report available IOC counts")
+
+    conn = parser.add_argument_group("MISP connection")
+    conn.add_argument("--misp", metavar="HOST", help="MISP IP or hostname")
+    conn.add_argument("--scheme", default="https", choices=("https", "http"))
+    conn.add_argument("--port", type=int, default=None)
+    conn.add_argument("--insecure", action="store_true",
+                      help="disable TLS certificate verification")
+    conn.add_argument("--proxy", default=None)
+    conn.add_argument("--timeout", type=int, default=30)
+    conn.add_argument("--retries", type=int, default=3)
+    conn.add_argument("--token-file", default=None)
+
+    probe = parser.add_argument_group("probe filters")
+    probe.add_argument("--days", type=int, default=None,
+                       help="only count attributes from the last N days")
+    probe.add_argument("--to-ids", action="store_true", default=False,
+                       help="only count to_ids-flagged attributes")
+    probe.add_argument("--published", action="store_true", default=False,
+                       help="only count attributes in published events")
+    probe.add_argument("--probe-limit", type=int, default=5000,
+                       help="ceiling for count probes (default 5000)")
+    probe.add_argument("--show-empty", action="store_true",
+                       help="include types with a zero count")
+
+    run = parser.add_argument_group("unattended operation")
+    run.add_argument("--profile", metavar="NAME_OR_PATH",
+                     help="replay saved answers instead of running the "
+                          "interview")
+    run.add_argument("--yes", action="store_true",
+                     help="never prompt; requires --profile and a token from "
+                          "--token-file, NEXUS_MISP_TOKEN or credentials.json")
+    run.add_argument("--dry-run", action="store_true",
+                     help="build and compare, write nothing")
+    run.add_argument("--diff", action="store_true",
+                     help="with --dry-run, show the full line diff")
+
+    parser.add_argument("--do-notice", action="store_true",
+                        help="expect/emit the meta.do_notice column")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    explicit_log = args.log_file is not None
+    logfile = args.log_file or os.path.join(NEXUS_HOME, "logs", "nexus.log")
+    setup_logging(args.verbose, logfile, required=explicit_log)
+
+    if args.lint:
+        return cmd_lint(args)
+    if args.check_env:
+        return cmd_check_env(args)
+    if args.seed:
+        return cmd_seed(args)
+    if args.apply:
+        return cmd_apply(args)
+    if args.explain:
+        return cmd_explain(args)
+    if args.yes and not args.profile:
+        print("--yes requires --profile (there is nothing to answer "
+              "unattended)", file=sys.stderr)
+        return 2
+    if args.probe:
+        if not args.misp:
+            print("--probe requires --misp HOST", file=sys.stderr)
+            return 2
+        return cmd_probe(args)
+
+    return cmd_build(args)
+
+
+def cmd_build(args):
+    """The default mode: interview, fetch, build, check, write."""
+    ok, findings = check_env()
+    if not ok:
+        for level, message in findings:
+            if level in ("error", "fix"):
+                print(LEVEL_PREFIX.get(level, "  ") + message)
+        # The one failure Nexus can fix itself, and the one most likely to be
+        # hit on a fresh manager.
+        missing_load = not os.path.exists(
+            os.path.join(SO_INTEL_DIR, SO_LOAD_FILE))
+        # --yes seeds without asking; the alternative is an unattended run
+        # that writes a file Zeek will never load.
+        if missing_load and os.path.isdir(SO_INTEL_DIR) and (
+                args.yes or ask_yes_no(
+                    "Seed the intel directory from the Security Onion "
+                    "defaults?", True)):
+            try:
+                for path in seed_load_file():
+                    print("  copied %s" % path)
+            except OSError as exc:
+                print("  could not seed: %s" % exc)
+                return 1
+            ok, _ = check_env()
+        if not ok:
+            print("Environment is not ready -- run --check-env for detail.")
+            return 1
+
+    if args.profile:
+        try:
+            config = load_profile(profile_path(args.profile))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            print("could not load profile: %s" % exc, file=sys.stderr)
+            return 2
+        config["token"] = resolve_token(args, interactive=not args.yes)
+        if not config["token"]:
+            print("no API token available", file=sys.stderr)
+            return 2
+        print("Replaying profile %s" % profile_path(args.profile))
+    else:
+        # The interview needs a live client for its tag/org/type lists, but
+        # stage 1 is what collects the credentials, so connect in between.
+        try:
+            config = run_interview(None)
+        except InterviewAborted as exc:
+            print("\nAborted: %s" % exc)
+            return 130
+
+    # Profiles written before topology became explicit remain compatible.
+    config.setdefault("deployment", "distributed")
+    config.setdefault("max_indicators", None)
+    if config.get("do_notice") and not notice_policy_loaded():
+        print("WARNING: policy/frameworks/intel/do_notice.zeek is not loaded; "
+              "meta.do_notice will have no effect.")
+
+    # CLI flags win over whatever the profile recorded.
+    if args.dry_run:
+        config["dry_run"] = True
+    if args.yes:
+        config["apply"] = config.get("apply", False)
+
+    client = MispClient(
+        host=config["misp_host"], token=config["token"],
+        scheme=config["scheme"], port=config["port"],
+        verify_tls=config["verify_tls"], proxy=config["proxy"],
+        timeout=config["timeout"], retries=config["retries"],
+    )
+
+    if config.get("profile_path") and not args.profile:
+        try:
+            saved = save_profile(config, config["profile_path"])
+            print("saved profile %s (the token is not stored)" % saved)
+        except OSError as exc:
+            log.warning("could not save profile: %s", exc)
+
+    print(summarise_config(config))
+    try:
+        version = client.get_version()
+    except MispError as exc:
+        print("MISP connection failed: %s" % exc, file=sys.stderr)
+        return 2
+    log.info("connected to MISP %s", version.get("version", "unknown"))
+
+    exclusions = ExclusionSet(
+        exclude_private=config["exclude_private"],
+        own_networks=config["own_networks"],
+        own_domains=config["own_domains"],
+        allowlist=_load_allowlist(config.get("allowlist_file")),
+    )
+
+    records = _fetch_records(client, config)
+    rows, stats = build_indicators(
+        records, types=config["types"], exclusions=exclusions,
+        split_composites=config["split_composites"],
+        allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
+        desc_template=config["desc_template"],
+        misp_base_url=config["misp_base_url"],
+        meta_maxlen=config["meta_maxlen"],
+        do_notice=config["do_notice"] or None,
+    )
+    print("\n" + stats.report())
+
+    path = config["output_path"]
+    existing_header, existing = read_existing(path)
+    wanted_header = header_line(config["do_notice"])
+    if existing_header and existing_header != wanted_header:
+        print("\nBlocked. Existing intel.dat schema differs from the requested "
+              "meta.do_notice setting; append-only mode will not rewrite "
+              "existing rows.")
+        return 1
+
+    fresh_lines = rows_to_lines(rows, config["do_notice"])
+    combined = merge_additive(existing, fresh_lines)
+    verdicts = run_guardrails(rows, len(existing),
+                              intel_dir=os.path.dirname(path),
+                              append_only=True,
+                              cap=config.get("max_indicators"))
+    print("\nGuardrails")
+    blocked = False
+    for verdict in verdicts:
+        print("  %-7s %s" % (verdict.level, verdict.message))
+        blocked = blocked or not verdict.ok
+    if blocked:
+        print("\nBlocked. Nothing written.")
+        return 1
+
+    lines = [wanted_header] + combined
+
+    problems = lint_lines(lines, config["do_notice"])
+    if problems:
+        print("\nRefusing to write, the rendered file fails lint:")
+        for problem in problems[:10]:
+            print("  " + problem)
+        return 1
+
+    added, removed = indicator_delta(existing, lines)
+    print("\nMISP indicator diff")
+    print(summarise_delta(existing, lines))
+    if removed:
+        # This is an invariant check, not an expected operator decision.
+        print("\nBlocked. Append-only update unexpectedly removed indicators.")
+        return 1
+
+    if config.get("dry_run"):
+        print("\nDry run -- nothing written to %s" % path)
+        if args.diff:
+            diff = unified_intel_diff(existing, lines, path)
+            print("")
+            print("\n".join(diff) if diff else "(no line-level changes)")
+        return 0
+
+    if config["backup"]:
+        saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
+        if saved:
+            print("\nbacked up to %s" % saved)
+    write_atomic(path, lines)
+    print("added %d new indicators; %d total in %s"
+          % (len(added), len(combined), path))
+
+    if not config.get("apply"):
+        target = ("standalone node" if config.get("deployment") == "standalone"
+                  else "grid")
+        print("\nNot applied. To push it to the %s:" % target)
+        print("  %s" % SO_APPLY_CMD)
+        print("Then check: %s" % SO_INTEL_LOG)
+        return 0
+
+    target = ("standalone node" if config.get("deployment") == "standalone"
+              else "grid")
+    print("\nApplying to the %s: %s" % (target, SO_APPLY_CMD))
+    applied, steps = apply_to_grid(intel_dir=os.path.dirname(path),
+                                   expected=len(rows))
+    for level, message in steps:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    return 0 if applied else 1
+
+
+def _fetch_records(client, config):
+    """Yield records, one restSearch per selected feed.
+
+    Two feeds identified by different mechanisms -- one by fixed event, one by
+    tag -- cannot be expressed in a single restSearch body, so each gets its
+    own query and the results are merged.  build_indicators() dedupes across
+    them, so an indicator carried by two feeds is written once.
+    """
+    base = build_search_params(config)
+    feeds = config.get("feeds") or []
+    if not feeds:
+        for record in client.search_attributes(
+                base, max_results=config.get("max_indicators")):
+            yield record
+        return
+
+    budget = config.get("max_indicators")
+    include_tags = config.get("include_tags") or []
+    seen = 0
+    for feed in feeds:
+        params = apply_feed_to_params(base, feed)
+        # See apply_feed_to_params: a tag-identified feed consumed the tags.OR
+        # slot, so the operator's include-tags have to be honoured here.
+        post_filter = include_tags if params.get("tags", {}).get(
+            "OR") == [feed_provenance(feed)[1]] else []
+        remaining = None if budget is None else max(0, budget - seen)
+        if remaining == 0:
+            log.warning("indicator budget spent before feed %s", feed["name"])
+            return
+        log.info("fetching feed %s", feed["name"])
+        for record in client.search_attributes(params, max_results=remaining):
+            if post_filter and not set(post_filter) & set(record["event_tags"]):
+                continue
+            record["feed"] = feed["name"]
+            seen += 1
+            yield record
+
+
+def _load_allowlist(path):
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return [l.strip() for l in handle
+                    if l.strip() and not l.startswith("#")]
+    except (OSError, UnicodeDecodeError) as exc:
+        log.warning("could not read allowlist %s: %s", path, exc)
+        return []
+
+
+if __name__ == "__main__":
+    sys.exit(main())
