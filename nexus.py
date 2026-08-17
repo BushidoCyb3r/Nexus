@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 __version__ = "0.2.0-dev"
 
@@ -2982,6 +2982,102 @@ def build_search_params(config):
     if config.get("analysis") is not None:
         params["analysis"] = config["analysis"]
     return params
+
+
+def _opencti_filter(key, values, operator="eq", mode="or"):
+    return {"key": [key], "values": [str(v) for v in values],
+            "operator": operator, "mode": mode}
+
+
+def _opencti_stamp(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _opencti_iso_date(value):
+    # ask_date also accepts MISP-style relative windows ("30d"); those mean
+    # nothing to an OpenCTI filter, which compares ISO-8601 timestamps.
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def build_opencti_filters(config, now=None):
+    """Interview answers -> the OpenCTI 6.x FilterGroup.  Pure, no I/O.
+
+    `now` is injectable so valid_until comparisons stay deterministic under
+    test; production passes nothing and gets the run's own UTC clock.
+    """
+    moment = now or datetime.now(timezone.utc)
+    filters = []
+    groups = []
+
+    if config.get("types"):
+        filters.append(_opencti_filter("x_opencti_main_observable_type",
+                                       config["types"]))
+    if config.get("min_score"):
+        filters.append(_opencti_filter("x_opencti_score",
+                                       [config["min_score"]], "gte"))
+    if config.get("min_confidence"):
+        filters.append(_opencti_filter("confidence",
+                                       [config["min_confidence"]], "gte"))
+    if config.get("exclude_revoked"):
+        filters.append(_opencti_filter("revoked", ["false"]))
+    if config.get("require_detection"):
+        filters.append(_opencti_filter("x_opencti_detection", ["true"]))
+    if config.get("exclude_expired"):
+        # An indicator past its valid_until is stale by its own author's
+        # judgement; keeping it would arm Zeek on expired intel.
+        filters.append(_opencti_filter("valid_until",
+                                       [_opencti_stamp(moment)], "gt"))
+
+    field = config.get("timestamp_field") or "created_at"
+    mode = config.get("time_mode") or "all"
+    if mode == "last" and config.get("days"):
+        since = moment - timedelta(days=int(config["days"]))
+        filters.append(_opencti_filter(field, [_opencti_stamp(since)], "gte"))
+    elif mode == "range":
+        date_from = config.get("date_from")
+        if date_from and _opencti_iso_date(date_from):
+            filters.append(_opencti_filter(
+                field, ["%sT00:00:00Z" % date_from], "gte"))
+        elif date_from:
+            # A relative window like "30d" would silently build a filter
+            # that matches nothing -- skip it and say why, instead of
+            # returning a run that quietly fetches zero indicators.
+            log.warning("date_from %r is not an ISO date (YYYY-MM-DD); "
+                       "OpenCTI filters need a real timestamp -- skipping "
+                       "the lower time bound", date_from)
+        date_to = config.get("date_to")
+        if date_to and _opencti_iso_date(date_to):
+            filters.append(_opencti_filter(
+                field, ["%sT23:59:59Z" % date_to], "lte"))
+        elif date_to:
+            log.warning("date_to %r is not an ISO date (YYYY-MM-DD); "
+                       "OpenCTI filters need a real timestamp -- skipping "
+                       "the upper time bound", date_to)
+
+    if config.get("include_label_ids"):
+        filters.append(_opencti_filter("objectLabel",
+                                       config["include_label_ids"]))
+    if config.get("marking_ids"):
+        filters.append(_opencti_filter("objectMarking", config["marking_ids"]))
+    if config.get("author_ids"):
+        filters.append(_opencti_filter("createdBy", config["author_ids"]))
+
+    if config.get("exclude_label_ids"):
+        # A not_eq cannot share the objectLabel key with the include list in one
+        # group, so exclusions get a group of their own.
+        groups.append({
+            "mode": "and",
+            "filters": [_opencti_filter("objectLabel",
+                                        config["exclude_label_ids"],
+                                        "not_eq", "and")],
+            "filterGroups": [],
+        })
+
+    return {"mode": "and", "filters": filters, "filterGroups": groups}
 
 
 def _yes_no(flag):

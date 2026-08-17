@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import nexus
@@ -1894,6 +1895,136 @@ class TestBuildSearchParams(unittest.TestCase):
         before = dict(config)
         nexus.build_search_params(config)
         self.assertEqual(config, before)
+
+
+class TestBuildOpenctiFilters(unittest.TestCase):
+
+    FIXED_NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def keys(self, group):
+        return [f["key"][0] for f in group["filters"]]
+
+    def filter_for(self, group, key):
+        for entry in group["filters"]:
+            if entry["key"] == [key]:
+                return entry
+        return None
+
+    def test_empty_config_is_a_valid_empty_group(self):
+        out = nexus.build_opencti_filters({}, now=self.FIXED_NOW)
+        self.assertEqual(out, {"mode": "and", "filters": [], "filterGroups": []})
+
+    def test_types_become_one_or_filter(self):
+        out = nexus.build_opencti_filters(
+            {"types": ["IPv4-Addr", "Domain-Name"]}, now=self.FIXED_NOW)
+        entry = self.filter_for(out, "x_opencti_main_observable_type")
+        self.assertEqual(entry["values"], ["IPv4-Addr", "Domain-Name"])
+        self.assertEqual(entry["operator"], "eq")
+        self.assertEqual(entry["mode"], "or")
+
+    def test_min_score_uses_gte(self):
+        out = nexus.build_opencti_filters({"min_score": 60}, now=self.FIXED_NOW)
+        entry = self.filter_for(out, "x_opencti_score")
+        self.assertEqual(entry["values"], ["60"])
+        self.assertEqual(entry["operator"], "gte")
+
+    def test_zero_min_score_is_not_a_filter(self):
+        out = nexus.build_opencti_filters({"min_score": 0}, now=self.FIXED_NOW)
+        self.assertIsNone(self.filter_for(out, "x_opencti_score"))
+
+    def test_min_confidence_uses_gte(self):
+        out = nexus.build_opencti_filters({"min_confidence": 75},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "confidence")["values"], ["75"])
+
+    def test_exclude_revoked(self):
+        out = nexus.build_opencti_filters({"exclude_revoked": True},
+                                          now=self.FIXED_NOW)
+        entry = self.filter_for(out, "revoked")
+        self.assertEqual(entry["values"], ["false"])
+        self.assertEqual(entry["operator"], "eq")
+
+    def test_require_detection(self):
+        out = nexus.build_opencti_filters({"require_detection": True},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "x_opencti_detection")["values"],
+                         ["true"])
+
+    def test_exclude_expired_uses_the_injected_now(self):
+        out = nexus.build_opencti_filters({"exclude_expired": True},
+                                          now=self.FIXED_NOW)
+        entry = self.filter_for(out, "valid_until")
+        self.assertEqual(entry["values"], ["2026-08-17T12:00:00Z"])
+        self.assertEqual(entry["operator"], "gt")
+
+    def test_last_n_days_on_created_at(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "last", "days": 30, "timestamp_field": "created_at"},
+            now=self.FIXED_NOW)
+        entry = self.filter_for(out, "created_at")
+        self.assertEqual(entry["values"], ["2026-07-18T12:00:00Z"])
+        self.assertEqual(entry["operator"], "gte")
+
+    def test_last_n_days_on_valid_from(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "last", "days": 7, "timestamp_field": "valid_from"},
+            now=self.FIXED_NOW)
+        self.assertIsNotNone(self.filter_for(out, "valid_from"))
+
+    def test_explicit_range_emits_both_bounds(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "range", "date_from": "2026-01-01",
+             "date_to": "2026-06-30", "timestamp_field": "created_at"},
+            now=self.FIXED_NOW)
+        bounds = [f for f in out["filters"] if f["key"] == ["created_at"]]
+        self.assertEqual(sorted(b["operator"] for b in bounds), ["gte", "lte"])
+
+    def test_time_mode_all_emits_no_time_filter(self):
+        out = nexus.build_opencti_filters({"time_mode": "all", "days": 30},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+
+    def test_include_labels_markings_authors(self):
+        out = nexus.build_opencti_filters(
+            {"include_label_ids": ["l1", "l2"], "marking_ids": ["m1"],
+             "author_ids": ["o1"]}, now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "objectLabel")["values"],
+                         ["l1", "l2"])
+        self.assertEqual(self.filter_for(out, "objectMarking")["values"], ["m1"])
+        self.assertEqual(self.filter_for(out, "createdBy")["values"], ["o1"])
+
+    def test_excluded_labels_go_into_a_nested_group(self):
+        out = nexus.build_opencti_filters({"exclude_label_ids": ["bad"]},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+        group = out["filterGroups"][0]
+        self.assertEqual(group["filters"][0]["key"], ["objectLabel"])
+        self.assertEqual(group["filters"][0]["operator"], "not_eq")
+        self.assertEqual(group["filters"][0]["values"], ["bad"])
+
+    def test_include_and_exclude_labels_coexist(self):
+        out = nexus.build_opencti_filters(
+            {"include_label_ids": ["good"], "exclude_label_ids": ["bad"]},
+            now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "objectLabel")["values"], ["good"])
+        self.assertEqual(out["filterGroups"][0]["filters"][0]["values"], ["bad"])
+
+    def test_result_is_json_serialisable(self):
+        out = nexus.build_opencti_filters(
+            {"types": ["Url"], "min_score": 50, "exclude_revoked": True},
+            now=self.FIXED_NOW)
+        json.dumps(out)
+
+    def test_non_iso_date_from_is_skipped_and_warns(self):
+        # ask_date accepts MISP-style relative windows ("30d"); those are
+        # meaningless as an OpenCTI timestamp comparison, so silently passing
+        # one through would build a filter that matches nothing.
+        with self.assertLogs("nexus", level="WARNING") as cm:
+            out = nexus.build_opencti_filters(
+                {"time_mode": "range", "date_from": "30d",
+                 "timestamp_field": "created_at"}, now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+        self.assertIn("30d", cm.output[0])
 
 
 # ---------------------------------------------------------------------------
