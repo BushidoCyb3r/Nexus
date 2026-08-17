@@ -992,6 +992,90 @@ class TestOpenctiClient(unittest.TestCase):
         self.assertEqual(self.cti.requests[0]["body"]["variables"], {"a": 3})
 
 
+class TestOpenctiDiscovery(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def conn(self, nodes, **page_info):
+        info = {"endCursor": None, "hasNextPage": False}
+        info.update(page_info)
+        return {"pageInfo": info,
+                "edges": [{"node": n} for n in nodes]}
+
+    def test_labels_flatten_from_edges(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"labels": self.conn(
+            [{"id": "l1", "value": "malware"}, {"id": "l2", "value": "apt"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_labels(),
+                         [{"id": "l1", "value": "malware"},
+                          {"id": "l2", "value": "apt"}])
+
+    def test_markings_flatten(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"markingDefinitions": self.conn(
+            [{"id": "m1", "definition": "TLP:AMBER", "definition_type": "TLP"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_markings(),
+                         [{"id": "m1", "definition": "TLP:AMBER",
+                           "definition_type": "TLP"}])
+
+    def test_organizations_flatten(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"organizations": self.conn(
+            [{"id": "o1", "name": "CIRCL"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_organizations(), [{"id": "o1", "name": "CIRCL"}])
+
+    def test_nodes_without_a_name_are_dropped(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"labels": self.conn(
+            [{"id": "l1", "value": "malware"}, {"id": "l2", "value": ""}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_labels(), [{"id": "l1", "value": "malware"}])
+
+    def test_count_type_uses_global_count_and_is_exact(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 4231, "endCursor": None,
+                         "hasNextPage": False},
+            "edges": []}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("IPv4-Addr"), (4231, True))
+
+    def test_count_type_sends_the_type_filter(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 1, "endCursor": None,
+                         "hasNextPage": False}, "edges": []}}})])
+        client = self.cti.client()
+        client.count_type("Domain-Name")
+        sent = self.cti.requests[0]["body"]["variables"]["filters"]
+        keys = [f["key"] for f in sent["filters"]]
+        self.assertIn(["x_opencti_main_observable_type"], keys)
+        values = [f["values"] for f in sent["filters"]
+                  if f["key"] == ["x_opencti_main_observable_type"]][0]
+        self.assertEqual(values, ["Domain-Name"])
+
+    def test_count_type_merges_base_filters(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 1, "endCursor": None,
+                         "hasNextPage": False}, "edges": []}}})])
+        client = self.cti.client()
+        base = {"mode": "and",
+                "filters": [{"key": ["revoked"], "values": ["false"],
+                             "operator": "eq", "mode": "or"}],
+                "filterGroups": []}
+        client.count_type("Url", base)
+        sent = self.cti.requests[0]["body"]["variables"]["filters"]
+        keys = [f["key"] for f in sent["filters"]]
+        self.assertIn(["revoked"], keys)
+        self.assertIn(["x_opencti_main_observable_type"], keys)
+
+    def test_count_type_falls_back_to_edge_length(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": True},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, False))
+
+
 class TestFlatten(unittest.TestCase):
 
     def test_flatten_pulls_event_context_and_tags(self):

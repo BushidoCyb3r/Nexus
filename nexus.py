@@ -661,6 +661,17 @@ class MispClient(_HttpTransport):
         return [a for a in attrs if isinstance(a, dict)]
 
 
+def merge_opencti_filters(base, extra_filters):
+    """Return a FilterGroup with `extra_filters` ANDed onto `base`."""
+    merged = {"mode": "and", "filters": [], "filterGroups": []}
+    if isinstance(base, dict):
+        merged["mode"] = base.get("mode") or "and"
+        merged["filters"] = list(base.get("filters") or [])
+        merged["filterGroups"] = list(base.get("filterGroups") or [])
+    merged["filters"] = merged["filters"] + list(extra_filters or [])
+    return merged
+
+
 class OpenctiClient(_HttpTransport):
     """Minimal OpenCTI 6.x GraphQL client over urllib."""
 
@@ -706,12 +717,101 @@ class OpenctiClient(_HttpTransport):
         about = data.get("about") or {}
         return {"version": about.get("version") or "unknown"}
 
+    # -- discovery ---------------------------------------------------------
+
+    LABELS_QUERY = """
+    query NexusLabels($first: Int!) {
+      labels(first: $first) { edges { node { id value } } }
+    }
+    """
+
+    MARKINGS_QUERY = """
+    query NexusMarkings($first: Int!) {
+      markingDefinitions(first: $first) {
+        edges { node { id definition definition_type } }
+      }
+    }
+    """
+
+    ORGANIZATIONS_QUERY = """
+    query NexusOrganizations($first: Int!) {
+      organizations(first: $first) { edges { node { id name } } }
+    }
+    """
+
+    COUNT_QUERY = """
+    query NexusCount($filters: FilterGroup) {
+      indicators(first: 1, filters: $filters) {
+        pageInfo { globalCount endCursor hasNextPage }
+        edges { node { id } }
+      }
+    }
+    """
+
+    def get_labels(self, first=500):
+        data = self._graphql(self.LABELS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "value": n.get("value")}
+                for n in _edge_nodes(data.get("labels"))
+                if n.get("value")]
+
+    def get_markings(self, first=200):
+        data = self._graphql(self.MARKINGS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "definition": n.get("definition"),
+                 "definition_type": n.get("definition_type")}
+                for n in _edge_nodes(data.get("markingDefinitions"))
+                if n.get("definition")]
+
+    def get_organizations(self, first=500):
+        data = self._graphql(self.ORGANIZATIONS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "name": n.get("name")}
+                for n in _edge_nodes(data.get("organizations"))
+                if n.get("name")]
+
+    def count_type(self, main_observable_type, base_filters=None,
+                   probe_limit=None):
+        """Return (count, exact).
+
+        globalCount is an exact total, unlike MISP's bounded probe.  It is
+        permission-dependent, so fall back to what the page actually returned
+        and say so rather than reporting a guess as fact.
+
+        probe_limit is accepted and ignored so this stays call-compatible
+        with MispClient.count_type; a later stage calls both through one
+        code path.
+        """
+        filters = merge_opencti_filters(base_filters, [{
+            "key": ["x_opencti_main_observable_type"],
+            "values": [main_observable_type],
+            "operator": "eq", "mode": "or"}])
+        data = self._graphql(self.COUNT_QUERY, {"filters": filters})
+        connection = data.get("indicators") or {}
+        page_info = connection.get("pageInfo") or {}
+        if page_info.get("globalCount") is not None:
+            try:
+                return int(page_info["globalCount"]), True
+            except (TypeError, ValueError):
+                pass
+        nodes = _edge_nodes(connection)
+        return len(nodes), not page_info.get("hasNextPage")
+
 
 def _misp_bool(value):
     """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""
     if isinstance(value, str):
         return value not in ("0", "", "false", "False")
     return bool(value)
+
+
+def _edge_nodes(connection):
+    """Relay connection -> the list of node dicts, tolerating nulls."""
+    if not isinstance(connection, dict):
+        return []
+    out = []
+    for edge in connection.get("edges") or []:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if isinstance(node, dict):
+            out.append(node)
+    return out
 
 
 def flatten_attribute(attr):
