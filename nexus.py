@@ -227,6 +227,17 @@ OPENCTI_IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
 
 OPENCTI_OFF_BY_DEFAULT = frozenset(("User-Account", "Software"))
 
+# Observable entity types whose observable_value maps straight to a mapping-table
+# key.  Anything not here needs field-specific extraction (hashes, logins).
+OPENCTI_OBSERVABLE_TYPE_ALIASES = {
+    "IPv4-Addr": "IPv4-Addr",
+    "IPv6-Addr": "IPv6-Addr",
+    "Domain-Name": "Domain-Name",
+    "Hostname": "Hostname",
+    "Url": "Url",
+    "Email-Addr": "Email-Addr",
+}
+
 GRAPHQL_PATH = "/graphql"
 OPENCTI_DEFAULT_PORT_HTTP = 4000
 # GraphQL answers 200 even when it refuses you, so auth failure has to be read
@@ -855,6 +866,114 @@ def flatten_attribute(attr):
     }
 
 
+def _opencti_epoch(value):
+    """ISO-8601 from OpenCTI -> epoch seconds, or "" when it will not parse."""
+    if not value:
+        return ""
+    text = str(value).strip().replace("Z", "+00:00")
+    # OpenCTI emits millisecond precision; datetime in 3.6 will not take it.
+    text = re.sub(r"\.\d+", "", text)
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+    return int(parsed.timestamp())
+
+
+def _observable_values(observable):
+    """One observable -> [(mapping_table_key, value), ...]."""
+    entity_type = observable.get("entity_type") or ""
+    value = (observable.get("observable_value") or "").strip()
+
+    alias = OPENCTI_OBSERVABLE_TYPE_ALIASES.get(entity_type)
+    if alias:
+        return [(alias, value)] if value else []
+
+    out = []
+    if entity_type in ("StixFile", "Artifact"):
+        name = (observable.get("name") or "").strip()
+        if name:
+            out.append(("File-Name", name))
+        for entry in observable.get("hashes") or []:
+            digest = (entry.get("hash") or "").strip()
+            if digest:
+                out.append((normalise_hash_algorithm(entry.get("algorithm")),
+                            digest))
+    elif entity_type == "X509-Certificate":
+        for entry in observable.get("hashes") or []:
+            digest = (entry.get("hash") or "").strip()
+            if digest:
+                # Certificate hashes are Intel::CERT_HASH, and only SHA-1 is;
+                # the X509- prefix keeps them out of the file-hash keys.
+                out.append(("X509-%s"
+                            % normalise_hash_algorithm(entry.get("algorithm")),
+                            digest))
+    elif entity_type == "User-Account":
+        login = (observable.get("account_login") or value).strip()
+        if login:
+            out.append(("User-Account", login))
+    elif entity_type == "Software":
+        name = (observable.get("name") or value).strip()
+        if name:
+            out.append(("Software", name))
+    elif value:
+        # Unknown observable type: pass its entity_type through so
+        # build_indicators reports it against OPENCTI_UNMAPPABLE rather than
+        # dropping it without a word.
+        out.append((entity_type, value))
+    return out
+
+
+def flatten_indicator(node, stats=None):
+    """OpenCTI indicator node -> the internal records the rest of Nexus uses.
+
+    One record per extracted value: an indicator carrying both an MD5 and a
+    SHA-256 for one file produces two rows, which is correct -- Zeek matches
+    whichever algorithm it is configured to compute.
+    """
+    tags = []
+    for label in node.get("objectLabel") or []:
+        name = label.get("value") if isinstance(label, dict) else None
+        if name and name not in tags:
+            tags.append(name)
+    for marking in node.get("objectMarking") or []:
+        name = marking.get("definition") if isinstance(marking, dict) else None
+        if name and name not in tags:
+            tags.append(name)
+
+    created_by = node.get("createdBy") or {}
+    common = {
+        "category": node.get("pattern_type") or "",
+        "to_ids": bool(node.get("x_opencti_detection")),
+        "uuid": node.get("standard_id") or node.get("id") or "",
+        "timestamp": _opencti_epoch(node.get("updated_at")
+                                    or node.get("created_at")),
+        "comment": node.get("description") or "",
+        "event_id": str(node.get("id") or ""),
+        "event_uuid": node.get("standard_id") or "",
+        "event_info": node.get("name") or "",
+        "event_tags": tags,
+        "org": created_by.get("name") or "",
+    }
+
+    connection = node.get("observables") or {}
+    if (connection.get("pageInfo") or {}).get("hasNextPage") and stats is not None:
+        stats.opencti_truncated_observables += 1
+
+    records = []
+    for observable in _edge_nodes(connection):
+        for value_type, value in _observable_values(observable):
+            record = dict(common)
+            record["type"] = value_type
+            record["value"] = value
+            records.append(record)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # FEEDS
 # ---------------------------------------------------------------------------
@@ -1385,6 +1504,10 @@ class BuildStats(object):
         self.excluded = {}
         self.unmapped = {}
         self.duplicates = 0
+        self.opencti_truncated_observables = 0
+        self.opencti_pattern_fallbacks = 0
+        self.opencti_unparsed_patterns = 0
+        self.opencti_non_stix_patterns = 0
 
     def _bump(self, bucket, key):
         bucket[key] = bucket.get(key, 0) + 1
@@ -1408,13 +1531,27 @@ class BuildStats(object):
         for label, bucket in (("by type", self.by_type),
                               ("rejected", self.rejected),
                               ("excluded", self.excluded),
-                              ("unmapped MISP types", self.unmapped)):
+                              ("unmapped source types", self.unmapped)):
             if bucket:
                 lines.append("  %s:" % label)
                 for key in sorted(bucket, key=lambda k: -bucket[k]):
                     lines.append("    %-24s %d" % (key, bucket[key]))
         if self.duplicates:
             lines.append("  deduplicated: %d" % self.duplicates)
+        if self.opencti_truncated_observables:
+            lines.append("  %d indicators had more than one page of linked "
+                         "observables; some values were not read"
+                         % self.opencti_truncated_observables)
+        if self.opencti_pattern_fallbacks:
+            lines.append("  %d indicators had no linked observables; their STIX "
+                         "pattern was parsed instead"
+                         % self.opencti_pattern_fallbacks)
+        if self.opencti_unparsed_patterns:
+            lines.append("  %d STIX patterns yielded no usable indicator"
+                         % self.opencti_unparsed_patterns)
+        if self.opencti_non_stix_patterns:
+            lines.append("  %d indicators skipped: their pattern is not STIX"
+                         % self.opencti_non_stix_patterns)
         return "\n".join(lines)
 
 

@@ -3114,5 +3114,128 @@ class TestOpenctiMapping(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], ["evil.com"])
 
 
+class TestFlattenIndicator(unittest.TestCase):
+
+    def node(self, **overrides):
+        base = {
+            "id": "indicator--1",
+            "standard_id": "indicator--std",
+            "name": "Evil domain",
+            "description": "seen in phishing",
+            "pattern": "[domain-name:value = 'evil.com']",
+            "pattern_type": "stix",
+            "x_opencti_score": 80,
+            "confidence": 75,
+            "revoked": False,
+            "x_opencti_detection": True,
+            "valid_from": "2026-08-01T00:00:00Z",
+            "valid_until": "2027-08-01T00:00:00Z",
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "objectLabel": [{"id": "l1", "value": "phishing"}],
+            "objectMarking": [{"id": "m1", "definition": "TLP:AMBER"}],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": []},
+        }
+        base.update(overrides)
+        return base
+
+    def observables(self, nodes, has_next=False):
+        return {"pageInfo": {"hasNextPage": has_next},
+                "edges": [{"node": n} for n in nodes]}
+
+    def test_simple_observable_becomes_one_record(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        records = nexus.flatten_indicator(node)
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["value"], "evil.com")
+        self.assertEqual(rec["type"], "Domain-Name")
+        self.assertEqual(rec["category"], "stix")
+        self.assertIs(rec["to_ids"], True)
+        self.assertEqual(rec["uuid"], "indicator--std")
+        self.assertEqual(rec["event_id"], "indicator--1")
+        self.assertEqual(rec["event_info"], "Evil domain")
+        self.assertEqual(rec["comment"], "seen in phishing")
+        self.assertEqual(rec["org"], "CIRCL")
+
+    def test_labels_and_markings_both_land_in_event_tags(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertIn("phishing", rec["event_tags"])
+        self.assertIn("TLP:AMBER", rec["event_tags"])
+
+    def test_stixfile_yields_one_record_per_hash_plus_the_name(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "StixFile",
+            "observable_value": "bad.exe",
+            "name": "bad.exe",
+            "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                       {"algorithm": "sha-256", "hash": "e" * 64}],
+        }]))
+        records = nexus.flatten_indicator(node)
+        pairs = sorted((r["type"], r["value"]) for r in records)
+        self.assertEqual(pairs, sorted([
+            ("File-Name", "bad.exe"),
+            ("MD5", "d" * 32),
+            ("SHA-256", "e" * 64),
+        ]))
+
+    def test_x509_hashes_are_keyed_separately(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "X509-Certificate",
+            "observable_value": "cert",
+            "hashes": [{"algorithm": "SHA-1", "hash": "b" * 40},
+                       {"algorithm": "SHA-256", "hash": "c" * 64}],
+        }]))
+        types = sorted(r["type"] for r in nexus.flatten_indicator(node))
+        self.assertEqual(types, ["X509-SHA-1", "X509-SHA-256"])
+
+    def test_user_account_uses_account_login(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "User-Account", "observable_value": "",
+            "account_login": "bad_actor"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertEqual(rec["value"], "bad_actor")
+        self.assertEqual(rec["type"], "User-Account")
+
+    def test_missing_created_by_is_empty_not_a_crash(self):
+        node = self.node(createdBy=None, observables=self.observables(
+            [{"entity_type": "Url", "observable_value": "http://evil.com/a"}]))
+        self.assertEqual(nexus.flatten_indicator(node)[0]["org"], "")
+
+    def test_updated_at_becomes_epoch_seconds(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertIsInstance(rec["timestamp"], int)
+        self.assertGreater(rec["timestamp"], 1750000000)
+
+    def test_unparseable_timestamp_is_empty(self):
+        node = self.node(updated_at="not a date", observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        self.assertEqual(nexus.flatten_indicator(node)[0]["timestamp"], "")
+
+    def test_detection_false_sets_to_ids_false(self):
+        node = self.node(x_opencti_detection=False, observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        self.assertIs(nexus.flatten_indicator(node)[0]["to_ids"], False)
+
+    def test_truncated_observables_are_counted(self):
+        stats = nexus.BuildStats()
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}],
+            has_next=True))
+        nexus.flatten_indicator(node, stats=stats)
+        self.assertEqual(stats.opencti_truncated_observables, 1)
+
+    def test_observable_with_no_usable_value_is_skipped(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": ""}]))
+        self.assertEqual(nexus.flatten_indicator(node), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
