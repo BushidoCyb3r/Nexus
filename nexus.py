@@ -59,7 +59,7 @@ NEXUS_HOME = "/opt/nexus"
 PROFILE_VERSION = 2
 # Never persisted.  The token is a secret; `discovery` is a cache of live MISP
 # lists that would be stale the moment it is written.
-PROFILE_EXCLUDED_KEYS = ("token", "discovery")
+PROFILE_EXCLUDED_KEYS = ("token", "discovery", "_stats")
 # v1 predates OpenCTI support and named everything after MISP.
 PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
                       "misp_base_url": "source_base_url"}
@@ -3668,9 +3668,10 @@ def resolve_token(args, interactive=True):
             token = ""
         if token:
             return token
-    env = os.environ.get("NEXUS_MISP_TOKEN")
-    if env:
-        return env.strip()
+    for name in ("NEXUS_TOKEN", "NEXUS_MISP_TOKEN"):
+        env = os.environ.get(name)
+        if env:
+            return env.strip()
     cred_path = os.path.join(NEXUS_HOME, "credentials.json")
     if os.path.exists(cred_path):
         try:
@@ -3681,10 +3682,39 @@ def resolve_token(args, interactive=True):
         except (ValueError, OSError) as exc:
             log.warning("could not read %s: %s", cred_path, exc)
     if not interactive:
-        log.error("no token in --token-file, NEXUS_MISP_TOKEN or %s/"
-                  "credentials.json, and --yes cannot prompt", NEXUS_HOME)
+        log.error("no token in --token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
+                  "%s/credentials.json, and --yes cannot prompt", NEXUS_HOME)
         return ""
-    return getpass.getpass("MISP API token: ").strip()
+    # Which platform this is for is the interview's job, asked in stage 1;
+    # by the time resolve_token runs standalone (e.g. --probe) that context
+    # may not exist yet, so the prompt stays platform-neutral.
+    return getpass.getpass("API token: ").strip()
+
+
+def resolve_source_args(args):
+    """Fold the deprecated --misp alias into --host/--source."""
+    if getattr(args, "misp", None):
+        if not args.host:
+            args.host = args.misp
+            args.source = args.source or "misp"
+            print("--misp is deprecated; use --host with --source misp",
+                  file=sys.stderr)
+        else:
+            print("--misp ignored: --host was also given", file=sys.stderr)
+    return args
+
+
+def make_client(config):
+    """Build the client for whichever platform the config names."""
+    kwargs = {
+        "host": config["source_host"], "token": config["token"],
+        "scheme": config["scheme"], "port": config["port"],
+        "verify_tls": config["verify_tls"], "proxy": config.get("proxy"),
+        "timeout": config["timeout"], "retries": config["retries"],
+    }
+    if config.get("source") == "opencti":
+        return OpenctiClient(**kwargs)
+    return MispClient(**kwargs)
 
 
 def cmd_check_env(args):
@@ -3716,7 +3746,7 @@ def cmd_lint(args):
 
 
 def cmd_explain(args):
-    """Show exactly what would be asked of MISP, without asking it."""
+    """Show exactly what would be asked of the platform, without asking it."""
     if not args.profile:
         print("--explain requires --profile", file=sys.stderr)
         return 2
@@ -3727,9 +3757,15 @@ def cmd_explain(args):
         return 2
 
     print(summarise_config(config))
+    print("")
+    if config.get("source") == "opencti":
+        print("One query to POST /graphql:")
+        print("  " + json.dumps(build_opencti_filters(config), indent=2,
+                                sort_keys=True))
+        return 0
+
     base = build_search_params(config)
     feeds = config.get("feeds") or []
-    print("")
     if not feeds:
         print("One query to POST /attributes/restSearch:")
         print("  " + json.dumps(base, indent=2, sort_keys=True))
@@ -3772,18 +3808,25 @@ def cmd_probe(args):
         print("no API token supplied", file=sys.stderr)
         return 2
 
-    client = MispClient(
-        host=args.misp, token=token, scheme=args.scheme, port=args.port,
-        verify_tls=not args.insecure, proxy=args.proxy, timeout=args.timeout,
-        retries=args.retries,
-    )
+    client = make_client({
+        "source": args.source, "source_host": args.host, "token": token,
+        "scheme": args.scheme, "port": args.port,
+        "verify_tls": not args.insecure, "proxy": args.proxy,
+        "timeout": args.timeout, "retries": args.retries,
+    })
 
+    if args.source == "opencti":
+        return _cmd_probe_opencti(client, args)
+    return _cmd_probe_misp(client, args)
+
+
+def _cmd_probe_misp(client, args):
     try:
         version = client.get_version()
-    except MispAuthError as exc:
+    except SourceAuthError as exc:
         print("authentication failed: %s" % exc, file=sys.stderr)
         return 2
-    except MispError as exc:
+    except SourceError as exc:
         print("connection failed: %s" % exc, file=sys.stderr)
         return 2
 
@@ -3797,7 +3840,7 @@ def cmd_probe(args):
         described = client.describe_types()
         tags = client.get_tags()
         orgs = client.get_orgs()
-    except MispError as exc:
+    except SourceError as exc:
         print("discovery failed: %s" % exc, file=sys.stderr)
         return 2
 
@@ -3825,7 +3868,7 @@ def cmd_probe(args):
         try:
             count, exact = client.count_type(misp_type, base,
                                              probe_limit=args.probe_limit)
-        except MispError as exc:
+        except SourceError as exc:
             print("  %-24s %10s  %s" % (misp_type, "ERR", exc))
             continue
         if count == 0 and not args.show_empty:
@@ -3846,10 +3889,84 @@ def cmd_probe(args):
     return 0
 
 
+def _cmd_probe_opencti(client, args):
+    try:
+        version = client.get_version()
+    except SourceAuthError as exc:
+        print("authentication failed: %s" % exc, file=sys.stderr)
+        return 2
+    except SourceError as exc:
+        print("connection failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("Connected to %s" % client.base_url)
+    print("  OpenCTI version : %s" % version.get("version", "unknown"))
+
+    try:
+        labels = client.get_labels()
+        markings = client.get_markings()
+        orgs = client.get_organizations()
+    except SourceError as exc:
+        print("discovery failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("\nDiscovery")
+    print("  labels                              : %d" % len(labels))
+    print("  marking definitions                 : %d" % len(markings))
+    print("  organisations                       : %d" % len(orgs))
+
+    # x_opencti_main_observable_type is what count_type() and the search
+    # filter both key on -- not the OPENCTI_TO_ZEEK value-type keys, which
+    # are one level finer (a StixFile yields several value types at once).
+    candidates = []
+    for key in OPENCTI_IOC_CLASS_ORDER:
+        candidates.extend(OPENCTI_IOC_CLASSES[key][1])
+    # Local, display-only: several main_observable_types (StixFile, Artifact,
+    # X509-Certificate) have no direct OPENCTI_TO_ZEEK entry of their own, so
+    # zeek_type_for() cannot answer for them.
+    zeek_hint = {
+        "IPv4-Addr": "Intel::ADDR", "IPv6-Addr": "Intel::ADDR",
+        "Domain-Name": "Intel::DOMAIN", "Hostname": "Intel::DOMAIN",
+        "Url": "Intel::URL", "Email-Addr": "Intel::EMAIL",
+        "StixFile": "Intel::FILE_HASH + Intel::FILE_NAME",
+        "Artifact": "Intel::FILE_HASH + Intel::FILE_NAME",
+        "X509-Certificate": "Intel::CERT_HASH",
+        "User-Account": "Intel::USER_NAME", "Software": "Intel::SOFTWARE",
+    }
+
+    print("\nMappable observable types")
+    print("  %-24s %10s  %s" % ("opencti type", "count", "zeek type"))
+
+    total = 0
+    for main_type in candidates:
+        try:
+            count, exact = client.count_type(main_type,
+                                             probe_limit=args.probe_limit)
+        except SourceError as exc:
+            print("  %-24s %10s  %s" % (main_type, "ERR", exc))
+            continue
+        if count == 0 and not args.show_empty:
+            continue
+        total += count
+        marker = "" if exact else "+"
+        flag = "" if main_type not in OPENCTI_OFF_BY_DEFAULT else "   (off by default)"
+        print("  %-24s %9d%s  %s%s"
+              % (main_type, count, marker, zeek_hint.get(main_type, ""), flag))
+
+    print("\n  approximate total indicators available: %d%s"
+          % (total, "" if total < args.probe_limit else "+"))
+    if OPENCTI_UNMAPPABLE:
+        print("\nPresent in OpenCTI but not mappable to Zeek:")
+        for main_type in sorted(OPENCTI_UNMAPPABLE):
+            print("  %-24s %s" % (main_type, OPENCTI_UNMAPPABLE[main_type]))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="nexus",
-        description="Build a Zeek intel.dat from MISP, for Security Onion 3.2.",
+        description="Build a Zeek intel.dat from MISP or OpenCTI, for "
+                    "Security Onion 3.2.",
     )
     parser.add_argument("--version", action="version",
                         version="nexus %s" % __version__)
@@ -3869,13 +3986,19 @@ def build_parser():
                       help="copy the Security Onion default intel files "
                            "(including __load__.Zeek) into the local dir")
     mode.add_argument("--explain", action="store_true",
-                      help="print the resolved MISP query for a profile and "
-                           "exit; contacts nothing")
+                      help="print the resolved platform query for a profile "
+                           "and exit; contacts nothing")
     mode.add_argument("--probe", action="store_true",
-                      help="connect to MISP and report available IOC counts")
+                      help="connect to the platform and report available "
+                           "IOC counts")
 
-    conn = parser.add_argument_group("MISP connection")
-    conn.add_argument("--misp", metavar="HOST", help="MISP IP or hostname")
+    conn = parser.add_argument_group("platform connection")
+    conn.add_argument("--source", choices=SOURCES, default=None,
+                      help="which platform to pull from; asked if omitted")
+    conn.add_argument("--host", metavar="HOST", default=None,
+                      help="platform IP or hostname; asked if omitted")
+    conn.add_argument("--misp", metavar="HOST", default=None,
+                      help="deprecated alias for --host --source misp")
     conn.add_argument("--scheme", default="https", choices=("https", "http"))
     conn.add_argument("--port", type=int, default=None)
     conn.add_argument("--insecure", action="store_true",
@@ -3903,7 +4026,8 @@ def build_parser():
                           "interview")
     run.add_argument("--yes", action="store_true",
                      help="never prompt; requires --profile and a token from "
-                          "--token-file, NEXUS_MISP_TOKEN or credentials.json")
+                          "--token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
+                          "credentials.json")
     run.add_argument("--dry-run", action="store_true",
                      help="build and compare, write nothing")
     run.add_argument("--diff", action="store_true",
@@ -3916,6 +4040,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args = resolve_source_args(args)
     explicit_log = args.log_file is not None
     logfile = args.log_file or os.path.join(NEXUS_HOME, "logs", "nexus.log")
     setup_logging(args.verbose, logfile, required=explicit_log)
@@ -3935,9 +4060,18 @@ def main(argv=None):
               "unattended)", file=sys.stderr)
         return 2
     if args.probe:
-        if not args.misp:
-            print("--probe requires --misp HOST", file=sys.stderr)
-            return 2
+        # Flags exist to skip questions, not to change what a flagless run
+        # means: absent --host/--source, --probe asks rather than errors.
+        try:
+            if not args.host:
+                args.host = ask_required("Platform address (IP or hostname)",
+                                         None)
+            if not args.source:
+                args.source = ask_choice("Threat intel platform",
+                                         list(SOURCES), "misp")
+        except InterviewAborted as exc:
+            print("\nAborted: %s" % exc)
+            return 130
         return cmd_probe(args)
 
     return cmd_build(args)
@@ -4004,12 +4138,7 @@ def cmd_build(args):
     if args.yes:
         config["apply"] = config.get("apply", False)
 
-    client = MispClient(
-        host=config["source_host"], token=config["token"],
-        scheme=config["scheme"], port=config["port"],
-        verify_tls=config["verify_tls"], proxy=config["proxy"],
-        timeout=config["timeout"], retries=config["retries"],
-    )
+    client = make_client(config)
 
     if config.get("profile_path") and not args.profile:
         try:
@@ -4019,12 +4148,13 @@ def cmd_build(args):
             log.warning("could not save profile: %s", exc)
 
     print(summarise_config(config))
+    label = SOURCE_LABELS.get(config.get("source"), "platform")
     try:
         version = client.get_version()
-    except MispError as exc:
-        print("MISP connection failed: %s" % exc, file=sys.stderr)
+    except SourceError as exc:
+        print("%s connection failed: %s" % (label, exc), file=sys.stderr)
         return 2
-    log.info("connected to MISP %s", version.get("version", "unknown"))
+    log.info("connected to %s %s", label, version.get("version", "unknown"))
 
     exclusions = ExclusionSet(
         exclude_private=config["exclude_private"],
@@ -4033,6 +4163,15 @@ def cmd_build(args):
         allowlist=_load_allowlist(config.get("allowlist_file")),
     )
 
+    # A live BuildStats has to be reachable from _fetch_records (OpenCTI's
+    # pattern-fallback counters) as well as build_indicators (mapping
+    # counters), so both write into the same instance via config["_stats"].
+    stats = BuildStats()
+    config["_stats"] = stats
+    if config.get("source") == "opencti":
+        table = OPENCTI_TO_ZEEK
+    else:
+        table = MISP_TO_ZEEK
     records = _fetch_records(client, config)
     rows, stats = build_indicators(
         records, types=config["types"], exclusions=exclusions,
@@ -4043,6 +4182,7 @@ def cmd_build(args):
         meta_maxlen=config["meta_maxlen"],
         do_notice=config["do_notice"] or None,
         source=config.get("source", "misp"),
+        mapping_table=table, stats=stats,
     )
     print("\n" + stats.report())
 
@@ -4080,7 +4220,7 @@ def cmd_build(args):
         return 1
 
     added, removed = indicator_delta(existing, lines)
-    print("\nMISP indicator diff")
+    print("\n%s indicator diff" % label)
     print(summarise_delta(existing, lines))
     if removed:
         # This is an invariant check, not an expected operator decision.
@@ -4122,13 +4262,23 @@ def cmd_build(args):
 
 
 def _fetch_records(client, config):
-    """Yield records, one restSearch per selected feed.
+    """Yield records from whichever platform the config names.
 
-    Two feeds identified by different mechanisms -- one by fixed event, one by
-    tag -- cannot be expressed in a single restSearch body, so each gets its
-    own query and the results are merged.  build_indicators() dedupes across
-    them, so an indicator carried by two feeds is written once.
+    OpenCTI expresses its whole query as one FilterGroup, so it is a single
+    call.  MISP needs the per-feed fan-out below: two feeds identified by
+    different mechanisms -- one by fixed event, one by tag -- cannot be
+    expressed in a single restSearch body, so each gets its own query and the
+    results are merged.  build_indicators() dedupes across them, so an
+    indicator carried by two feeds is written once.
     """
+    if config.get("source") == "opencti":
+        filters = build_opencti_filters(config)
+        for record in client.search_indicators(
+                filters, max_results=config.get("max_indicators"),
+                stats=config.get("_stats")):
+            yield record
+        return
+
     base = build_search_params(config)
     feeds = config.get("feeds") or []
     if not feeds:

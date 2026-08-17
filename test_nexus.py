@@ -3937,5 +3937,77 @@ class TestOpenctiSearch(unittest.TestCase):
         self.assertEqual(variables["filters"], filters)
 
 
+class TestSourceCli(unittest.TestCase):
+
+    def parse(self, argv):
+        return nexus.build_parser().parse_args(argv)
+
+    def test_source_flag(self):
+        self.assertEqual(self.parse(["--source", "opencti"]).source, "opencti")
+
+    def test_source_defaults_to_none_so_the_interview_asks(self):
+        self.assertIsNone(self.parse([]).source)
+
+    def test_host_flag(self):
+        self.assertEqual(self.parse(["--host", "cti.local"]).host, "cti.local")
+
+    def test_misp_alias_sets_host_and_source(self):
+        args = self.parse(["--misp", "misp.local"])
+        resolved = nexus.resolve_source_args(args)
+        self.assertEqual(resolved.host, "misp.local")
+        self.assertEqual(resolved.source, "misp")
+
+    def test_explicit_host_wins_over_the_alias(self):
+        args = self.parse(["--host", "a", "--misp", "b"])
+        self.assertEqual(nexus.resolve_source_args(args).host, "a")
+
+    def test_make_client_picks_the_opencti_client(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "proxy": None, "timeout": 30, "retries": 3, "token": "tok"}
+        self.assertIsInstance(nexus.make_client(config), nexus.OpenctiClient)
+
+    def test_make_client_picks_the_misp_client(self):
+        config = {"source": "misp", "source_host": "misp.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "proxy": None, "timeout": 30, "retries": 3, "token": "tok"}
+        self.assertIsInstance(nexus.make_client(config), nexus.MispClient)
+
+    def test_neutral_token_env_var_is_read_first(self):
+        args = self.parse([])
+        os.environ["NEXUS_TOKEN"] = "neutral"
+        os.environ["NEXUS_MISP_TOKEN"] = "legacy"
+        try:
+            self.assertEqual(nexus.resolve_token(args, interactive=False),
+                             "neutral")
+        finally:
+            del os.environ["NEXUS_TOKEN"]
+            del os.environ["NEXUS_MISP_TOKEN"]
+
+    def test_legacy_token_env_var_still_works(self):
+        args = self.parse([])
+        os.environ["NEXUS_MISP_TOKEN"] = "legacy"
+        try:
+            self.assertEqual(nexus.resolve_token(args, interactive=False),
+                             "legacy")
+        finally:
+            del os.environ["NEXUS_MISP_TOKEN"]
+
+    def test_fetch_records_uses_the_opencti_path(self):
+        class Client(object):
+            def __init__(self):
+                self.calls = []
+
+            def search_indicators(self, filters, max_results=None, stats=None):
+                self.calls.append(filters)
+                return iter([{"value": "evil.com", "type": "Domain-Name"}])
+
+        client = Client()
+        config = {"source": "opencti", "types": ["Domain-Name"]}
+        records = list(nexus._fetch_records(client, config))
+        self.assertEqual(records[0]["value"], "evil.com")
+        self.assertEqual(len(client.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
