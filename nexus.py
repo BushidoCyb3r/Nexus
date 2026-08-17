@@ -985,6 +985,73 @@ def flatten_indicator(node, stats=None):
     return records
 
 
+# Only STIX patterns are parsed.  A YARA/Sigma/Snort/PCRE rule's string
+# literals are not indicators, and mining them would arm Zeek against
+# whatever text a detection rule happened to mention.
+OPENCTI_PARSEABLE_PATTERN_TYPES = frozenset(("stix",))
+
+STIX_PROPERTY_TO_TYPE = {
+    "ipv4-addr:value": "IPv4-Addr",
+    "ipv6-addr:value": "IPv6-Addr",
+    "domain-name:value": "Domain-Name",
+    "hostname:value": "Hostname",
+    "url:value": "Url",
+    "email-addr:value": "Email-Addr",
+    "email-message:from_ref.value": "Email-Addr",
+    "file:name": "File-Name",
+    "user-account:account_login": "User-Account",
+    "software:name": "Software",
+}
+
+# `object-type:property = 'value'`.  The property class deliberately excludes
+# "!" and whitespace, so a "!=" comparison can never bridge from the property
+# to the "=" and the regex simply fails to match there -- an exclusion is not
+# something a flat indicator list can express, so it is dropped for free
+# rather than needing a special case.
+_STIX_COMPARISON = re.compile(
+    r"([a-z0-9-]+):([a-zA-Z0-9_.\-']+?)\s*=\s*'([^']*)'")
+
+
+def parse_stix_pattern(pattern):
+    """STIX pattern -> [(mapping_table_key, value), ...].
+
+    Used only when an indicator has no linked observables.  Anything that
+    cannot be represented as a flat indicator -- negations, qualifiers, object
+    types with no Zeek equivalent -- is skipped rather than approximated.
+    """
+    if not pattern:
+        return []
+
+    out = []
+    seen = set()
+    for match in _STIX_COMPARISON.finditer(str(pattern)):
+        obj_type = match.group(1)
+        prop = match.group(2).strip()
+        value = match.group(3).strip()
+        if not value:
+            continue
+
+        if prop.lower().startswith("hashes."):
+            algorithm = normalise_hash_algorithm(
+                prop[len("hashes."):].strip("'\""))
+            if obj_type == "x509-certificate":
+                value_type = "X509-%s" % algorithm
+            else:
+                value_type = algorithm
+        else:
+            value_type = STIX_PROPERTY_TO_TYPE.get(
+                "%s:%s" % (obj_type.lower(), prop))
+
+        if not value_type or value_type not in OPENCTI_TO_ZEEK:
+            continue
+        key = (value_type, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # FEEDS
 # ---------------------------------------------------------------------------

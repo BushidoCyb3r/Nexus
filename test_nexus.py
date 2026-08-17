@@ -3286,5 +3286,65 @@ class TestOpenctiTimestamp(unittest.TestCase):
         self.assertEqual(nexus._opencti_epoch("not a date"), "")
 
 
+class TestStixPattern(unittest.TestCase):
+
+    def test_simple_comparisons(self):
+        cases = [
+            ("[ipv4-addr:value = '45.33.32.1']", [("IPv4-Addr", "45.33.32.1")]),
+            ("[ipv6-addr:value = '2606:4700::1']", [("IPv6-Addr", "2606:4700::1")]),
+            ("[domain-name:value = 'evil.com']", [("Domain-Name", "evil.com")]),
+            ("[url:value = 'http://evil.com/a']", [("Url", "http://evil.com/a")]),
+            ("[email-addr:value = 'a@evil.com']", [("Email-Addr", "a@evil.com")]),
+            ("[file:name = 'bad.exe']", [("File-Name", "bad.exe")]),
+        ]
+        for pattern, expected in cases:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(nexus.parse_stix_pattern(pattern), expected)
+
+    def test_quoted_hash_property(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[file:hashes.'SHA-256' = '%s']" % ("a" * 64)),
+            [("SHA-256", "a" * 64)])
+
+    def test_unquoted_hash_property(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[file:hashes.MD5 = '%s']" % ("d" * 32)),
+            [("MD5", "d" * 32)])
+
+    def test_certificate_hash_keys_separately(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern(
+                "[x509-certificate:hashes.'SHA-1' = '%s']" % ("b" * 40)),
+            [("X509-SHA-1", "b" * 40)])
+
+    def test_or_joined_comparisons_all_extracted(self):
+        pattern = ("[domain-name:value = 'a.com' OR domain-name:value = 'b.com']")
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("Domain-Name", "a.com"), ("Domain-Name", "b.com")])
+
+    def test_qualifiers_are_ignored(self):
+        pattern = "[ipv4-addr:value = '45.33.32.1'] REPEATS 2 TIMES WITHIN 60 SECONDS"
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("IPv4-Addr", "45.33.32.1")])
+
+    def test_unsupported_property_yields_nothing(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[windows-registry-key:key = 'HKLM\\\\Run']"),
+            [])
+
+    def test_not_equals_is_not_treated_as_an_indicator(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[domain-name:value != 'good.com']"), [])
+
+    def test_empty_and_none_are_safe(self):
+        self.assertEqual(nexus.parse_stix_pattern(""), [])
+        self.assertEqual(nexus.parse_stix_pattern(None), [])
+
+    def test_duplicate_values_are_deduped_in_order(self):
+        pattern = "[domain-name:value = 'a.com' OR domain-name:value = 'a.com']"
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("Domain-Name", "a.com")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
