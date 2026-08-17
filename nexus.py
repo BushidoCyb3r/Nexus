@@ -1656,9 +1656,13 @@ def _safe_format(template, **fields):
 
 
 def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
-                misp_base_url=None, maxlen=DEFAULT_META_MAXLEN):
-    """Build (source, desc, url) for one record."""
-    source = _safe_format(
+                base_url=None, maxlen=DEFAULT_META_MAXLEN, source="misp"):
+    """Build (source, desc, url) for one record.
+
+    `source` picks the URL shape: MISP links to an event, OpenCTI to the
+    indicator itself (record["event_id"] carries the indicator id there).
+    """
+    meta_source = _safe_format(
         source_fmt,
         org=record.get("org") or "unknown",
         event_id=record.get("event_id") or "0",
@@ -1682,10 +1686,14 @@ def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
         desc = record.get("event_info") or ""
 
     url = ""
-    if misp_base_url and record.get("event_id"):
-        url = "%s/events/view/%s" % (misp_base_url.rstrip("/"), record["event_id"])
+    if base_url and record.get("event_id"):
+        if source == "opencti":
+            url = "%s/dashboard/observations/indicators/%s" % (
+                base_url.rstrip("/"), record["event_id"])
+        else:
+            url = "%s/events/view/%s" % (base_url.rstrip("/"), record["event_id"])
 
-    return (sanitize_meta(source, maxlen),
+    return (sanitize_meta(meta_source, maxlen),
             sanitize_meta(desc, maxlen),
             sanitize_meta(url, maxlen))
 
@@ -1764,11 +1772,12 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
                      split_composites="both", allow_subnet=True,
                      source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
                      base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
-                     do_notice=None, mapping_table=None):
+                     do_notice=None, mapping_table=None, source="misp"):
     """Records -> deduplicated intel rows.  Pure: no I/O, no network.
 
-    `mapping_table` selects the source; defaults to the MISP table so
-    existing callers are unaffected.
+    `mapping_table` selects the type mapping; defaults to the MISP table so
+    existing callers are unaffected.  `source` picks the meta.url shape
+    (see render_meta) and likewise defaults to "misp".
 
     Returns (rows, stats) where each row is
     (indicator, zeek_type, source, desc, url, do_notice).
@@ -1790,7 +1799,7 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
             continue
 
         meta = render_meta(record, source_fmt, desc_template, base_url,
-                           meta_maxlen)
+                           meta_maxlen, source=source)
 
         for raw, zeek_type in map_attribute(record, split_composites,
                                             allow_subnet, table=lookup):
@@ -2810,14 +2819,22 @@ def _stage3_iocs(config, discovery, input_fn, source="misp"):
                        and counts.get(t, (1, True))[0] != 0]
         selected.extend(ask_multi(label, options, preselected, input_fn))
 
-    config["split_composites"] = ask_choice(
-        "Composite types (domain|ip, filename|md5): emit which half?",
-        [("both", "domain + ip"), ("first", "domain only"),
-         ("second", "ip only")], "both", input_fn)
+    if source == "opencti":
+        # No OPENCTI_TO_ZEEK entry has more than one spec, so a first/second
+        # split answer would have nothing to act on -- don't ask.
+        config["split_composites"] = "both"
+    else:
+        config["split_composites"] = ask_choice(
+            "Composite types (domain|ip, filename|md5): emit which half?",
+            [("both", "domain + ip"), ("first", "domain only"),
+             ("second", "ip only")], "both", input_fn)
     config["hostname_as_domain"] = ask_yes_no(
         "Treat hostname as Intel::DOMAIN?", True, input_fn)
     if not config["hostname_as_domain"]:
-        selected = [t for t in selected if not t.startswith("hostname")]
+        # OpenCTI's type literal is "Hostname" (capital H); MISP's is
+        # lowercase "hostname"/"hostname|port".
+        hostname_prefix = "Hostname" if source == "opencti" else "hostname"
+        selected = [t for t in selected if not t.startswith(hostname_prefix)]
     config["allow_subnet"] = ask_yes_no(
         "Emit Intel::SUBNET for CIDR values in IP attributes?", True, input_fn)
 
@@ -2893,6 +2910,71 @@ def _stage5_scope(config, discovery, input_fn):
         None, input_fn)
     config["event_ids"] = ask_list("Restrict to event IDs or UUIDs",
                                    "none", None, input_fn)
+    return config
+
+
+def _stage4_quality_opencti(config, input_fn):
+    _stage(4, "Quality filters")
+    config["min_score"] = ask_int(
+        "Minimum x_opencti_score (0 = no filter)", 50, 0, 100, input_fn)
+    config["min_confidence"] = ask_int(
+        "Minimum confidence (0 = no filter)", 0, 0, 100, input_fn)
+    config["exclude_revoked"] = ask_yes_no(
+        "Exclude revoked indicators?", True, input_fn)
+    config["require_detection"] = ask_yes_no(
+        "Only indicators flagged for detection?", False, input_fn)
+    # An indicator past its own author's valid_until is stale by their
+    # judgement, and Zeek has no expiry of its own.
+    config["exclude_expired"] = ask_yes_no(
+        "Exclude indicators past their valid_until?", True, input_fn)
+    return config
+
+
+def _names_to_ids(names, mapping):
+    """Selected names -> OpenCTI ids, dropping anything discovery never saw."""
+    out = []
+    for name in names or []:
+        ident = mapping.get(name)
+        if not ident:
+            log.warning("no OpenCTI id for %r; it was dropped from the filter",
+                        name)
+            continue
+        out.append(ident)
+    return out
+
+
+def _stage5_scope_opencti(config, discovery, input_fn):
+    _stage(5, "Scope")
+    labels = discovery.get("labels") or []
+    markings = discovery.get("markings") or []
+    orgs = discovery.get("orgs") or []
+
+    config["include_labels"] = _ask_names("Include labels", labels,
+                                          input_fn=input_fn)
+    config["exclude_labels"] = _ask_names("Exclude labels", labels,
+                                          input_fn=input_fn)
+    config["markings"] = _ask_names("TLP markings", markings, input_fn=input_fn)
+    config["authors"] = _ask_names("Created by (organisations)", orgs,
+                                   input_fn=input_fn)
+
+    config["include_label_ids"] = _names_to_ids(
+        config["include_labels"], discovery.get("label_ids") or {})
+    config["exclude_label_ids"] = _names_to_ids(
+        config["exclude_labels"], discovery.get("label_ids") or {})
+    config["marking_ids"] = _names_to_ids(
+        config["markings"], discovery.get("marking_ids") or {})
+    config["author_ids"] = _names_to_ids(
+        config["authors"], discovery.get("org_ids") or {})
+
+    mode = ask_choice("Time window", ["all", "last", "range"], "all", input_fn)
+    config["time_mode"] = mode
+    if mode == "last":
+        config["days"] = ask_int("Days", 30, 1, 3650, input_fn)
+    elif mode == "range":
+        config["date_from"] = ask_date("From (YYYY-MM-DD)", None, input_fn)
+        config["date_to"] = ask_date("To (YYYY-MM-DD)", None, input_fn)
+    config["timestamp_field"] = ask_choice(
+        "Timestamp field", ["created_at", "valid_from"], "created_at", input_fn)
     return config
 
 
@@ -3007,8 +3089,12 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass, source=Non
 
     _stage_feeds(config, discovery, input_fn, source=config["source"])
     _stage3_iocs(config, discovery, input_fn, source=config["source"])
-    _stage4_quality(config, input_fn)
-    _stage5_scope(config, discovery, input_fn)
+    if config["source"] == "opencti":
+        _stage4_quality_opencti(config, input_fn)
+        _stage5_scope_opencti(config, discovery, input_fn)
+    else:
+        _stage4_quality(config, input_fn)
+        _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
     _stage7_metadata(config, input_fn)
     _stage8_output(config, input_fn)
@@ -3191,23 +3277,27 @@ def summarise_config(config):
     port = config.get("port")
     scheme = config.get("scheme", "https")
     shown_port = "" if port in (None, 80, 443) else ":%d" % port
+    source = config.get("source", "misp")
+    label = SOURCE_LABELS.get(source, source)
     lines = ["Pre-flight summary", ""]
 
-    lines.append("  MISP        : %s://%s%s (verify TLS: %s)"
-                 % (scheme, config.get("source_host", "?"), shown_port,
+    lines.append("  source      : %s" % source)
+    lines.append("  %-12s: %s://%s%s (verify TLS: %s)"
+                 % (label, scheme, config.get("source_host", "?"), shown_port,
                     _yes_no(config.get("verify_tls"))))
     if config.get("proxy"):
         lines.append("  proxy       : %s" % config["proxy"])
 
-    feeds = config.get("feeds") or []
-    if feeds:
-        lines.append("  feeds       : %d selected (one query each)" % len(feeds))
-        for feed in feeds:
-            kind, value, _ = feed_provenance(feed)
-            lines.append("                  %-28s via %s=%s"
-                         % (feed["name"][:28], kind, value))
-    else:
-        lines.append("  feeds       : all of MISP (no feed restriction)")
+    if source != "opencti":
+        feeds = config.get("feeds") or []
+        if feeds:
+            lines.append("  feeds       : %d selected (one query each)" % len(feeds))
+            for feed in feeds:
+                kind, value, _ = feed_provenance(feed)
+                lines.append("                  %-28s via %s=%s"
+                             % (feed["name"][:28], kind, value))
+        else:
+            lines.append("  feeds       : all of MISP (no feed restriction)")
 
     types = config.get("types") or []
     lines.append("  IOC types   : %d selected%s"
@@ -3217,15 +3307,23 @@ def summarise_config(config):
                     "on" if config.get("allow_subnet") else "off",
                     "as DOMAIN" if config.get("hostname_as_domain") else "dropped"))
 
-    lines.append("  quality     : to_ids=%s published=%s warninglist=%s "
-                 "deleted=%s" % (_yes_no(config.get("to_ids")),
-                                 _yes_no(config.get("published")),
-                                 _yes_no(config.get("enforce_warninglist")),
-                                 "excluded" if config.get("exclude_deleted")
-                                 else "included"))
-    if config.get("threat_level") or config.get("analysis") is not None:
-        lines.append("  event state : threat_level<=%s analysis=%s"
-                     % (config.get("threat_level"), config.get("analysis")))
+    if source == "opencti":
+        lines.append("  quality     : min_score=%s min_confidence=%s revoked=%s "
+                     "detection=%s expired=%s"
+                     % (config.get("min_score", 0), config.get("min_confidence", 0),
+                        "excluded" if config.get("exclude_revoked") else "included",
+                        "required" if config.get("require_detection") else "any",
+                        "excluded" if config.get("exclude_expired") else "included"))
+    else:
+        lines.append("  quality     : to_ids=%s published=%s warninglist=%s "
+                     "deleted=%s" % (_yes_no(config.get("to_ids")),
+                                     _yes_no(config.get("published")),
+                                     _yes_no(config.get("enforce_warninglist")),
+                                     "excluded" if config.get("exclude_deleted")
+                                     else "included"))
+        if config.get("threat_level") or config.get("analysis") is not None:
+            lines.append("  event state : threat_level<=%s analysis=%s"
+                         % (config.get("threat_level"), config.get("analysis")))
 
     mode = config.get("time_mode") or "all"
     if mode == "last":
@@ -3238,13 +3336,19 @@ def summarise_config(config):
         window = "all time"
     lines.append("  window      : %s" % window)
 
-    for label, key in (("include tags", "include_tags"),
-                       ("exclude tags", "exclude_tags"),
-                       ("orgs", "orgs"), ("sharing groups", "sharing_groups"),
-                       ("event ids", "event_ids")):
+    if source == "opencti":
+        scope_fields = (("include labels", "include_labels"),
+                        ("exclude labels", "exclude_labels"),
+                        ("markings", "markings"), ("authors", "authors"))
+    else:
+        scope_fields = (("include tags", "include_tags"),
+                        ("exclude tags", "exclude_tags"),
+                        ("orgs", "orgs"), ("sharing groups", "sharing_groups"),
+                        ("event ids", "event_ids"))
+    for scope_label, key in scope_fields:
         values = config.get(key) or []
         if values:
-            lines.append("  %-12s: %s" % (label, ", ".join(values)))
+            lines.append("  %-12s: %s" % (scope_label, ", ".join(values)))
 
     lines.append("  exclusions  : private=%s networks=%s domains=%s allowlist=%s"
                  % (_yes_no(config.get("exclude_private")),
@@ -3269,8 +3373,12 @@ def summarise_config(config):
         lines.append("  profile     : %s" % config["profile_path"])
 
     lines.append("")
-    lines.append("  restSearch  : %s"
-                 % json.dumps(build_search_params(config), sort_keys=True))
+    if source == "opencti":
+        lines.append("  filters     : %s"
+                     % json.dumps(build_opencti_filters(config), sort_keys=True))
+    else:
+        lines.append("  restSearch  : %s"
+                     % json.dumps(build_search_params(config), sort_keys=True))
     return "\n".join(lines)
 
 
@@ -3934,6 +4042,7 @@ def cmd_build(args):
         base_url=config["source_base_url"],
         meta_maxlen=config["meta_maxlen"],
         do_notice=config["do_notice"] or None,
+        source=config.get("source", "misp"),
     )
     print("\n" + stats.report())
 

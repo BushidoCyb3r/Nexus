@@ -2381,6 +2381,103 @@ class TestOpenctiInterviewStages(Quiet):
             nexus._stage3_iocs(config, discovery, fake)
         self.assertIn("ip-dst", config["types"])
 
+    def test_opencti_hostname_answer_drops_the_capitalised_type(self):
+        # OpenCTI's type literal is "Hostname" (capital H), not MISP's
+        # "hostname" -- answering "no" here must actually remove it, or an
+        # OpenCTI operator declining hostname-as-domain silently keeps them.
+        discovery = {"counts": {}, "types": ["Hostname", "Domain-Name"]}
+        fake = by_prompt([("Network -", "all"), ("Treat hostname", "n")])
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertNotIn("Hostname", config["types"])
+
+    def test_opencti_skips_the_composite_question_entirely(self):
+        # No OPENCTI_TO_ZEEK entry has more than one spec, so the composite
+        # split question cannot do anything on this path; it must not be
+        # asked, and the config value stays at the "both" default.
+        discovery = {"counts": {}, "types": []}
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertEqual(config["split_composites"], "both")
+        self.assertNotIn("Composite types", " ".join(fake.state["prompts"]))
+
+
+# ---------------------------------------------------------------------------
+# STAGES 4, 5 -- OpenCTI quality and scope
+# ---------------------------------------------------------------------------
+
+class TestOpenctiQualityAndScope(Quiet):
+
+    def discovery(self):
+        return {"labels": ["phishing", "apt"], "markings": ["TLP:AMBER"],
+                "orgs": ["CIRCL"],
+                "label_ids": {"phishing": "l1", "apt": "l2"},
+                "marking_ids": {"TLP:AMBER": "m1"},
+                "org_ids": {"CIRCL": "o1"}}
+
+    def test_quality_defaults(self):
+        fake = scripted(["", "", "", "", ""])
+        config = {}
+        nexus._stage4_quality_opencti(config, fake)
+        self.assertEqual(config["min_score"], 50)
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["exclude_revoked"], True)
+        self.assertIs(config["require_detection"], False)
+        self.assertIs(config["exclude_expired"], True)
+
+    def test_quality_answers_are_taken(self):
+        fake = scripted(["70", "60", "n", "y", "n"])
+        config = {}
+        nexus._stage4_quality_opencti(config, fake)
+        self.assertEqual(config["min_score"], 70)
+        self.assertEqual(config["min_confidence"], 60)
+        self.assertIs(config["exclude_revoked"], False)
+        self.assertIs(config["require_detection"], True)
+        self.assertIs(config["exclude_expired"], False)
+
+    def test_names_to_ids_translates_and_drops_unknowns(self):
+        mapping = {"phishing": "l1"}
+        with self.assertLogs("nexus", level="WARNING"):
+            out = nexus._names_to_ids(["phishing", "ghost"], mapping)
+        self.assertEqual(out, ["l1"])
+
+    def test_scope_translates_names_to_ids(self):
+        # include labels, exclude labels, markings, authors, time mode, field
+        fake = by_prompt([
+            ("Include labels", "1"),
+            ("Exclude labels", "2"),
+            ("TLP markings", "1"),
+            ("Created by", "1"),
+            ("Time window", "1"),
+            ("Timestamp field", "1"),
+        ])
+        config = {}
+        nexus._stage5_scope_opencti(config, self.discovery(), fake)
+        self.assertEqual(config["include_label_ids"], ["l1"])
+        self.assertEqual(config["exclude_label_ids"], ["l2"])
+        self.assertEqual(config["marking_ids"], ["m1"])
+        self.assertEqual(config["author_ids"], ["o1"])
+
+    def test_summary_names_the_source_and_shows_the_filter_group(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "types": ["IPv4-Addr"], "min_score": 50,
+                  "exclude_revoked": True, "output_path": "/tmp/intel.dat"}
+        text = nexus.summarise_config(config)
+        self.assertIn("opencti", text)
+        self.assertIn("x_opencti_main_observable_type", text)
+        self.assertNotIn("restSearch", text)
+
+    def test_misp_summary_still_shows_restsearch(self):
+        config = {"source": "misp", "source_host": "misp.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "types": ["ip-dst"], "output_path": "/tmp/intel.dat"}
+        text = nexus.summarise_config(config)
+        self.assertIn("restSearch", text)
+
 
 # ---------------------------------------------------------------------------
 # SUMMARY
@@ -2841,6 +2938,31 @@ class TestFeedMetadata(unittest.TestCase):
         lines = [nexus.header_line()] + nexus.rows_to_lines(rows)
         self.assertEqual(nexus.lint_lines(lines), [])
         self.assertIn("MISP-feed-CIRCL-OSINT", lines[1])
+
+
+class TestSourceAwareMetaUrl(unittest.TestCase):
+    """meta.url must point at a page that exists on the source platform."""
+
+    def test_misp_url_shape_is_unchanged(self):
+        _, _, url = nexus.render_meta({"event_id": "42"},
+                                      base_url="https://misp.example")
+        self.assertEqual(url, "https://misp.example/events/view/42")
+
+    def test_opencti_url_points_at_the_indicator_dashboard(self):
+        _, _, url = nexus.render_meta({"event_id": "abc-123"},
+                                      base_url="https://cti.local",
+                                      source="opencti")
+        self.assertEqual(
+            url, "https://cti.local/dashboard/observations/indicators/abc-123")
+
+    def test_build_indicators_threads_source_into_the_url(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "IPv4-Addr", "value": "1.2.3.4", "event_id": "9"}],
+            types=["IPv4-Addr"], exclusions=nexus.ExclusionSet(),
+            base_url="https://cti.local", source="opencti",
+            mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(rows[0][4],
+                         "https://cti.local/dashboard/observations/indicators/9")
 
 
 class TestFeedDiscovery(Quiet):
