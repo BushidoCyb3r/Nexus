@@ -4056,10 +4056,16 @@ class TestOpenctiEndToEnd(unittest.TestCase):
     def test_private_addresses_are_still_excluded(self):
         records = nexus.flatten_indicator(
             self.indicator("i1", "IPv4-Addr", "10.0.0.1"))
-        rows, _ = nexus.build_indicators(
+        rows, stats = nexus.build_indicators(
             records, mapping_table=nexus.OPENCTI_TO_ZEEK,
             exclusions=nexus.ExclusionSet(exclude_private=True))
         self.assertEqual(rows, [])
+        # rows == [] alone doesn't distinguish "excluded" from "never mapped"
+        # (an unmapped type hits stats.unmap() before exclusions run at all).
+        # Pin down the actual exclusion reason so a broken OPENCTI_TO_ZEEK
+        # entry or a broken exclusion check would fail this differently.
+        self.assertEqual(stats.excluded.get("private_ip"), 1)
+        self.assertEqual(stats.unmapped, {})
 
     def test_append_only_merge_across_sources(self):
         path = os.path.join(self.dir, "intel.dat")
@@ -4077,9 +4083,9 @@ class TestOpenctiEndToEnd(unittest.TestCase):
             existing_rows, nexus.rows_to_lines(rows, False))
 
         # The MISP row owns the key; the OpenCTI run adds nothing and removes
-        # nothing.
+        # nothing. The existing row must survive byte-for-byte.
         self.assertEqual(len(combined), 1)
-        self.assertIn("MISP", combined[0])
+        self.assertEqual(combined[0], "evil.com\tIntel::DOMAIN\tMISP\told desc\t-")
         added, removed = nexus.indicator_delta(existing_rows, combined)
         self.assertEqual(removed, [])
 
