@@ -2546,10 +2546,15 @@ def _count_label(misp_type, counts):
     return format(count, ",d") + ("" if exact else "+")
 
 
-def _type_annotation(misp_type, counts):
+def _type_annotation(misp_type, counts, table=None, off_by_default=None):
+    """`table` and `off_by_default` default to the MISP pair so the one
+    existing call site (pre-OpenCTI) is unaffected; _stage3_iocs passes the
+    OpenCTI pair on that path so the Zeek-type column isn't just "None".
+    """
+    noisy_set = MISP_OFF_BY_DEFAULT if off_by_default is None else off_by_default
     return "%9s  -> %s%s" % (
-        _count_label(misp_type, counts), zeek_type_for(misp_type),
-        "   (noisy)" if misp_type in MISP_OFF_BY_DEFAULT else "")
+        _count_label(misp_type, counts), zeek_type_for(misp_type, table),
+        "   (noisy)" if misp_type in noisy_set else "")
 
 
 # -- stage 2: discovery -----------------------------------------------------
@@ -2595,6 +2600,54 @@ def discover(client, probe_limit=5000):
     found["orgs"] = [o.get("name") for o in found["orgs"] if o.get("name")]
     found["sharing_groups"] = [s.get("name") for s in found["sharing_groups"]
                                if s.get("name")]
+    return found
+
+
+def discover_opencti(client, probe_limit=None):
+    """Stage 2 for OpenCTI.  Names for the operator, ids for the filters.
+
+    6.x filters take entity ids, so the interview shows names and translates
+    through these maps rather than passing a name through as a guess.
+    """
+    found = {"version": {}, "types": [], "counts": {}, "labels": [],
+             "markings": [], "orgs": [], "label_ids": {}, "marking_ids": {},
+             "org_ids": {}}
+    if client is None:
+        return found
+
+    try:
+        found["version"] = client.get_version()
+    except SourceError as exc:
+        log.warning("could not fetch the OpenCTI version: %s", exc)
+
+    for label, call, name_key, names_key, ids_key in (
+            ("labels", client.get_labels, "value", "labels", "label_ids"),
+            ("marking definitions", client.get_markings, "definition",
+             "markings", "marking_ids"),
+            ("organisations", client.get_organizations, "name", "orgs",
+             "org_ids")):
+        try:
+            rows = call()
+        except SourceError as exc:
+            log.warning("could not fetch %s: %s", label, exc)
+            continue
+        for row in rows:
+            name = row.get(name_key)
+            if not name:
+                continue
+            if name not in found[names_key]:
+                found[names_key].append(name)
+            found[ids_key][name] = row.get("id")
+
+    candidates = []
+    for key in OPENCTI_IOC_CLASS_ORDER:
+        candidates.extend(OPENCTI_IOC_CLASSES[key][1])
+    for main_type in candidates:
+        try:
+            found["counts"][main_type] = client.count_type(main_type)
+        except SourceError as exc:
+            log.warning("count for %s failed: %s", main_type, exc)
+    found["types"] = [t for t in candidates if found["counts"].get(t, (0,))[0]]
     return found
 
 
@@ -2658,14 +2711,25 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None):
     return config
 
 
-def _stage_feeds(config, discovery, input_fn):
+def _stage_feeds(config, discovery, input_fn, source="misp"):
     """Stage 2b: which MISP feeds to pull from.
 
     Runs after discovery so the list is live, and before the IOC types so the
     operator narrows by source first and by type second.
     """
-    feeds = discovery.get("feeds") or []
     config["feeds"] = []
+    if source == "opencti":
+        # OpenCTI has no post-ingest feed trace worth a selectable/blocked
+        # split -- its provenance filtering is author and label, in stage 5.
+        # Skipping silently would look like a bug to an operator who knows
+        # the MISP flow and sees stage 2b vanish.
+        print("")
+        print("-- Stage 2b: feeds")
+        print("  Not applicable to OpenCTI; provenance is filtered by author "
+              "and label in stage 5.")
+        return
+
+    feeds = discovery.get("feeds") or []
     if not feeds:
         return
 
@@ -2709,13 +2773,23 @@ def _stage_feeds(config, discovery, input_fn):
         config["source_fmt"] = "MISP-feed-{feed}"
 
 
-def _stage3_iocs(config, discovery, input_fn):
+def _stage3_iocs(config, discovery, input_fn, source="misp"):
     _stage(3, "What IOCs do you want?")
     counts = discovery.get("counts") or {}
     known = set(discovery.get("types") or ())
 
-    order = [k for k in IOC_CLASS_ORDER if k in IOC_CLASSES]
-    class_options = [(k, IOC_CLASSES[k][0]) for k in order]
+    if source == "opencti":
+        classes = OPENCTI_IOC_CLASSES
+        order = [k for k in OPENCTI_IOC_CLASS_ORDER if k in OPENCTI_IOC_CLASSES]
+        off_by_default = OPENCTI_OFF_BY_DEFAULT
+        table = OPENCTI_TO_ZEEK
+    else:
+        classes = IOC_CLASSES
+        order = [k for k in IOC_CLASS_ORDER if k in IOC_CLASSES]
+        off_by_default = MISP_OFF_BY_DEFAULT
+        table = None  # None -> zeek_type_for's own MISP_TO_ZEEK default
+
+    class_options = [(k, classes[k][0]) for k in order]
     config["ioc_classes"] = ask_multi("IOC classes", class_options,
                                       preselected=order, input_fn=input_fn)
 
@@ -2723,15 +2797,16 @@ def _stage3_iocs(config, discovery, input_fn):
     for key in order:
         if key not in config["ioc_classes"]:
             continue
-        label, types = IOC_CLASSES[key]
-        # An empty `known` means discovery was skipped, not that MISP is empty.
+        label, types = classes[key]
+        # An empty `known` means discovery was skipped, not that the source is empty.
         candidates = [t for t in types if not known or t in known]
         if not candidates:
             print("  no %s attribute types exist on this instance" % key)
             continue
-        options = [(t, _type_annotation(t, counts)) for t in candidates]
+        options = [(t, _type_annotation(t, counts, table, off_by_default))
+                   for t in candidates]
         preselected = [t for t in candidates
-                       if t not in MISP_OFF_BY_DEFAULT
+                       if t not in off_by_default
                        and counts.get(t, (1, True))[0] != 0]
         selected.extend(ask_multi(label, options, preselected, input_fn))
 
@@ -2914,17 +2989,24 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass, source=Non
     _stage1_connection(config, client, input_fn, getpass_fn, source=source)
 
     _stage(2, "Discovery")
-    discovery = discover(client)
-    if client is None:
-        print("  skipped -- no MISP connection, offering the full type list")
+    if config["source"] == "opencti":
+        discovery = discover_opencti(client)
+        if client is not None:
+            print("  %d labels, %d markings, %d organisations"
+                  % (len(discovery["labels"]), len(discovery["markings"]),
+                     len(discovery["orgs"])))
     else:
-        print("  %d attribute types, %d tags, %d orgs, %d sharing groups"
-              % (len(discovery["types"]), len(discovery["tags"]),
-                 len(discovery["orgs"]), len(discovery["sharing_groups"])))
+        discovery = discover(client)
+        if client is None:
+            print("  skipped -- no MISP connection, offering the full type list")
+        else:
+            print("  %d attribute types, %d tags, %d orgs, %d sharing groups"
+                  % (len(discovery["types"]), len(discovery["tags"]),
+                     len(discovery["orgs"]), len(discovery["sharing_groups"])))
     config["discovery"] = discovery
 
-    _stage_feeds(config, discovery, input_fn)
-    _stage3_iocs(config, discovery, input_fn)
+    _stage_feeds(config, discovery, input_fn, source=config["source"])
+    _stage3_iocs(config, discovery, input_fn, source=config["source"])
     _stage4_quality(config, input_fn)
     _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)

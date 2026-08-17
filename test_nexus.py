@@ -2301,6 +2301,88 @@ class TestOpenctiStage1(Quiet):
 
 
 # ---------------------------------------------------------------------------
+# STAGES 2, 2b, 3 -- OpenCTI discovery, feeds and IOC types
+# ---------------------------------------------------------------------------
+
+class StubOpenctiClient(object):
+    """A no-network OpenCTI client for interview tests."""
+
+    def __init__(self):
+        self.host = "cti.local"
+        self.scheme = "https"
+        self.port = 443
+        self.token = "tok"
+        self.verify_tls = True
+        self.timeout = 30
+        self.retries = 3
+
+    def get_version(self):
+        return {"version": "6.4.1"}
+
+    def get_labels(self):
+        return [{"id": "l1", "value": "phishing"},
+                {"id": "l2", "value": "apt"}]
+
+    def get_markings(self):
+        return [{"id": "m1", "definition": "TLP:AMBER",
+                 "definition_type": "TLP"}]
+
+    def get_organizations(self):
+        return [{"id": "o1", "name": "CIRCL"}]
+
+    def count_type(self, main_type, base_filters=None, probe_limit=None):
+        return ({"IPv4-Addr": 100, "Domain-Name": 50}.get(main_type, 0), True)
+
+
+class TestOpenctiInterviewStages(Quiet):
+
+    def test_discovery_returns_names_and_id_maps(self):
+        found = nexus.discover_opencti(StubOpenctiClient())
+        self.assertEqual(found["labels"], ["phishing", "apt"])
+        self.assertEqual(found["label_ids"]["phishing"], "l1")
+        self.assertEqual(found["markings"], ["TLP:AMBER"])
+        self.assertEqual(found["marking_ids"]["TLP:AMBER"], "m1")
+        self.assertEqual(found["orgs"], ["CIRCL"])
+        self.assertEqual(found["org_ids"]["CIRCL"], "o1")
+        self.assertEqual(found["counts"]["IPv4-Addr"], (100, True))
+
+    def test_discovery_with_no_client_is_empty_not_a_crash(self):
+        found = nexus.discover_opencti(None)
+        self.assertEqual(found["labels"], [])
+        self.assertEqual(found["counts"], {})
+
+    def test_feed_stage_prints_a_skip_line_for_opencti(self):
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            nexus._stage_feeds(config, {}, scripted([]), source="opencti")
+        self.assertIn("Not applicable to OpenCTI", out.getvalue())
+        self.assertEqual(config["feeds"], [])
+
+    def test_ioc_stage_offers_opencti_classes(self):
+        discovery = {"counts": {"IPv4-Addr": (100, True)},
+                     "types": ["IPv4-Addr", "Domain-Name"]}
+        # "1" -> network class only, "all" -> every discovered network type;
+        # everything after that (composite/hostname/subnet) is MISP-shaped
+        # boilerplate this test does not care about, so fill="" takes the
+        # default for the rest of the (unbranched) tail of the stage.
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertIn("IPv4-Addr", out.getvalue())
+        self.assertTrue(set(config["types"]) <= {
+            "IPv4-Addr", "IPv6-Addr", "Domain-Name", "Hostname", "Url"})
+
+    def test_ioc_stage_still_offers_misp_classes_by_default(self):
+        discovery = {"counts": {}, "types": []}
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake)
+        self.assertIn("ip-dst", config["types"])
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
 
