@@ -263,6 +263,13 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 ### Flagged as unverified, OpenCTI
 
+> **Status: live validation deferred.** As of 2026-08-21 the operator has no OpenCTI
+> instance available to test against, and has deliberately postponed this. The OpenCTI
+> code path is complete, unit-tested (449 tests, all sources) and reviewed, but **no part
+> of it has ever exchanged a packet with a real OpenCTI server.** Treat it as untested in
+> production until the checklist below has been run. This is a known, accepted gap — not
+> an oversight to re-flag.
+
 Nothing in this project has ever run against a real OpenCTI instance. None of these six block what has already shipped, and each is a contained fix — a few lines in one function, not a redesign.
 
 1. **`x_opencti_detection` as a filter key.** The field exists on Indicator; whether it is filterable is the open question. If not, the detection requirement moves to a client-side filter in the fetch loop.
@@ -271,6 +278,33 @@ Nothing in this project has ever run against a real OpenCTI instance. None of th
 4. **`globalCount` under the operator's auth level.** `count_type` falls back to a bounded, still-exact count when `globalCount` is absent (see §3), but the interview's count annotations get less useful without it.
 5. **Rate limiting on a large paginated pull.** The existing retry/backoff handles 429, but OpenCTI's actual ceiling and page-size sweet spot are unknown. Default page size is 100 (smaller than MISP's) and is tunable via `page_size`.
 6. **OpenCTI version and reachability from the manager.** Same pre-flight class as the outstanding `--check-env` run against the real Security Onion box — nobody has pointed this code at a live OpenCTI yet.
+
+#### First-contact checklist — run this when an OpenCTI instance becomes available
+
+Do these in order. Each step is designed to fail cheaply and locally, before anything
+writes an `intel.dat`. Nothing here needs a Security Onion box.
+
+1. `python3 nexus.py --probe --source opencti --host <HOST>` — proves reachability, auth,
+   the `Authorization: Bearer` header, and `get_version()`. A wrong token returns HTTP
+   200 with the error in the body, so confirm it reports an auth failure rather than
+   succeeding emptily. Deliberately try a bad token once to check that.
+2. Confirm the probe's per-type counts are non-zero and plausible. Zero everywhere with a
+   successful connection points at item 1 above (`x_opencti_detection` not filterable) or
+   item 3 (label ids versus values).
+3. Check whether the counts are reported as exact. If `globalCount` is unavailable at the
+   operator's auth level (item 4), the annotations degrade but the fetch still works.
+4. Run a full interview and let it complete to a `--dry-run` build. Watch stage 2's
+   discovery lists — empty label, marking or organization lists mean discovery is not
+   returning what the filter builder expects (items 2 and 3).
+5. Inspect the dry-run's unmapped/skipped counters in the run report. A large
+   `pattern unparseable` count means real-world patterns differ from the STIX shapes
+   `parse_stix_pattern` handles; capture a few offending patterns verbatim before changing
+   anything.
+6. Only then do a real build, against a scratch output path first (`--offline` once that
+   ships, or an explicit output path), and diff it by hand before it goes near a manager.
+
+Record what each step actually returned. Several items above become moot the moment real
+responses are observed, and the list should shrink rather than be carried forward intact.
 
 ### Explicitly out of scope (`PLAN.md` §14)
 
