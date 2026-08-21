@@ -17,13 +17,13 @@ Not a library. Not a package. **One script**, standard library only, so it drops
 ### Files
 
 ```
-nexus.py        4325 lines   the tool
+nexus.py        4328 lines   the tool
 test_nexus.py   4094 lines   449 tests, no MISP, OpenCTI or SO required
-PLAN.md          532 lines   full design doc, section numbers referenced below
-HANDOFF.md        285 lines   this file
+PLAN.md          553 lines   full design doc, section numbers referenced below
+HANDOFF.md       287 lines   this file
 ```
 
-Not a git repository. There is no CI. `python3 -m unittest test_nexus` is the only gate.
+A git repository, currently on branch `opencti-source`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
 
 ---
 
@@ -120,36 +120,36 @@ Counts come from `pageInfo.globalCount`, which — unlike MISP's bounded probe �
 One file, banner-delimited sections in dependency order:
 
 ```
-CONSTANTS   32  SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
-LOGGING    280  RedactingFilter + RedactingFormatter (token scrubbing)
-CLIENT     370  _HttpTransport (shared base), MispClient, OpenctiClient,
+CONSTANTS   35  SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
+LOGGING    283  RedactingFilter + RedactingFormatter (token scrubbing)
+CLIENT     373  _HttpTransport (shared base), MispClient, OpenctiClient,
                 NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
                 MispAuthError are aliases), flatten_attribute, flatten_indicator,
                 parse_stix_pattern
-FEEDS     1183  feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
+FEEDS     1186  feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
                 no feed concept)
-MAPPING   1243  map_attribute — source type -> Zeek type, composite splitting;
+MAPPING   1246  map_attribute — source type -> Zeek type, composite splitting;
                 table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
-NORMALISE 1303  norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
-FILTERS   1551  ExclusionSet — private IPs, own networks/domains, allowlist
-INTEL     1629  build/render/lint/read/merge_additive/backup/write_atomic
-CHECKENV  2018  check_env + notice_policy_loaded — stage 0
-GUARDRAILS 2132 check_size/not_empty/delta/load_file/broad, run_guardrails
-INTERVIEW 2303  ask* primitives, discover (MISP) / discover_opencti,
+NORMALISE 1306  norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
+FILTERS   1554  ExclusionSet — private IPs, own networks/domains, allowlist
+INTEL     1632  build/render/lint/read/merge_additive/backup/write_atomic
+CHECKENV  2021  check_env + notice_policy_loaded — stage 0
+GUARDRAILS 2135 check_size/not_empty/delta/load_file/broad, run_guardrails
+INTERVIEW 2306  ask* primitives, discover (MISP) / discover_opencti,
                 build_search_params (MISP) / build_opencti_filters (OpenCTI),
                 _stage1_connection, _stage_feeds, _stage3_iocs shared across
                 sources; _stage4_quality/_stage5_scope have an `_opencti`
                 sibling each and run_interview picks the pair by source;
                 run_interview ties the stages together
-PROFILES 3386   save_profile, load_profile (JSON, 0600, profile v2 with a v1
+PROFILES 3389   save_profile, load_profile (JSON, 0600, profile v2 with a v1
                 reader that migrates the old MISP-only keys forward in memory)
-DIFF     3461   indicator_delta, summarise_delta, unified_intel_diff
-APPLY    3505   seed_load_file, salt_apply, log_errors_since, apply_to_grid
-MAIN     3649   argparse, cmd_* dispatch (client factory picks Misp/OpenctiClient
+DIFF     3464   indicator_delta, summarise_delta, unified_intel_diff
+APPLY    3508   seed_load_file, salt_apply, log_errors_since, apply_to_grid
+MAIN     3652   argparse, cmd_* dispatch (client factory picks Misp/OpenctiClient
                 from config["source"]), cmd_build orchestration
 ```
 
-The `CLIENT` section banner in the file still reads `# MISP CLIENT` — it was not renamed when `OpenctiClient` was added alongside `MispClient`. Read past the banner text; the section holds both clients and both flatteners.
+The `CLIENT` section holds both clients and both flatteners; its banner was renamed from `# MISP CLIENT` when `OpenctiClient` landed.
 
 ### Rules the code holds to — preserve these
 
@@ -236,7 +236,7 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 - **Certificate hashes need their own `X509-` mapping keys.** `OPENCTI_TO_ZEEK["X509-SHA-1"]` is a separate key from `["SHA-1"]` — without the prefix a certificate SHA-1 would land in `Intel::FILE_HASH` instead of `Intel::CERT_HASH`.
 - **Non-STIX pattern types are never mined for values.** `parse_stix_pattern` only runs for `pattern_type == "stix"`; a YARA or Sigma rule's string literals are not treated as indicators.
 - **The interview's hostname question is type-name-sensitive per source.** It drops the literal `"Hostname"` on OpenCTI but `"hostname"` on MISP — the two platforms spell the type differently. Before this was fixed, an OpenCTI operator answering "no" to "treat hostnames as domains" still got hostname indicators, silently, because the MISP-only literal never matched.
-- **`meta.url` is source-aware.** OpenCTI indicators link to `{base}/dashboard/observations/indicators/{id}`; the MISP event URL shape (`{base}/events/view/{id}`) is unchanged. `render_meta` branches on the record's source rather than assuming one URL template.
+- **`meta.url` is source-aware.** OpenCTI indicators link to `{base}/dashboard/observations/indicators/{id}`; the MISP event URL shape (`{base}/events/view/{id}`) is unchanged. `render_meta` branches on the record's source rather than assuming one URL template — though the stage 7 *question wording* ("Link meta.url back to the MISP event?") and the `meta.source` presets (`SOURCE_FORMATS`, defaulting to `MISP-event-{event_id}`) are still MISP-labelled on an OpenCTI run, a known cosmetic gap recorded at `PLAN.md` §4 item 31.
 
 ---
 
@@ -263,7 +263,7 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 ### Flagged as unverified, OpenCTI
 
-Nothing in this project has ever run against a real OpenCTI instance. None of these six block what has already shipped; each could change at most one line.
+Nothing in this project has ever run against a real OpenCTI instance. None of these six block what has already shipped, and each is a contained fix — a few lines in one function, not a redesign.
 
 1. **`x_opencti_detection` as a filter key.** The field exists on Indicator; whether it is filterable is the open question. If not, the detection requirement moves to a client-side filter in the fetch loop.
 2. **`objectLabel` / `objectMarking` return shape.** The flattener assumes bare lists, which is 6.x behaviour. 5.x returned `edges { node { ... } }`; if some 6.x point release differs, the flattener needs the edges walk added back.

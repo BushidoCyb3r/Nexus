@@ -115,8 +115,7 @@ Internally organised into banner-delimited sections, in dependency order so the 
 # ── LOGGING ────────────────────────────────────────────────
 #   setup_logging(), a redacting Filter that scrubs the API token
 
-# ── MISP CLIENT ────────────────────────────────────────────
-#   (banner name unchanged; this section now holds both clients)
+# ── CLIENT ─────────────────────────────────────────────────
 #   class _HttpTransport:  shared urllib/TLS/retry base
 #   class MispClient(_HttpTransport):  get_version, describe_types,
 #                      get_tags, get_orgs, get_sharing_groups,
@@ -125,11 +124,17 @@ Internally organised into banner-delimited sections, in dependency order so the 
 #                      get_version, get_labels, get_markings,
 #                      get_organizations, count_type, search_indicators
 #                      (cursor-paginated generator)
-#   flatten_attribute(attr) / flatten_indicator(node) — both produce the
-#   same internal record shape (below), so everything downstream of this
-#   seam is source-agnostic
+#   flatten_attribute(attr) → one record; flatten_indicator(node,
+#   stats=None) → a *list*, one record per extracted observable value
+#   (an indicator carrying both an MD5 and a SHA-256 yields two rows).
+#   Both emit the same record shape (below), so everything downstream
+#   of this seam is source-agnostic
 #   parse_stix_pattern(pattern) — fallback for OpenCTI indicators with no
 #   linked observables; only for pattern_type == "stix"
+
+# ── FEEDS ──────────────────────────────────────────────────
+#   feed_provenance(), feed_is_selectable(), apply_feed_to_params()
+#   (MISP only — OpenCTI has no feed concept)
 
 # ── MAPPING ────────────────────────────────────────────────
 #   map_attribute(record, table=MISP_TO_ZEEK or OPENCTI_TO_ZEEK)
@@ -146,12 +151,17 @@ Internally organised into banner-delimited sections, in dependency order so the 
 #   ExclusionSet: RFC1918, own CIDRs, own domain suffixes, allowlist file
 
 # ── INTEL FILE ─────────────────────────────────────────────
-#   render_lines(), dedupe(), lint_lines(), read_existing(),
-#   merge_additive(), write_atomic(), backup()
+#   header_line(), render_meta(), render_line(), build_indicators()
+#   (dedup by (indicator, Intel::Type) happens inline here — there is no
+#   separate dedupe function), rows_to_lines(), lint_lines(), lint_file(),
+#   read_existing(), merge_additive(), backup_file(), write_atomic()
 
-# ── PROFILES ───────────────────────────────────────────────
-#   load_profile(), save_profile()   (JSON, v2 schema with a v1 reader
-#   that migrates old MISP-only key names forward in memory)
+# ── ENVIRONMENT CHECK ──────────────────────────────────────
+#   detect_so_version(), notice_policy_loaded(), check_env()  — stage 0
+
+# ── GUARDRAILS ─────────────────────────────────────────────
+#   check_size(), check_not_empty(), check_delta(), check_load_file(),
+#   check_broad_indicators(), run_guardrails()   (§8)
 
 # ── INTERVIEW ──────────────────────────────────────────────
 #   ask(), ask_yes_no(), ask_int(), ask_choice(), ask_multi(),
@@ -160,8 +170,16 @@ Internally organised into banner-delimited sections, in dependency order so the 
 #   then run_interview() -> Config, one stage per §4 heading,
 #   stages 2/2b/3/4/5 branching by source
 
+# ── PROFILES ───────────────────────────────────────────────
+#   load_profile(), save_profile()   (JSON, v2 schema with a v1 reader
+#   that migrates old MISP-only key names forward in memory)
+
+# ── DIFF ───────────────────────────────────────────────────
+#   indicator_delta(), summarise_delta(), unified_intel_diff()
+
 # ── APPLY ──────────────────────────────────────────────────
-#   ensure_load_file(), salt_apply(), check_reporter_log()
+#   seed_load_file(), salt_apply(), log_offset(), log_errors_since(),
+#   verify_runtime(), apply_to_grid()
 
 # ── MAIN ───────────────────────────────────────────────────
 #   argparse (--source/--host/--misp), client factory picking
@@ -175,7 +193,7 @@ Internally organised into banner-delimited sections, in dependency order so the 
 - Only `write_atomic()` may write to the live intel path.
 - `_HttpTransport` is the only thing that speaks HTTP; `MispClient` and `OpenctiClient` both subclass it and are the only things that call it.
 
-Internal record shape after fetch — produced by both `flatten_attribute` (MISP) and `flatten_indicator` (OpenCTI), so mapping, normalisation and everything after it runs unchanged regardless of source:
+Internal record shape after fetch — produced by both `flatten_attribute(attr)` (MISP, one record per attribute) and `flatten_indicator(node, stats=None)` (OpenCTI, a *list* of records — one per observable value extracted from the indicator, so a file indicator carrying an MD5 and a SHA-256 fans out to two). The shape is identical either way, so mapping, normalisation and everything after it runs unchanged regardless of source:
 
 ```python
 {
@@ -200,7 +218,7 @@ Stages 0, 6, 7 and 8 below call the same code regardless of source. Stages 1, 2,
 
 Detects SO version, verifies `/opt/so/saltstack/local/salt/zeek/policy/intel/` exists, and checks for `__load__.Zeek`. If the directory is empty or the load file is missing, offers to seed it from `/opt/so/saltstack/default/salt/zeek/policy/intel/` before going any further.
 
-### Stage 1 — Platform and connection
+### Stage 1 — Connection
 
 0. Threat intel platform `[misp / opencti]` — asked whenever `--source` was not already supplied on the command line; a caller that already knows skips the question.
 1. Platform address (IP or hostname) — prompt text is `MISP address` or `OpenCTI address` depending on the answer above.
@@ -239,7 +257,7 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
    [ ] filename         2,441   → Intel::FILE_NAME   (noisy)
    ```
 9. Composite types (`domain|ip`, `ip-src|port`, `filename|md5`) — emit both halves or one? `[both]`
-10. Treat `hostname` as `Intel::DOMAIN`? `[yes]` — MISP asks about the type literal `"hostname"`; the OpenCTI variant of the same question asks about `"Hostname"`, since the two platforms spell the type differently and a shared literal would silently do nothing on one of them.
+10. Treat `hostname` as `Intel::DOMAIN`? `[yes]` — the prompt text is identical on both sources; what branches is the type literal used to act on a `no`. MISP drops types starting `"hostname"`, OpenCTI drops `"Hostname"`, since the two platforms spell the type differently and a shared literal would silently do nothing on one of them.
 11. Emit `Intel::SUBNET` for CIDR values in IP attributes? `[yes]`
 
 **OpenCTI variant of stage 3.** Driven by `OPENCTI_IOC_CLASSES` instead of MISP's attribute-type table, annotated with live counts the same way, with `OPENCTI_OFF_BY_DEFAULT` (`User-Account`, `Software`) left unselected. The composite-type question (item 9) is skipped — no `OPENCTI_TO_ZEEK` entry has more than one target Zeek type, so it would be pure noise. The result populates the `x_opencti_main_observable_type` filter.
@@ -398,7 +416,7 @@ Per Intel type, before an indicator enters the file:
 6. Exactly one `\n` after the last record, no trailing blank line.
 7. Confirm `__load__.Zeek` is still present alongside it.
 
-**Merge mode**: existing lines whose `meta.source` does *not* match the Nexus source prefix are preserved verbatim at the top, so hand-maintained entries survive regeneration.
+**Merge mode**: append-only. `cmd_build` calls `merge_additive()`, which keeps *every* existing line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
 
 **Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count.
 
@@ -521,8 +539,8 @@ Phases 1–2 are independently useful and fully testable without a Security Onio
 
 1. Exact 3.2.x point release on the target manager, and whether the local intel dir is currently populated (does `__load__.Zeek` exist there today?).
 2. Does that grid already have an intel feed or anything else managing that file? Merge mode depends on the answer.
-4. Expected indicator volume from your MISP — drives the cap, and whether aging moves up from §14.
-5. Unattended on a schedule from day one, or interactive-only until it's trusted?
+3. Expected indicator volume from your MISP — drives the cap, and whether aging moves up from §14.
+4. Unattended on a schedule from day one, or interactive-only until it's trusted?
 
 ---
 

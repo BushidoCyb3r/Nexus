@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
 
-Phases 0-3 and 5: environment check, source client (MISP or OpenCTI), the
-mapping/normalise/write core, the interactive interview, and the safety
-guardrails. One source per run, selected in the interview or via --source.
+Phases 0-6 and 8: environment check, source client (MISP or OpenCTI), the
+mapping/normalise/write core, the interactive interview, profiles and the
+unattended modes, the safety guardrails, apply-to-grid, and OpenCTI as a
+second source.  Phase 7 (systemd timer, install docs) is outstanding.
+One source per run, selected in the interview or via --source.
 
 Standard library only.  Python 3.6+.
 """
@@ -368,7 +370,7 @@ def setup_logging(verbose=False, logfile=None, required=True):
 
 
 # ---------------------------------------------------------------------------
-# MISP CLIENT
+# CLIENT
 # ---------------------------------------------------------------------------
 
 def _is_loopback(host):
