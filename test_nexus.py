@@ -381,7 +381,7 @@ class TestBuild(unittest.TestCase):
     def test_report_is_printable(self):
         _, stats = self.build()
         report = stats.report()
-        self.assertIn("fetched 7 attributes -> 4 indicators", report)
+        self.assertIn("fetched 7 records -> 4 indicators", report)
         self.assertIn("private_ip", report)
 
     def test_type_selection_filters_input(self):
@@ -965,6 +965,16 @@ class TestOpenctiClient(unittest.TestCase):
     def test_auth_message_in_a_200_body_raises_auth_error(self):
         self.cti = FakeOpencti(script=[
             (200, {"errors": [{"message": "You must be logged in to do this."}],
+                   "data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_not_authenticated_phrasing_raises_auth_error(self):
+        # The common OpenCTI wording; "authentication"/"authenticate" alone
+        # missed it and the operator got a generic error instead of "rotate
+        # your token".
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "User is not authenticated"}],
                    "data": None})])
         client = self.cti.client()
         self.assertRaises(nexus.SourceAuthError, client.get_version)

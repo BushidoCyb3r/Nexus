@@ -304,7 +304,7 @@ OPENCTI_DEFAULT_PORT_HTTP = 4000
 OPENCTI_AUTH_ERROR_CODES = frozenset(
     ("AUTH_REQUIRED", "FORBIDDEN_ACCESS", "AUTH_FAILURE", "UNAUTHORIZED"))
 _OPENCTI_AUTH_PATTERN = re.compile(
-    r"\bunauthori[sz]ed\b|\bforbidden\b|\bauthentication\b|\bauthenticate\b"
+    r"\bunauthori[sz]ed\b|\bforbidden\b|\bauthenticat\w*\b"
     r"|\bmust be logged in\b|\blogged in\b|invalid token|expired token"
     r"|missing token", re.IGNORECASE)
 
@@ -890,12 +890,7 @@ class OpenctiClient(_HttpTransport):
             description
             pattern
             pattern_type
-            x_opencti_score
-            confidence
-            revoked
             x_opencti_detection
-            valid_from
-            valid_until
             created_at
             updated_at
             createdBy { ... on Identity { name } }
@@ -1792,7 +1787,7 @@ class BuildStats(object):
         self.emitted += 1
 
     def report(self):
-        lines = ["fetched %d attributes -> %d indicators"
+        lines = ["fetched %d records -> %d indicators"
                  % (self.fetched, self.emitted)]
         for label, bucket in (("by type", self.by_type),
                               ("rejected", self.rejected),
@@ -2660,12 +2655,12 @@ def discover(client, probe_limit=5000):
             ("feeds", "feeds", client.get_feeds)):
         try:
             found[key] = call()
-        except MispError as exc:
+        except SourceError as exc:
             log.warning("could not fetch %s: %s", label, exc)
 
     try:
         found["types"] = client.describe_types().get("types") or []
-    except MispError as exc:
+    except SourceError as exc:
         log.warning("could not fetch attribute types: %s", exc)
 
     known = set(found["types"])
@@ -2675,7 +2670,7 @@ def discover(client, probe_limit=5000):
         try:
             found["counts"][misp_type] = client.count_type(
                 misp_type, probe_limit=probe_limit)
-        except MispError as exc:
+        except SourceError as exc:
             log.warning("count for %s failed: %s", misp_type, exc)
 
     found["tags"] = [t.get("name") for t in found["tags"] if t.get("name")]
@@ -3544,7 +3539,6 @@ def migrate_profile_config(config, version):
         for old, new in PROFILE_V1_KEY_MAP.items():
             if old in migrated:
                 migrated.setdefault(new, migrated.pop(old))
-            migrated.pop(old, None)
         migrated.setdefault("source", "misp")
         log.info("migrated a profile-version-1 profile forward to version %d",
                  PROFILE_VERSION)
