@@ -2376,6 +2376,17 @@ SOURCE_FORMATS = (
     ("fixed string", "type your own"),
 )
 
+# meta.source ends up in intel.dat, so it has to name the platform the row
+# actually came from -- an analyst chasing an intel.log hit reads it as a
+# lookup key, and "MISP-event-indicator--9f2c" sends them to a MISP that has
+# no such event.
+OPENCTI_SOURCE_FORMATS = (
+    ("OpenCTI-{event_id}", "OpenCTI-indicator--9f2c"),
+    ("OpenCTI-{org}", "OpenCTI-CIRCL"),
+    ("OpenCTI", "OpenCTI"),
+    ("fixed string", "type your own"),
+)
+
 DEFAULT_DESC_TEMPLATE = "{event_info} | {category}"
 DEFAULT_DAYS = 90
 DEFAULT_MAX_INDICATORS = None
@@ -3059,17 +3070,22 @@ def _stage6_exclusions(config, input_fn):
 
 def _stage7_metadata(config, input_fn):
     _stage(7, "Metadata")
-    choice = ask_choice("meta.source format", list(SOURCE_FORMATS),
-                        "MISP-event-{event_id}", input_fn)
+    opencti = config.get("source") == "opencti"
+    formats = OPENCTI_SOURCE_FORMATS if opencti else SOURCE_FORMATS
+    platform = "OpenCTI" if opencti else "MISP"
+    choice = ask_choice("meta.source format", list(formats),
+                        formats[0][0], input_fn)
     if choice == "fixed string":
-        choice = ask_required("Fixed meta.source value", "MISP", input_fn)
+        choice = ask_required("Fixed meta.source value", platform, input_fn)
     config["source_fmt"] = choice
 
     config["desc_template"] = ask(
         "meta.desc template ({event_info} {category} {tags} {comment} "
         "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
 
-    if ask_yes_no("Link meta.url back to the MISP event?", True, input_fn):
+    link_target = "OpenCTI indicator" if opencti else "MISP event"
+    if ask_yes_no("Link meta.url back to the %s?" % link_target, True,
+                  input_fn):
         netloc = config.get("source_host") or ""
         port = config.get("port")
         if port and port not in (80, 443):

@@ -2480,6 +2480,71 @@ class TestOpenctiQualityAndScope(Quiet):
 
 
 # ---------------------------------------------------------------------------
+# STAGE 7 -- meta.source is source-aware
+# ---------------------------------------------------------------------------
+
+class TestStage7SourceFormats(Quiet):
+
+    def stage7(self, source, input_fn=None):
+        config = {"source": source, "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        fake = input_fn or scripted([], fill="")
+        nexus._stage7_metadata(config, fake)
+        return config, fake
+
+    def test_opencti_default_is_not_a_misp_event(self):
+        # meta.url points at OpenCTI, so a MISP-flavoured meta.source sends an
+        # analyst chasing an intel.log hit into a MISP with no such event.
+        config, _ = self.stage7("opencti")
+        self.assertEqual(config["source_fmt"], "OpenCTI-{event_id}")
+
+    def test_opencti_prompts_never_say_misp(self):
+        fake = scripted([], fill="")
+        self.stage7("opencti", fake)
+        joined = " ".join(fake.state["prompts"]) + self.printed
+        self.assertNotIn("MISP", joined)
+
+    def test_opencti_fixed_string_default_is_opencti(self):
+        config, _ = self.stage7(
+            "opencti", by_prompt([("meta.source format", "4")], fill=""))
+        self.assertEqual(config["source_fmt"], "OpenCTI")
+
+    def test_misp_stage7_is_byte_identical(self):
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        fake = scripted([], fill="")
+        nexus._stage7_metadata(config, fake)
+        self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
+        self.assertEqual(
+            fake.state["prompts"],
+            ["  meta.source format -- choose 1-4 [1]: ",
+             "meta.desc template ({event_info} {category} {tags} {comment} "
+             "{type} {org} {uuid}) [{event_info} | {category}]: ",
+             "Link meta.url back to the MISP event? [Y/n]: ",
+             "Emit the meta.do_notice column? [y/N]: ",
+             "Max metadata field length [200]: "])
+        self.assertEqual(
+            self.printed,
+            "\n-- Stage 7: Metadata\n"
+            "meta.source format\n"
+            "    1) MISP-event-{event_id}          MISP-event-42\n"
+            "    2) MISP-{org}                     MISP-CIRCL\n"
+            "    3) MISP                           MISP\n"
+            "    4) fixed string                   type your own\n")
+
+    def test_a_shipped_opencti_row_names_opencti(self):
+        record = {"type": "Domain-Name", "value": "evil.com", "to_ids": True,
+                  "uuid": "u", "event_info": "i", "event_id": "indicator--9f2c",
+                  "event_tags": [], "org": "CIRCL", "comment": "",
+                  "category": "", "timestamp": ""}
+        config, _ = self.stage7("opencti")
+        rows, _ = nexus.build_indicators(
+            [record], mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti",
+            source_fmt=config["source_fmt"])
+        self.assertEqual(rows[0][2], "OpenCTI-indicator--9f2c")
+
+
+# ---------------------------------------------------------------------------
 # STAGE 2 -- the interview connects for itself
 # ---------------------------------------------------------------------------
 
