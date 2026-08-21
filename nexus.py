@@ -13,6 +13,7 @@ Standard library only.  Python 3.6+.
 import argparse
 import difflib
 import getpass
+import http.client
 import ipaddress
 import json
 import logging
@@ -546,6 +547,12 @@ class _HttpTransport(object):
                 except Exception:  # pragma: no cover - best effort only
                     pass
                 raise SourceError("HTTP %d from %s %s" % (exc.code, url, detail))
+            except (UnicodeError, http.client.InvalidURL) as exc:
+                # urllib rejects a malformed host before it opens a socket,
+                # and neither of these is an OSError.  Retrying cannot help:
+                # the URL will be just as unbuildable next time.
+                raise SourceError("cannot build a request for %s: %s"
+                                  % (url, exc))
             except (urllib.error.URLError, ssl.SSLError, OSError) as exc:
                 if attempt < self.retries:
                     last_exc = exc
@@ -2744,9 +2751,11 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
     label = SOURCE_LABELS.get(source, source)
 
     # --host seeds the default; it does not skip the question.
+    # .strip(): a --host default is returned verbatim, and urllib chokes on
+    # "cti.local " long before it opens a socket.
     config["source_host"] = ask_required(
         "%s address (IP or hostname)" % label,
-        host or (client.host if client is not None else None), input_fn)
+        host or (client.host if client is not None else None), input_fn).strip()
     config["scheme"] = ask_choice(
         "Scheme", ["https", "http"],
         client.scheme if client is not None else "https", input_fn)

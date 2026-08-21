@@ -2623,6 +2623,40 @@ class TestInterviewConnectsForDiscovery(Quiet):
         self.assertNotIn("not filtered", label_line)
 
 
+class TestMalformedHostDoesNotCrashTheRun(Quiet):
+    """urllib rejects some hostnames before it opens a socket, and it raises
+    UnicodeError / http.client.InvalidURL to do it.  Neither is an OSError, so
+    both used to sail past `except SourceError` and kill the interview."""
+
+    def client(self, host):
+        return nexus.OpenctiClient(host=host, token="tok", retries=1, timeout=1)
+
+    def test_an_empty_dns_label_is_a_source_error(self):
+        with self.assertRaises(nexus.SourceError):
+            self.client("cti..local").get_version()
+
+    def test_a_space_in_the_host_is_a_source_error(self):
+        with self.assertRaises(nexus.SourceError):
+            self.client("cti local").get_version()
+
+    def test_the_interview_degrades_to_offline_instead_of_crashing(self):
+        config = nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti..local")], fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti",
+            connect=nexus.make_client)
+        self.assertEqual(config["source_host"], "cti..local")
+        self.assertIn("could not connect", self.printed)
+
+    def test_a_host_default_is_stripped_before_it_reaches_urllib(self):
+        config = {}
+        nexus._stage1_connection(config, None, scripted([], fill=""),
+                                 lambda *a, **k: "tok", source="opencti",
+                                 host="cti.local ")
+        self.assertEqual(config["source_host"], "cti.local")
+
+
+
 # ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
