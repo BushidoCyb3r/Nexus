@@ -2655,6 +2655,24 @@ class TestMalformedHostDoesNotCrashTheRun(Quiet):
                                  host="cti.local ")
         self.assertEqual(config["source_host"], "cti.local")
 
+    def test_the_connect_failure_message_is_redacted(self):
+        token = "supersecret-token-1234"
+
+        def connect(config):
+            # Building the client is what registers the token with REDACTOR,
+            # exactly as make_client does; the failure comes after.
+            nexus.OpenctiClient(host=config["source_host"],
+                                token=config["token"], retries=1, timeout=1)
+            raise nexus.SourceError(
+                "HTTP 500 from https://cti.local/graphql %s" % config["token"])
+
+        nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti.local")], fill=""),
+            getpass_fn=lambda prompt: token, source="opencti", connect=connect)
+        self.assertIn("could not connect", self.printed)
+        self.assertNotIn(token, self.printed)
+
 
 
 # ---------------------------------------------------------------------------

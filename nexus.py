@@ -3173,7 +3173,7 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
             candidate.get_version()
             client = candidate
         except SourceError as exc:
-            print("  could not connect: %s" % exc)
+            print("  could not connect: %s" % REDACTOR.scrub(str(exc)))
             print("  continuing offline -- name-based filters cannot be "
                   "resolved and will not be applied")
     if config["source"] == "opencti":
