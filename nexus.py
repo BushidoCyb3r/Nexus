@@ -2724,7 +2724,8 @@ def discover_opencti(client, probe_limit=None):
 
 # -- stages -----------------------------------------------------------------
 
-def _stage1_connection(config, client, input_fn, getpass_fn, source=None):
+def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
+                       host=None):
     """Stage 1.  Collects connection answers only -- main() builds the client."""
     _stage(1, "Connection")
 
@@ -2736,9 +2737,10 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None):
     config["source"] = source
     label = SOURCE_LABELS.get(source, source)
 
+    # --host seeds the default; it does not skip the question.
     config["source_host"] = ask_required(
         "%s address (IP or hostname)" % label,
-        client.host if client is not None else None, input_fn)
+        host or (client.host if client is not None else None), input_fn)
     config["scheme"] = ask_choice(
         "Scheme", ["https", "http"],
         client.scheme if client is not None else "https", input_fn)
@@ -3124,16 +3126,36 @@ def _stage8_output(config, input_fn):
     return config
 
 
-def run_interview(client, input_fn=input, getpass_fn=getpass.getpass, source=None):
+def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
+                  source=None, host=None, connect=None):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
     (and testable) with no MISP in reach.
+
+    `connect` closes the chicken-and-egg: stage 1 is what collects the
+    credentials, but stages 3 and 5 need a live client for their type, tag and
+    label lists -- and OpenCTI's scope filters are entity ids, which only a
+    connection can resolve a typed name to.  Callers that want a live
+    interview pass make_client here; callers that must stay offline pass
+    nothing.
     """
     config = {}
-    _stage1_connection(config, client, input_fn, getpass_fn, source=source)
+    _stage1_connection(config, client, input_fn, getpass_fn, source=source,
+                       host=host)
 
     _stage(2, "Discovery")
+    if client is None and connect is not None:
+        try:
+            candidate = connect(config)
+            # Fail fast on one call: discovery is dozens of requests, and on
+            # an unreachable host every one of them would retry and time out.
+            candidate.get_version()
+            client = candidate
+        except SourceError as exc:
+            print("  could not connect: %s" % exc)
+            print("  continuing offline -- name-based filters cannot be "
+                  "resolved and will not be applied")
     if config["source"] == "opencti":
         discovery = discover_opencti(client)
         if client is not None:
@@ -3400,18 +3422,31 @@ def summarise_config(config):
     lines.append("  window      : %s" % window)
 
     if source == "opencti":
-        scope_fields = (("include labels", "include_labels"),
-                        ("exclude labels", "exclude_labels"),
-                        ("markings", "markings"), ("authors", "authors"))
+        scope_fields = (("include labels", "include_labels",
+                         "include_label_ids"),
+                        ("exclude labels", "exclude_labels",
+                         "exclude_label_ids"),
+                        ("markings", "markings", "marking_ids"),
+                        ("authors", "authors", "author_ids"))
     else:
-        scope_fields = (("include tags", "include_tags"),
-                        ("exclude tags", "exclude_tags"),
-                        ("orgs", "orgs"), ("sharing groups", "sharing_groups"),
-                        ("event ids", "event_ids"))
-    for scope_label, key in scope_fields:
+        scope_fields = (("include tags", "include_tags", None),
+                        ("exclude tags", "exclude_tags", None),
+                        ("orgs", "orgs", None),
+                        ("sharing groups", "sharing_groups", None),
+                        ("event ids", "event_ids", None))
+    for scope_label, key, id_key in scope_fields:
         values = config.get(key) or []
-        if values:
-            lines.append("  %-12s: %s" % (scope_label, ", ".join(values)))
+        if not values:
+            continue
+        note = ""
+        if id_key is not None:
+            # OpenCTI filters on ids, not names.  Printing the names alone
+            # would let the summary claim a scope the query does not have.
+            resolved = config.get(id_key) or []
+            if len(resolved) < len(values):
+                note = "  (%d of %d resolved to an OpenCTI id; the rest are " \
+                       "not filtered)" % (len(resolved), len(values))
+        lines.append("  %-12s: %s%s" % (scope_label, ", ".join(values), note))
 
     lines.append("  exclusions  : private=%s networks=%s domains=%s allowlist=%s"
                  % (_yes_no(config.get("exclude_private")),
@@ -4175,7 +4210,7 @@ def cmd_build(args):
         # The interview needs a live client for its tag/org/type lists, but
         # stage 1 is what collects the credentials, so connect in between.
         try:
-            config = run_interview(None)
+            config = run_interview(None, connect=make_client)
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130

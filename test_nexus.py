@@ -2480,6 +2480,75 @@ class TestOpenctiQualityAndScope(Quiet):
 
 
 # ---------------------------------------------------------------------------
+# STAGE 2 -- the interview connects for itself
+# ---------------------------------------------------------------------------
+
+class TestInterviewConnectsForDiscovery(Quiet):
+    """Stage 5's OpenCTI filters are entity ids; only a live client resolves
+    a typed name to one.  With no connection the whole stage is inert."""
+
+    def interview(self, connect, input_fn=None, source="opencti"):
+        return nexus.run_interview(
+            None,
+            input_fn=input_fn or by_prompt(
+                [("OpenCTI address", "cti.local"),
+                 ("Include labels", "1"),
+                 ("TLP markings", "1"),
+                 ("Created by", "1")], fill=""),
+            getpass_fn=lambda prompt: "tok", source=source, connect=connect)
+
+    def test_scope_names_resolve_to_ids_on_a_connected_run(self):
+        seen = {}
+
+        def connect(config):
+            seen["config"] = config
+            return StubOpenctiClient()
+
+        config = self.interview(connect)
+        self.assertEqual(config["include_labels"], ["phishing"])
+        self.assertEqual(config["include_label_ids"], ["l1"])
+        self.assertEqual(config["marking_ids"], ["m1"])
+        self.assertEqual(config["author_ids"], ["o1"])
+        # The client is built from stage 1's own answers, not from thin air.
+        self.assertEqual(seen["config"]["source_host"], "cti.local")
+        self.assertEqual(seen["config"]["token"], "tok")
+
+    def test_filters_built_from_that_config_actually_carry_the_ids(self):
+        config = self.interview(lambda c: StubOpenctiClient())
+        filters = nexus.build_opencti_filters(config)
+        keys = [f["key"][0] for f in filters["filters"]]
+        self.assertIn("objectMarking", keys)
+        self.assertIn("objectLabel", keys)
+
+    def test_a_dead_host_degrades_to_an_offline_interview(self):
+        def connect(config):
+            raise nexus.SourceError("no route to host")
+
+        config = self.interview(connect)
+        self.assertEqual(config["source_host"], "cti.local")
+        self.assertIn("could not connect", self.printed)
+
+    def test_no_connect_callable_means_no_connection_attempt(self):
+        # Every existing caller passes nothing and must stay offline.
+        config = nexus.run_interview(
+            None, input_fn=by_prompt([("OpenCTI address", "cti.local")],
+                                     fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti")
+        self.assertEqual(config["include_label_ids"], [])
+
+    def test_summary_flags_scope_terms_that_resolved_to_nothing(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "markings": ["TLP:GREEN"], "marking_ids": [],
+                  "include_labels": ["phishing"], "include_label_ids": ["l1"]}
+        text = nexus.summarise_config(config)
+        self.assertIn("TLP:GREEN", text)
+        self.assertIn("not filtered", text)
+        # A term that did resolve must not be smeared with the same warning.
+        label_line = [l for l in text.splitlines() if "include labels" in l][0]
+        self.assertNotIn("not filtered", label_line)
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
 
