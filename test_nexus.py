@@ -4143,6 +4143,68 @@ class TestSourceCli(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
 
+class TestBuildHonoursSourceAndHostFlags(Quiet):
+    """--source/--host say "asked if omitted" in the help; on a build run they
+    were read by nobody, so they changed nothing at all."""
+
+    def build(self, argv, interview):
+        args = nexus.resolve_source_args(nexus.build_parser().parse_args(argv))
+        seen = {}
+
+        def fake_interview(client, **kwargs):
+            seen.update(kwargs)
+            return interview(kwargs)
+
+        real = (nexus.run_interview, nexus.check_env)
+        nexus.run_interview = fake_interview
+        nexus.check_env = lambda: (True, [])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                nexus.cmd_build(args)
+        finally:
+            nexus.run_interview, nexus.check_env = real
+        return seen
+
+    def test_flags_reach_the_interview(self):
+        def stop(kwargs):
+            raise nexus.InterviewAborted("enough")
+
+        seen = self.build(["--source", "opencti", "--host", "cti.local"], stop)
+        self.assertEqual(seen["source"], "opencti")
+        self.assertEqual(seen["host"], "cti.local")
+
+    def test_a_flagless_run_still_asks(self):
+        # The interactivity rule: absent the switch, the script asks.  A fix
+        # that silently defaulted to "misp" would pass the test above and
+        # fail this one.
+        def stop(kwargs):
+            raise nexus.InterviewAborted("enough")
+
+        seen = self.build([], stop)
+        self.assertIsNone(seen["source"])
+        self.assertIsNone(seen["host"])
+
+        # ...and run_interview with source=None does ask.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["2", "cti.local"], fill=""),
+            getpass_fn=lambda prompt: "tok", source=None)
+        self.assertEqual(config["source"], "opencti")
+
+    def test_host_flag_is_only_a_default_the_question_still_runs(self):
+        fake = scripted([], fill="")
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti", host="cti.local")
+        self.assertEqual(config["source_host"], "cti.local")
+        self.assertIn("cti.local", fake.state["prompts"][0])
+
+        typed = scripted(["other.local"], fill="")
+        config = {}
+        nexus._stage1_connection(config, None, typed, lambda *a, **k: "tok",
+                                 source="opencti", host="cti.local")
+        self.assertEqual(config["source_host"], "other.local")
+
+
 class TestOpenctiEndToEnd(unittest.TestCase):
     """An OpenCTI profile all the way to rendered intel lines."""
 

@@ -4226,7 +4226,10 @@ def cmd_build(args):
         # The interview needs a live client for its tag/org/type lists, but
         # stage 1 is what collects the credentials, so connect in between.
         try:
-            config = run_interview(None, connect=make_client)
+            # --source/--host skip their questions; absent, the interview
+            # still asks.
+            config = run_interview(None, source=args.source, host=args.host,
+                                   connect=make_client)
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130
