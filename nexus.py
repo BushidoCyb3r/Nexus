@@ -1848,6 +1848,11 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
         misp_type = record.get("type") or ""
 
         if allowed is not None and misp_type not in allowed:
+            # Deselected is a choice and stays silent, but a type the mapping
+            # table has never heard of (an unknown hash algorithm, an
+            # unexpected observable entity) is a loss, and losses get counted.
+            if misp_type not in lookup:
+                stats.unmap(misp_type or "<empty>")
             continue
         if misp_type not in lookup:
             stats.unmap(misp_type or "<empty>")

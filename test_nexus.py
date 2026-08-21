@@ -387,8 +387,11 @@ class TestBuild(unittest.TestCase):
     def test_type_selection_filters_input(self):
         rows, stats = self.build(types=["ip-dst"])
         self.assertEqual([r[1] for r in rows], ["Intel::ADDR"])
-        # types the operator did not select are skipped, not tallied as unmapped
-        self.assertEqual(stats.unmapped, {})
+        # A mappable type the operator did not select is skipped in silence.
+        self.assertNotIn("domain", stats.unmapped)
+        # "ssdeep" is in no mapping table, so it is a loss whether or not it
+        # was selected, and a loss is always counted.
+        self.assertEqual(stats.unmapped, {"ssdeep": 1})
 
     def test_dedup_is_per_indicator_and_type(self):
         records = [
@@ -4374,6 +4377,30 @@ class TestOpenctiEndToEnd(unittest.TestCase):
             types=nexus.opencti_record_types(["StixFile"]),
             mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
         self.assertEqual(stats.unmapped.get("SSDEEP"), 1)
+
+    def test_an_unknown_hash_algorithm_is_counted_not_dropped(self):
+        # A connector shipping SHA3-256 produces record type "SHA3-256", which
+        # is in no expansion list, so the types filter used to eat it with no
+        # stats bucket -- the same silent loss the class-name filter caused.
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "hashes": [{"algorithm": "SHA3-256", "hash": "f" * 64}]}}]}
+        _, stats = nexus.build_indicators(
+            nexus.flatten_indicator(node),
+            types=nexus.opencti_record_types(["StixFile"]),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped.get("SHA3-256"), 1)
+
+    def test_a_deselected_but_mappable_type_stays_silent(self):
+        # Counting the unknown must not turn every deselected type into noise:
+        # the operator chose not to have those.
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "IPv4-Addr", "45.33.32.1"))
+        _, stats = nexus.build_indicators(
+            records, types=["Domain-Name"],
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped, {})
 
     def test_append_only_merge_across_sources(self):
         path = os.path.join(self.dir, "intel.dat")
