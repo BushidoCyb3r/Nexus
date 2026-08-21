@@ -4067,6 +4067,56 @@ class TestOpenctiEndToEnd(unittest.TestCase):
         self.assertEqual(stats.excluded.get("private_ip"), 1)
         self.assertEqual(stats.unmapped, {})
 
+    def test_selected_ioc_classes_keep_their_hashes(self):
+        # config["types"] holds x_opencti_main_observable_type names, but
+        # flatten_indicator() emits the finer OPENCTI_TO_ZEEK keys.  Filtering
+        # the second vocabulary with the first drops every file and cert hash
+        # without a stats bucket or a warning.
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "name": "bad.exe",
+                      "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                                 {"algorithm": "sha-256", "hash": "e" * 64}]}},
+            {"node": {"entity_type": "X509-Certificate",
+                      "observable_value": "cert",
+                      "hashes": [{"algorithm": "SHA-1", "hash": "b" * 40}]}},
+        ]}
+        records = nexus.flatten_indicator(node)
+
+        selected = (nexus.OPENCTI_IOC_CLASSES["file"][1]
+                    + nexus.OPENCTI_IOC_CLASSES["tls"][1])
+        rows, stats = nexus.build_indicators(
+            records, types=nexus.opencti_record_types(selected),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+
+        self.assertEqual(sorted(r[0] for r in rows),
+                         sorted(["bad.exe", "d" * 32, "e" * 64, "b" * 40]))
+        self.assertEqual(stats.by_type.get("Intel::CERT_HASH"), 1)
+        self.assertEqual(stats.by_type.get("Intel::FILE_HASH"), 2)
+
+    def test_expansion_is_identity_where_the_vocabularies_agree(self):
+        for main_type in nexus.OPENCTI_IOC_CLASSES["network"][1]:
+            self.assertEqual(nexus.opencti_record_types([main_type]),
+                             [main_type])
+
+    def test_every_offered_class_expands_to_mappable_record_types(self):
+        for key, (_, main_types) in nexus.OPENCTI_IOC_CLASSES.items():
+            expanded = nexus.opencti_record_types(main_types)
+            mappable = [t for t in expanded if t in nexus.OPENCTI_TO_ZEEK]
+            self.assertTrue(mappable, "%s expands to nothing mappable" % key)
+
+    def test_unmappable_emissions_are_counted_not_dropped_silently(self):
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "hashes": [{"algorithm": "SSDEEP", "hash": "3:abc"}]}}]}
+        _, stats = nexus.build_indicators(
+            nexus.flatten_indicator(node),
+            types=nexus.opencti_record_types(["StixFile"]),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped.get("SSDEEP"), 1)
+
     def test_append_only_merge_across_sources(self):
         path = os.path.join(self.dir, "intel.dat")
         existing = [nexus.header_line(False),

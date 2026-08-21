@@ -236,6 +236,56 @@ OPENCTI_IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
 
 OPENCTI_OFF_BY_DEFAULT = frozenset(("User-Account", "Software"))
 
+# Two vocabularies meet here.  config["types"] holds
+# x_opencti_main_observable_type names, because that is what the server-side
+# type filter takes; flatten_indicator() emits the finer OPENCTI_TO_ZEEK keys,
+# because a StixFile carries several value types at once.  This is the
+# expansion between them -- identity where the two happen to agree.
+_OPENCTI_FILE_RECORD_TYPES = ["File-Name", "MD5", "SHA-1", "SHA-224",
+                              "SHA-256", "SHA-384", "SHA-512", "SSDEEP",
+                              "TLSH"]
+
+OPENCTI_MAIN_TO_RECORD_TYPES = {
+    "IPv4-Addr":        ["IPv4-Addr"],
+    "IPv6-Addr":        ["IPv6-Addr"],
+    "Domain-Name":      ["Domain-Name"],
+    "Hostname":         ["Hostname"],
+    "Url":              ["Url"],
+    "Email-Addr":       ["Email-Addr"],
+    "StixFile":         _OPENCTI_FILE_RECORD_TYPES,
+    "Artifact":         _OPENCTI_FILE_RECORD_TYPES,
+    "X509-Certificate": ["X509-SHA-1", "X509-MD5", "X509-SHA-256"],
+    "User-Account":     ["User-Account"],
+    "Software":         ["Software"],
+}
+
+
+def opencti_record_types(main_types):
+    """Selected main observable types -> the record types they can emit.
+
+    Emissions with no Zeek equivalent (SSDEEP, X509-SHA-256) are included on
+    purpose: they then reach build_indicators' unmapped counter instead of
+    being dropped without a word.
+    """
+    out = []
+    for main_type in main_types or ():
+        for record_type in OPENCTI_MAIN_TO_RECORD_TYPES.get(main_type,
+                                                            [main_type]):
+            if record_type not in out:
+                out.append(record_type)
+    return out
+
+
+def opencti_zeek_types(main_type):
+    """The Zeek Intel types one main observable type can produce, in order."""
+    out = []
+    for record_type in OPENCTI_MAIN_TO_RECORD_TYPES.get(main_type,
+                                                        [main_type]):
+        for _, zeek_type in OPENCTI_TO_ZEEK.get(record_type, ()):
+            if zeek_type not in out:
+                out.append(zeek_type)
+    return out
+
 # Observable entity types whose observable_value maps straight to a mapping-table
 # key.  Anything not here needs field-specific extraction (hashes, logins).
 OPENCTI_OBSERVABLE_TYPE_ALIASES = {
@@ -2558,14 +2608,23 @@ def _count_label(misp_type, counts):
     return format(count, ",d") + ("" if exact else "+")
 
 
-def _type_annotation(misp_type, counts, table=None, off_by_default=None):
+def _type_annotation(misp_type, counts, table=None, off_by_default=None,
+                     source="misp"):
     """`table` and `off_by_default` default to the MISP pair so the one
     existing call site (pre-OpenCTI) is unaffected; _stage3_iocs passes the
     OpenCTI pair on that path so the Zeek-type column isn't just "None".
+
+    On the OpenCTI path the type shown is a main_observable_type, which has no
+    OPENCTI_TO_ZEEK entry of its own -- a StixFile is several Zeek types at
+    once -- so the expansion table answers instead of zeek_type_for().
     """
     noisy_set = MISP_OFF_BY_DEFAULT if off_by_default is None else off_by_default
+    if source == "opencti":
+        zeek = " + ".join(opencti_zeek_types(misp_type)) or "None"
+    else:
+        zeek = zeek_type_for(misp_type, table)
     return "%9s  -> %s%s" % (
-        _count_label(misp_type, counts), zeek_type_for(misp_type, table),
+        _count_label(misp_type, counts), zeek,
         "   (noisy)" if misp_type in noisy_set else "")
 
 
@@ -2815,7 +2874,8 @@ def _stage3_iocs(config, discovery, input_fn, source="misp"):
         if not candidates:
             print("  no %s attribute types exist on this instance" % key)
             continue
-        options = [(t, _type_annotation(t, counts, table, off_by_default))
+        options = [(t, _type_annotation(t, counts, table, off_by_default,
+                                        source))
                    for t in candidates]
         preselected = [t for t in candidates
                        if t not in off_by_default
@@ -3924,23 +3984,11 @@ def _cmd_probe_opencti(client, args):
     candidates = []
     for key in OPENCTI_IOC_CLASS_ORDER:
         candidates.extend(OPENCTI_IOC_CLASSES[key][1])
-    # Local, display-only: several main_observable_types (StixFile, Artifact,
-    # X509-Certificate) have no direct OPENCTI_TO_ZEEK entry of their own, so
-    # zeek_type_for() cannot answer for them.
-    zeek_hint = {
-        "IPv4-Addr": "Intel::ADDR", "IPv6-Addr": "Intel::ADDR",
-        "Domain-Name": "Intel::DOMAIN", "Hostname": "Intel::DOMAIN",
-        "Url": "Intel::URL", "Email-Addr": "Intel::EMAIL",
-        "StixFile": "Intel::FILE_HASH + Intel::FILE_NAME",
-        "Artifact": "Intel::FILE_HASH + Intel::FILE_NAME",
-        "X509-Certificate": "Intel::CERT_HASH",
-        "User-Account": "Intel::USER_NAME", "Software": "Intel::SOFTWARE",
-    }
-
     print("\nMappable observable types")
     print("  %-24s %10s  %s" % ("opencti type", "count", "zeek type"))
 
     total = 0
+    approximate = False
     for main_type in candidates:
         try:
             count, exact = client.count_type(main_type,
@@ -3951,13 +3999,17 @@ def _cmd_probe_opencti(client, args):
         if count == 0 and not args.show_empty:
             continue
         total += count
+        approximate = approximate or not exact
         marker = "" if exact else "+"
         flag = "" if main_type not in OPENCTI_OFF_BY_DEFAULT else "   (off by default)"
         print("  %-24s %9d%s  %s%s"
-              % (main_type, count, marker, zeek_hint.get(main_type, ""), flag))
+              % (main_type, count, marker,
+                 " + ".join(opencti_zeek_types(main_type)), flag))
 
-    print("\n  approximate total indicators available: %d%s"
-          % (total, "" if total < args.probe_limit else "+"))
+    # OpenCTI answers with globalCount, so unless a count actually came back
+    # capped these totals are exact and a "+" would be a lie.
+    print("\n  total indicators available: %d%s"
+          % (total, "+" if approximate else ""))
     if OPENCTI_UNMAPPABLE:
         print("\nPresent in OpenCTI but not mappable to Zeek:")
         for main_type in sorted(OPENCTI_UNMAPPABLE):
@@ -4173,11 +4225,15 @@ def cmd_build(args):
     config["_stats"] = stats
     if config.get("source") == "opencti":
         table = OPENCTI_TO_ZEEK
+        # config["types"] is in main_observable_type form for the server-side
+        # filter; the records build_indicators sees are one level finer.
+        wanted_types = opencti_record_types(config["types"])
     else:
         table = MISP_TO_ZEEK
+        wanted_types = config["types"]
     records = _fetch_records(client, config)
     rows, stats = build_indicators(
-        records, types=config["types"], exclusions=exclusions,
+        records, types=wanted_types, exclusions=exclusions,
         split_composites=config["split_composites"],
         allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
         desc_template=config["desc_template"],
