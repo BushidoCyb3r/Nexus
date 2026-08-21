@@ -2546,15 +2546,26 @@ class TestStage7SourceFormats(Quiet):
             "    4) fixed string                   type your own\n")
 
     def test_a_shipped_opencti_row_names_opencti(self):
-        record = {"type": "Domain-Name", "value": "evil.com", "to_ids": True,
-                  "uuid": "u", "event_info": "i", "event_id": "indicator--9f2c",
-                  "event_tags": [], "org": "CIRCL", "comment": "",
-                  "category": "", "timestamp": ""}
+        # Built by flatten_indicator rather than by hand: event_id comes from
+        # node["id"], the internal uuid meta.url also points at, not from
+        # standard_id, and a hand-written fixture can quietly disagree.
+        uuid = "6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45"
+        record = nexus.flatten_indicator({
+            "id": uuid, "standard_id": "indicator--" + uuid, "name": "i",
+            "pattern_type": "stix", "x_opencti_detection": True,
+            "createdBy": {"name": "CIRCL"},
+            "observables": {"edges": [{"node": {
+                "entity_type": "Domain-Name",
+                "observable_value": "evil.com"}}]}})[0]
         config, _ = self.stage7("opencti")
         rows, _ = nexus.build_indicators(
             [record], mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti",
             source_fmt=config["source_fmt"])
-        self.assertEqual(rows[0][2], "OpenCTI-indicator--9f2c")
+        self.assertEqual(rows[0][2], "OpenCTI-" + uuid)
+        # The menu example has to show that shape, not a standard_id.
+        example = dict(nexus.OPENCTI_SOURCE_FORMATS)["OpenCTI-{event_id}"]
+        self.assertNotIn("indicator--", example)
+        self.assertRegex(example, r"^OpenCTI-[0-9a-f]{8}-")
 
 
 # ---------------------------------------------------------------------------

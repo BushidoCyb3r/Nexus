@@ -2385,10 +2385,11 @@ SOURCE_FORMATS = (
 
 # meta.source ends up in intel.dat, so it has to name the platform the row
 # actually came from -- an analyst chasing an intel.log hit reads it as a
-# lookup key, and "MISP-event-indicator--9f2c" sends them to a MISP that has
-# no such event.
+# lookup key, and "MISP-event-6c1f0a2e-..." sends them to a MISP that has no
+# such event.  {event_id} is OpenCTI's internal id, the same one meta.url
+# links to, not the standard_id.
 OPENCTI_SOURCE_FORMATS = (
-    ("OpenCTI-{event_id}", "OpenCTI-indicator--9f2c"),
+    ("OpenCTI-{event_id}", "OpenCTI-6c1f0a2e-2b7d-4a55-..."),
     ("OpenCTI-{org}", "OpenCTI-CIRCL"),
     ("OpenCTI", "OpenCTI"),
     ("fixed string", "type your own"),
@@ -4234,8 +4235,8 @@ def cmd_build(args):
         # The interview needs a live client for its tag/org/type lists, but
         # stage 1 is what collects the credentials, so connect in between.
         try:
-            # --source/--host skip their questions; absent, the interview
-            # still asks.
+            # --source answers its own question; --host only seeds the
+            # default, so the address is still asked.
             config = run_interview(None, source=args.source, host=args.host,
                                    connect=make_client)
         except InterviewAborted as exc:
