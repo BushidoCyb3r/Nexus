@@ -4270,6 +4270,85 @@ class TestBuildHonoursSourceAndHostFlags(Quiet):
         self.assertEqual(config["source_host"], "other.local")
 
 
+class TestBuildTranslatesTheTypeVocabulary(Quiet):
+    """cmd_build must expand config["types"] (main observable type names) into
+    record types before build_indicators filters on them.  Every helper around
+    that call was covered; the call itself was not, so reverting it -- and
+    dropping every file hash -- passed the whole suite."""
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        # Without __load__.Zeek the guardrails block before anything is written.
+        with io.open(os.path.join(self.dir, nexus.SO_LOAD_FILE), "w"):
+            pass
+
+    def config(self):
+        config = nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti.local")], fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti")
+        # An operator who picked the "file" IOC class: class names, not the
+        # finer record types flatten_indicator() emits.
+        config["types"] = ["StixFile"]
+        config["output_path"] = os.path.join(self.dir, "intel.dat")
+        config["profile_path"] = None
+        config["backup"] = False
+        config["dry_run"] = False
+        config["apply"] = False
+        return config
+
+    def records(self):
+        node = {
+            "id": "6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45",
+            "standard_id": "indicator--6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45",
+            "name": "dropper", "description": "", "pattern_type": "stix",
+            "x_opencti_detection": True, "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": "StixFile", "name": "bad.exe",
+                          "observable_value": "bad.exe",
+                          "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                                     {"algorithm": "sha-256",
+                                      "hash": "e" * 64}]}}]},
+        }
+        return nexus.flatten_indicator(node)
+
+    def test_the_hashes_reach_the_written_file(self):
+        records = self.records()
+        # The record types are finer than the class name in config["types"];
+        # filtering the second vocabulary with the first matches nothing.
+        self.assertIn("MD5", [r["type"] for r in records])
+
+        class Client(object):
+            host = "cti.local"
+
+            def get_version(self):
+                return {"version": "6.2.0"}
+
+            def search_indicators(self, filters, max_results=None, stats=None):
+                return iter(records)
+
+        config = self.config()
+        real = (nexus.check_env, nexus.run_interview, nexus.make_client)
+        nexus.check_env = lambda: (True, [])
+        nexus.run_interview = lambda client, **kwargs: config
+        nexus.make_client = lambda cfg: Client()
+        try:
+            args = nexus.resolve_source_args(nexus.build_parser().parse_args([]))
+            rc = nexus.cmd_build(args)
+        finally:
+            nexus.check_env, nexus.run_interview, nexus.make_client = real
+
+        self.assertEqual(rc, 0)
+        with io.open(config["output_path"], encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertIn("d" * 32, body)
+        self.assertIn("e" * 64, body)
+        self.assertIn("bad.exe", body)
+
+
 class TestOpenctiEndToEnd(unittest.TestCase):
     """An OpenCTI profile all the way to rendered intel lines."""
 
