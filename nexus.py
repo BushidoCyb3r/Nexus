@@ -1847,15 +1847,14 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
         stats.fetched += 1
         misp_type = record.get("type") or ""
 
-        if allowed is not None and misp_type not in allowed:
-            # Deselected is a choice and stays silent, but a type the mapping
-            # table has never heard of (an unknown hash algorithm, an
-            # unexpected observable entity) is a loss, and losses get counted.
-            if misp_type not in lookup:
-                stats.unmap(misp_type or "<empty>")
-            continue
+        # Order matters: a type the mapping table has never heard of (an
+        # unknown hash algorithm, an unexpected observable entity) is a loss
+        # whether or not it was selected, and a loss gets counted.  Being
+        # deselected is a choice, and that one stays silent.
         if misp_type not in lookup:
             stats.unmap(misp_type or "<empty>")
+            continue
+        if allowed is not None and misp_type not in allowed:
             continue
 
         meta = render_meta(record, source_fmt, desc_template, base_url,
@@ -2756,9 +2755,9 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
     config["source"] = source
     label = SOURCE_LABELS.get(source, source)
 
-    # --host seeds the default; it does not skip the question.
-    # .strip(): a --host default is returned verbatim, and urllib chokes on
-    # "cti.local " long before it opens a socket.
+    # --host seeds the default; it does not skip the question.  It is also
+    # returned verbatim, and urllib chokes on "cti.local " long before it
+    # opens a socket, hence the strip.
     config["source_host"] = ask_required(
         "%s address (IP or hostname)" % label,
         host or (client.host if client is not None else None), input_fn).strip()
