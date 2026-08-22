@@ -1046,15 +1046,17 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
         if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
             status, payload = 404, {"title": "not found"}
         elif "/collections/" in parsed.path and parsed.path.endswith("/objects/"):
-            # Envelope pagination: each hit serves the next scripted page and
-            # advances the cursor; once pages run out, an empty closed page.
+            # Envelope pagination: each hit serves the next scripted page.
+            # Once the script runs out, replay the last page forever rather
+            # than fall back to a closed one -- a fake that can end the loop
+            # on its own would let a test pass with the client's cursor
+            # guard removed, which is exactly the bug this fake exists to
+            # catch. Only the client's own guard (or a scripted page's own
+            # more: False) may stop the pull.
             pages = self.server.pages
             idx = self.server.objects_index
-            if idx < len(pages):
-                status, payload = 200, pages[idx]
-                self.server.objects_index += 1
-            else:
-                status, payload = 200, {"objects": [], "more": False}
+            status, payload = 200, pages[min(idx, len(pages) - 1)]
+            self.server.objects_index += 1
         else:
             status, payload = self.server.routes.get(
                 parsed.path, (404, {"title": "not found"}))
@@ -1266,14 +1268,29 @@ class TestTaxii21Fetch(unittest.TestCase):
 
     def test_a_repeated_cursor_stops_the_loop(self):
         # A server that keeps handing back the same next value would spin
-        # forever; OpenctiClient carries the same guard.
+        # forever; OpenctiClient carries the same guard. The fake replays
+        # its last scripted page indefinitely (see FakeTaxiiHandler), so
+        # nothing but the client's own guard can end this pull -- without
+        # it, this test hangs rather than passing by accident.
         self.server.server.pages = [
             {"objects": [{"id": "a"}], "more": True, "next": "same"},
             {"objects": [{"id": "b"}], "more": True, "next": "same"},
         ]
         got = list(self.client.fetch_objects(
             {"id": "c1", "api_root": "/api1/"}))
-        self.assertLessEqual(len(got), 2)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_a_missing_cursor_stops_the_loop(self):
+        # more: True with no next at all is the other way a server can
+        # fail to hand back a usable cursor; same guard, same fake trap.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(len(self.server.requests), 1)
 
 
 class TestOpenctiClient(unittest.TestCase):
