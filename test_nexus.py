@@ -4761,6 +4761,106 @@ class TestStixPattern(unittest.TestCase):
                          [("Domain-Name", "a.com")])
 
 
+class TestFlattenTaxii(unittest.TestCase):
+
+    # Keys that exist only to feed Task 7's client-side filters -- everything
+    # else must match flatten_indicator()'s output key for key.
+    TAXII_ONLY_KEYS = set(("collection", "labels", "confidence",
+                           "valid_until", "created_by_ref",
+                           "object_marking_refs"))
+
+    def _indicator(self, **over):
+        obj = {
+            "type": "indicator", "id": "indicator--abc",
+            "pattern_type": "stix",
+            "pattern": "[domain-name:value = 'evil.example']",
+            "created": "2026-08-01T00:00:00.000Z",
+            "labels": ["phishing"],
+        }
+        obj.update(over)
+        return obj
+
+    def test_a_domain_pattern_becomes_one_record(self):
+        rows = nexus.flatten_taxii_object(self._indicator())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["value"], "evil.example")
+        self.assertEqual(rows[0]["type"], "Domain-Name")
+
+    def test_a_file_pattern_fans_out(self):
+        obj = self._indicator(pattern=(
+            "[file:name = 'x.exe' OR file:hashes.'SHA-256' = '"
+            + "a" * 64 + "']"))
+        rows = nexus.flatten_taxii_object(obj)
+        self.assertEqual(sorted(r["type"] for r in rows),
+                         ["File-Name", "SHA-256"])
+
+    def test_a_non_stix_pattern_is_counted_not_guessed(self):
+        stats = nexus.BuildStats()
+        rows = nexus.flatten_taxii_object(
+            self._indicator(pattern_type="yara", pattern="rule x {}"),
+            stats=stats)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats.unmapped, {"pattern:yara": 1})
+
+    def test_the_collection_title_reaches_the_record(self):
+        rows = nexus.flatten_taxii_object(self._indicator(),
+                                          collection_title="Feed One")
+        self.assertEqual(rows[0]["collection"], "Feed One")
+
+    def test_a_non_indicator_object_yields_nothing(self):
+        self.assertEqual(
+            nexus.flatten_taxii_object({"type": "malware", "id": "malware--1"}),
+            [])
+
+    def test_none_object_is_safe(self):
+        self.assertEqual(nexus.flatten_taxii_object(None), [])
+
+    def test_missing_confidence_is_none_not_zero(self):
+        # STIX 2.0 has no confidence property at all -- absent must mean
+        # "unknown", never 0, or a confidence filter would silently drop
+        # every object from a 2.0 feed.
+        rows = nexus.flatten_taxii_object(self._indicator())
+        self.assertIsNone(rows[0]["confidence"])
+
+    def test_explicit_zero_confidence_is_preserved(self):
+        rows = nexus.flatten_taxii_object(self._indicator(confidence=0))
+        self.assertEqual(rows[0]["confidence"], 0)
+
+    def test_taxii_only_fields_are_carried_through(self):
+        rows = nexus.flatten_taxii_object(self._indicator(
+            confidence=75,
+            valid_until="2027-08-01T00:00:00Z",
+            created_by_ref="identity--org1",
+            object_marking_refs=["marking-definition--tlp-amber"]))
+        rec = rows[0]
+        self.assertEqual(rec["labels"], ["phishing"])
+        self.assertEqual(rec["confidence"], 75)
+        self.assertEqual(rec["valid_until"], "2027-08-01T00:00:00Z")
+        self.assertEqual(rec["created_by_ref"], "identity--org1")
+        self.assertEqual(rec["object_marking_refs"],
+                         ["marking-definition--tlp-amber"])
+
+    def test_shared_keys_match_flatten_indicator_exactly(self):
+        """A future divergence between the two flatteners must fail loudly,
+        not silently blank a metadata field downstream."""
+        opencti_node = {
+            "id": "indicator--1",
+            "standard_id": "indicator--std",
+            "name": "Evil domain",
+            "description": "seen in phishing",
+            "pattern_type": "stix",
+            "createdBy": {"name": "CIRCL"},
+            "observables": {
+                "pageInfo": {"hasNextPage": False},
+                "edges": [{"node": {"entity_type": "Domain-Name",
+                                    "observable_value": "evil.com"}}],
+            },
+        }
+        opencti_keys = set(nexus.flatten_indicator(opencti_node)[0].keys())
+        taxii_keys = set(nexus.flatten_taxii_object(self._indicator())[0].keys())
+        self.assertEqual(taxii_keys - self.TAXII_ONLY_KEYS, opencti_keys)
+
+
 class TestOpenctiSearch(unittest.TestCase):
 
     def tearDown(self):

@@ -1472,6 +1472,74 @@ def parse_stix_pattern(pattern):
     return out
 
 
+def flatten_taxii_object(obj, collection_title=None, stats=None):
+    """One STIX indicator -> a record per value in its pattern.
+
+    1:N like flatten_indicator(), not 1:1 like flatten_attribute().  Only
+    `indicator` objects are read; a collection also carries malware, campaigns
+    and relationships, which are context rather than verdicts.
+
+    The shared keys below (everything but the last six) match
+    flatten_indicator()'s output field for field -- build_indicators(),
+    render_meta() and the exclusion filters all read those names regardless
+    of source, and a missing one would silently blank a metadata field
+    rather than raise.  TestFlattenTaxii pins the two flatteners' shared key
+    sets equal so a future divergence fails loudly.
+
+    Fields with no honest TAXII source are left empty rather than guessed:
+    "org" would otherwise have to hold a raw identity *reference* (an
+    unresolved "identity--..." id, not a name) -- that goes in the
+    TAXII-only created_by_ref instead, where it is labelled for what it is.
+    STIX 2.0 has no `confidence` property at all, and it must never be
+    defaulted to 0 -- that is a real (low) confidence value in 2.1, and
+    treating "absent" as "zero" would let a confidence filter silently drop
+    every object from a 2.0 feed. So confidence carries through as
+    obj.get(...), i.e. None when absent, never coerced.
+    """
+    obj = obj or {}
+    if obj.get("type") != "indicator":
+        return []
+    pattern_type = (obj.get("pattern_type") or "stix").lower()
+    if pattern_type not in OPENCTI_PARSEABLE_PATTERN_TYPES:
+        if stats is not None:
+            stats.unmap("pattern:%s" % pattern_type)
+        return []
+
+    labels = []
+    for label in obj.get("labels") or []:
+        if label and label not in labels:
+            labels.append(label)
+
+    common = {
+        # Shared with flatten_indicator() / flatten_attribute():
+        "category": pattern_type,
+        "to_ids": True,
+        "uuid": str(obj.get("id") or ""),
+        "timestamp": _opencti_epoch(obj.get("modified") or obj.get("created")),
+        "comment": obj.get("description") or "",
+        "event_id": str(obj.get("id") or ""),
+        "event_uuid": str(obj.get("id") or ""),
+        "event_info": obj.get("name") or "",
+        "event_tags": labels,
+        "org": "",
+        # TAXII-only, for Task 7's client-side filters:
+        "collection": collection_title or "",
+        "labels": list(labels),
+        "confidence": obj.get("confidence"),
+        "valid_until": obj.get("valid_until") or "",
+        "created_by_ref": obj.get("created_by_ref") or "",
+        "object_marking_refs": list(obj.get("object_marking_refs") or []),
+    }
+
+    records = []
+    for value_type, value in parse_stix_pattern(obj.get("pattern") or ""):
+        record = dict(common)
+        record["type"] = value_type
+        record["value"] = value
+        records.append(record)
+    return records
+
+
 # ---------------------------------------------------------------------------
 # FEEDS
 # ---------------------------------------------------------------------------
