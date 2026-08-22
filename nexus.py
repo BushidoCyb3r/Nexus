@@ -1986,6 +1986,60 @@ class ExclusionSet(object):
         return None
 
 
+def taxii_object_allowed(record, config, now=None):
+    """The filters TAXII cannot express, applied after download.
+
+    TAXII's own query params only reach `match[type]` and `added_after` --
+    labels, markings, confidence, validity and author all live inside the
+    STIX object, so Nexus filters them itself once the object has already
+    been fetched.  A server-side filter that silently matches nothing is a
+    defect this project has fixed three times; these are honest by
+    construction, but only because every one of them is actually applied.
+
+    The one trap is confidence: STIX 2.0 indicators have no such property at
+    all, so `flatten_taxii_object` carries an absent value through as None.
+    None means "unknown", not zero -- a minimum-confidence filter that
+    treated it as zero would silently drop every object from a 2.0 feed.
+    """
+    labels = set(record.get("labels") or [])
+    exclude_labels = set(config.get("exclude_labels") or [])
+    if exclude_labels and labels & exclude_labels:
+        return False
+    include_labels = set(config.get("include_labels") or [])
+    if include_labels and not (labels & include_labels):
+        return False
+
+    markings = set(record.get("object_marking_refs") or [])
+    include_markings = set(config.get("include_markings") or [])
+    if include_markings and not (markings & include_markings):
+        return False
+
+    include_authors = config.get("include_authors") or []
+    if include_authors and record.get("created_by_ref") not in include_authors:
+        return False
+
+    minimum = config.get("min_confidence")
+    confidence = record.get("confidence")
+    if minimum is not None and confidence is not None:
+        try:
+            if int(confidence) < int(minimum):
+                return False
+        except (TypeError, ValueError):
+            pass  # an unparseable confidence is unknown, not zero
+
+    if config.get("drop_expired") and record.get("valid_until"):
+        # _opencti_epoch returns an int on success, or "" when the
+        # timestamp will not parse -- coerce the success case to float
+        # once, deliberately, so it compares cleanly against time.time().
+        stamp = _opencti_epoch(record["valid_until"])
+        if stamp != "":
+            reference = time.time() if now is None else now.timestamp()
+            if float(stamp) < reference:
+                return False
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # INTEL FILE
 # ---------------------------------------------------------------------------

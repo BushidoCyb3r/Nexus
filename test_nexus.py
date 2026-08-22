@@ -4861,6 +4861,53 @@ class TestFlattenTaxii(unittest.TestCase):
         self.assertEqual(taxii_keys - self.TAXII_ONLY_KEYS, opencti_keys)
 
 
+class TestTaxiiClientSideFilters(unittest.TestCase):
+
+    def _record(self, **over):
+        rec = {"labels": ["phishing"], "confidence": 80,
+               "valid_until": "", "created_by_ref": "identity--a",
+               "object_marking_refs": ["marking-definition--green"]}
+        rec.update(over)
+        return rec
+
+    def test_no_filters_allows_everything(self):
+        self.assertTrue(nexus.taxii_object_allowed(self._record(), {}))
+
+    def test_include_labels_excludes_a_non_match(self):
+        config = {"include_labels": ["malware"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_exclude_labels_wins_over_include(self):
+        config = {"include_labels": ["phishing"],
+                  "exclude_labels": ["phishing"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_min_confidence_excludes_a_lower_score(self):
+        config = {"min_confidence": 90}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_absent_confidence_is_not_filtered_out(self):
+        # STIX 2.0 indicators have no confidence property at all.  Treating
+        # absent as zero would silently drop every object on a 2.0 feed.
+        config = {"min_confidence": 90}
+        self.assertTrue(nexus.taxii_object_allowed(
+            self._record(confidence=None), config))
+
+    def test_an_expired_indicator_is_excluded_when_asked(self):
+        config = {"drop_expired": True}
+        record = self._record(valid_until="2020-01-01T00:00:00Z")
+        self.assertFalse(nexus.taxii_object_allowed(
+            record, config, now=datetime(2026, 8, 22, tzinfo=timezone.utc)))
+
+    def test_markings_filter_matches_on_any_ref(self):
+        config = {"include_markings": ["marking-definition--red"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_authors_filter(self):
+        config = {"include_authors": ["identity--b"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+
 class TestOpenctiSearch(unittest.TestCase):
 
     def tearDown(self):
