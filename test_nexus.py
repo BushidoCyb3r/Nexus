@@ -5651,8 +5651,14 @@ class TestTaxiiFetchRecords(unittest.TestCase):
             self.calls.append({"collection": collection["id"],
                                "added_after": added_after,
                                "max_results": max_results})
+            sent = 0
             for obj in self.objects.get(collection["id"], []):
                 yield obj
+                sent += 1
+                # Honoured exactly as TaxiiClient honours it -- on objects,
+                # which is the whole point of not passing a record budget in.
+                if max_results is not None and sent >= max_results:
+                    return
 
     def indicator(self, value, ident, **over):
         obj = {"type": "indicator", "id": ident, "name": "n",
@@ -5695,6 +5701,34 @@ class TestTaxiiFetchRecords(unittest.TestCase):
         client = self.StubClient({})
         list(nexus._fetch_records(client, self.config(days=0)))
         self.assertIsNone(client.calls[0]["added_after"])
+
+    def unmappable(self, ident):
+        """An indicator that flattens to no records at all.
+
+        Routine, not exotic: every yara/sigma/snort indicator flattens to
+        nothing, as do windows-registry-key and network-traffic patterns.
+        """
+        return {"type": "indicator", "id": ident, "name": "n",
+                "pattern": "rule x { condition: true }",
+                "pattern_type": "yara", "created": "2026-08-01T00:00:00Z"}
+
+    def test_the_cap_is_a_record_budget_not_an_object_budget(self):
+        # max_indicators counts records; fetch_objects' max_results counts
+        # objects, and flattening is 1:N with N often zero.  Passing the
+        # record budget down as an object cap ended the pull early and said
+        # nothing: ten objects, five records, "capped at 10".
+        objects = []
+        for n in range(5):
+            objects.append(self.unmappable("i--y%d" % n))
+            objects.append(self.indicator("d%d.example" % n, "i--d%d" % n))
+        client = self.StubClient({"c1": objects})
+        records = list(nexus._fetch_records(client, self.config(
+            collections=[{"id": "c1", "title": "Feed One",
+                          "api_root": "/api1/"}],
+            max_indicators=3)))
+        self.assertEqual([r["value"] for r in records],
+                         ["d0.example", "d1.example", "d2.example"])
+        self.assertIsNone(client.calls[0]["max_results"])
 
     def test_the_post_download_filters_are_actually_applied(self):
         client = self.StubClient({

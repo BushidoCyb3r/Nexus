@@ -5373,12 +5373,15 @@ def _fetch_records(client, config):
         budget = config.get("max_indicators")
         seen = 0
         for collection in config.get("collections") or []:
-            remaining = None if budget is None else budget - seen
             log.info("fetching collection %s",
                      collection.get("title") or collection.get("id"))
+            # No max_results: it caps objects, and this budget counts records,
+            # which flattening produces 1:N from with N often zero -- passing
+            # it down under-delivered the budget silently.  The seen >= budget
+            # return below bounds the pull instead, and the generator
+            # suspends, so the over-read is one page at worst.
             for obj in client.fetch_objects(collection,
-                                            added_after=added_after,
-                                            max_results=remaining):
+                                            added_after=added_after):
                 for record in flatten_taxii_object(
                         obj, collection_title=collection.get("title"),
                         stats=stats):
@@ -5395,11 +5398,11 @@ def _fetch_records(client, config):
                         continue
                     seen += 1
                     yield record
-                    # fetch_objects' max_results counts objects, and TAXII
-                    # flattening is 1:N -- one 50-value pattern would blow a
-                    # cap of 3 ten times over.  check_size treats the cap as
-                    # a hard block, not a trim, so overshooting means a
-                    # failed build and no file at all.
+                    # The only place the cap is enforced: TAXII flattening
+                    # is 1:N, so one 50-value pattern would blow a cap of 3
+                    # ten times over.  check_size treats the cap as a hard
+                    # block, not a trim, so overshooting means a failed build
+                    # and no file at all.
                     if budget is not None and seen >= budget:
                         log.warning("indicator cap of %d reached; stopped "
                                     "fetching", budget)
