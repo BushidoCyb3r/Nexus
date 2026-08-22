@@ -2318,6 +2318,39 @@ class TestRunInterview(Quiet):
                          list(nexus.SUGGESTED_EXCLUDE_TAGS))
 
 
+class TestOfflineInterview(Quiet):
+
+    def run_it(self, offline):
+        return nexus.run_interview(
+            None, input_fn=scripted(["misp.example"], fill=""),
+            getpass_fn=lambda prompt: "tok", source="misp", offline=offline)
+
+    def test_offline_defaults_output_to_the_working_directory(self):
+        config = self.run_it(offline=True)
+        self.assertEqual(config["output_path"], "./intel.dat")
+
+    def test_offline_never_applies(self):
+        config = self.run_it(offline=True)
+        self.assertIs(config["apply"], False)
+        self.assertEqual(config["deployment"], "offline")
+
+    def test_offline_flag_is_recorded_in_the_config(self):
+        self.assertIs(self.run_it(offline=True)["offline"], True)
+        self.assertIs(self.run_it(offline=False)["offline"], False)
+
+    def test_manager_mode_still_defaults_to_the_security_onion_path(self):
+        config = self.run_it(offline=False)
+        self.assertEqual(config["output_path"], nexus.SO_INTEL_FILE)
+        self.assertEqual(config["deployment"], "distributed")
+
+    def test_offline_is_not_dropped_by_a_profile_round_trip(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "p.json")
+        nexus.save_profile(self.run_it(offline=True), path)
+        self.assertIs(nexus.load_profile(path)["offline"], True)
+
+
 # ---------------------------------------------------------------------------
 # STAGE 1 -- source selection
 # ---------------------------------------------------------------------------

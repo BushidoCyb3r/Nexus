@@ -3184,14 +3184,23 @@ def _stage7_metadata(config, input_fn):
     return config
 
 
-def _stage8_output(config, input_fn):
+def _stage8_output(config, input_fn, offline=False):
     _stage(8, "Output and apply")
-    config["deployment"] = ask_choice(
-        "Security Onion deployment",
-        [("distributed", "manager plus sensor grid"),
-         ("standalone", "one standalone node")],
-        "distributed", input_fn)
-    config["output_path"] = ask_required("Output path", SO_INTEL_FILE, input_fn)
+    config["offline"] = bool(offline)
+    if offline:
+        # Neither question means anything off-box: there is no grid to pick a
+        # topology for, and nothing to apply to.
+        config["deployment"] = "offline"
+        config["output_path"] = ask_required("Output path", "./intel.dat",
+                                             input_fn)
+    else:
+        config["deployment"] = ask_choice(
+            "Security Onion deployment",
+            [("distributed", "manager plus sensor grid"),
+             ("standalone", "one standalone node")],
+            "distributed", input_fn)
+        config["output_path"] = ask_required("Output path", SO_INTEL_FILE,
+                                             input_fn)
     config["merge_mode"] = "append-only"
     config["backup"] = ask_yes_no("Back up the existing file first?", True,
                                   input_fn)
@@ -3212,14 +3221,18 @@ def _stage8_output(config, input_fn):
             name += ".json"
         config["profile_path"] = os.path.join(PROFILE_DIR, name)
 
-    target = "standalone node" if config["deployment"] == "standalone" else "grid"
-    config["apply"] = ask_yes_no(
-        "Apply to the %s after writing?" % target, False, input_fn)
+    if offline:
+        config["apply"] = False
+    else:
+        target = ("standalone node" if config["deployment"] == "standalone"
+                  else "grid")
+        config["apply"] = ask_yes_no(
+            "Apply to the %s after writing?" % target, False, input_fn)
     return config
 
 
 def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
-                  source=None, host=None, connect=None):
+                  source=None, host=None, connect=None, offline=False):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
@@ -3274,7 +3287,7 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
         _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
     _stage7_metadata(config, input_fn)
-    _stage8_output(config, input_fn)
+    _stage8_output(config, input_fn, offline=offline)
 
     if config.get("feeds") and "{feed}" not in (config.get("source_fmt") or ""):
         log.info("feeds selected but meta.source has no {feed} placeholder; "
