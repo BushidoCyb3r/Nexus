@@ -1718,12 +1718,6 @@ class TestFlatten(unittest.TestCase):
         self.assertEqual(record["event_info"], "Event 1")
         self.assertEqual(record["event_tags"], ["tlp:amber"])
         self.assertEqual(record["org"], "CIRCL")
-        self.assertIs(record["to_ids"], True)
-
-    def test_to_ids_string_zero_is_false(self):
-        raw = attr("1.2.3.4")
-        raw["to_ids"] = "0"
-        self.assertIs(nexus.flatten_attribute(raw)["to_ids"], False)
 
     def test_flatten_tolerates_a_bare_attribute(self):
         record = nexus.flatten_attribute({"value": "1.2.3.4", "type": "ip-dst"})
@@ -4630,25 +4624,6 @@ class TestTransportHooks(unittest.TestCase):
         finally:
             fake.stop()
 
-    def test_add_secret_registers_with_the_redactor(self):
-        class Probe(nexus._HttpTransport):
-            def _auth_headers(self):
-                return {}
-        client = Probe(host="example.test", token="first")
-        client.add_secret("second-secret")
-        record = logging.LogRecord("n", logging.INFO, "p", 1,
-                                   "saw second-secret here", None, None)
-        nexus.REDACTOR.filter(record)
-        self.assertNotIn("second-secret", record.getMessage())
-
-    def test_add_secret_tolerates_empty(self):
-        class Probe(nexus._HttpTransport):
-            def _auth_headers(self):
-                return {}
-        client = Probe(host="example.test", token="t")
-        client.add_secret(None)      # must not raise
-        client.add_secret("")
-
 
 class TestTaxiiAuth(unittest.TestCase):
     def test_bearer_when_no_username(self):
@@ -4679,8 +4654,7 @@ class TestTaxiiAuth(unittest.TestCase):
             nexus.TaxiiClient(host="h", token="t", version="2.0").ACCEPT,
             "application/vnd.oasis.taxii+json; version=2.0")
 
-    def test_auth_errors_are_source_auth_errors(self):
-        self.assertTrue(issubclass(nexus.TaxiiAuthError, nexus.SourceAuthError))
+    def test_taxii_errors_are_source_errors(self):
         self.assertTrue(issubclass(nexus.TaxiiError, nexus.SourceError))
 
 
@@ -4803,7 +4777,6 @@ class TestFlattenIndicator(unittest.TestCase):
         self.assertEqual(rec["value"], "evil.com")
         self.assertEqual(rec["type"], "Domain-Name")
         self.assertEqual(rec["category"], "stix")
-        self.assertIs(rec["to_ids"], True)
         self.assertEqual(rec["uuid"], "indicator--std")
         self.assertEqual(rec["event_id"], "indicator--1")
         self.assertEqual(rec["event_info"], "Evil domain")
@@ -4867,11 +4840,6 @@ class TestFlattenIndicator(unittest.TestCase):
         node = self.node(updated_at="not a date", observables=self.observables(
             [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
         self.assertEqual(nexus.flatten_indicator(node)[0]["timestamp"], "")
-
-    def test_detection_false_sets_to_ids_false(self):
-        node = self.node(x_opencti_detection=False, observables=self.observables(
-            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
-        self.assertIs(nexus.flatten_indicator(node)[0]["to_ids"], False)
 
     def test_truncated_observables_are_counted(self):
         stats = nexus.BuildStats()
@@ -5094,6 +5062,10 @@ class TestFlattenTaxii(unittest.TestCase):
         opencti_keys = set(nexus.flatten_indicator(opencti_node)[0].keys())
         taxii_keys = set(nexus.flatten_taxii_object(self._indicator())[0].keys())
         self.assertEqual(taxii_keys - self.TAXII_ONLY_KEYS, opencti_keys)
+        misp_keys = set(nexus.flatten_attribute(attr("1.2.3.4")).keys())
+        # to_ids was set by all three flatteners and read by none of them.
+        for keys in (opencti_keys, taxii_keys, misp_keys):
+            self.assertNotIn("to_ids", keys)
 
 
 class TestTaxiiIndicatorTypes(unittest.TestCase):
@@ -5160,6 +5132,12 @@ class TestTaxiiClientSideFilters(unittest.TestCase):
         config = {"min_confidence": 90}
         self.assertTrue(nexus.taxii_object_allowed(
             self._record(confidence=None), config))
+
+    def test_an_unparseable_confidence_is_unknown_not_an_error(self):
+        # STIX says confidence is an integer 0-100, but a feed that puts
+        # "high" there must not take the whole run down with a ValueError.
+        self.assertTrue(nexus.taxii_object_allowed(
+            self._record(confidence="high"), {"min_confidence": 90}))
 
     def test_an_expired_indicator_is_excluded_when_asked(self):
         config = {"drop_expired": True}

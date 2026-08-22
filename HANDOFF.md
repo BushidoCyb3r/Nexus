@@ -127,7 +127,7 @@ Because `taxii_username` is excluded from profiles, replaying a Basic profile ha
 
 `detect_version()` probes `/taxii2/` (2.1) then `/taxii/` (2.0) and returns whichever answers first; the result becomes the interview's **default** answer, it does not skip the question — the standing no-implicit-default rule applies here too. An auth error during detection propagates as `SourceAuthError` rather than being read as "wrong version, try the other discovery path."
 
-Errors use ordinary HTTP status codes — 401/403 map directly to `TaxiiAuthError`/`TaxiiError`, unlike OpenCTI's GraphQL, which answers 200 even on a rejected token.
+Errors use ordinary HTTP status codes — the transport's own 401/403 handling raises `SourceAuthError` before any TAXII code runs, unlike OpenCTI's GraphQL, which answers 200 even on a rejected token. `TaxiiError` covers the protocol-level failures the client raises itself (an unsupported version, no discovery endpoint); there is no TAXII-specific auth exception, because nothing would ever raise one.
 
 Pagination is completely different between versions, and `fetch_objects(collection, added_after=None, max_results=None, page_size=100)` dispatches accordingly:
 
@@ -156,7 +156,7 @@ CLIENT      _HttpTransport (shared base; _request takes extra_headers=None,
             used by TAXII 2.0's Range pagination), MispClient, OpenctiClient,
             TaxiiClient (2.0/2.1, Basic or Bearer), NoCrossHostRedirect,
             SourceError/SourceAuthError (MispError/MispAuthError are
-            aliases; TaxiiError/TaxiiAuthError are TAXII's own subclasses),
+            aliases; TaxiiError is TAXII's own subclass),
             flatten_attribute, flatten_indicator, flatten_taxii_object,
             parse_stix_pattern
 FEEDS       feed_provenance, apply_feed_to_params  (MISP only — OpenCTI and

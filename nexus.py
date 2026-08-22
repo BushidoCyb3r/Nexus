@@ -480,10 +480,6 @@ class TaxiiError(SourceError):
     pass
 
 
-class TaxiiAuthError(SourceAuthError):
-    pass
-
-
 # The MISP names predate OpenCTI support.  Kept so existing call sites and
 # tests keep working; new code raises and catches the neutral names.
 MispError = SourceError
@@ -540,15 +536,6 @@ class _HttpTransport(object):
 
     def _auth_headers(self):
         raise NotImplementedError("a transport subclass must supply its auth header")
-
-    def add_secret(self, value):
-        """Register a further secret with the redactor.
-
-        Basic auth carries two -- a username and a password -- where every
-        other source Nexus speaks to carries one.
-        """
-        if value:
-            REDACTOR.add_secret(value)
 
     def _request(self, method, path, body=None, extra_headers=None):
         """Return (parsed_json, headers).  Retries on transient failures.
@@ -1064,7 +1051,7 @@ class TaxiiClient(_HttpTransport):
         self.username = username
         # The username is half of a Basic credential, so it is as much a
         # secret as the password it is paired with.
-        self.add_secret(username)
+        REDACTOR.add_secret(username)
 
     @property
     def ACCEPT(self):
@@ -1275,15 +1262,10 @@ def flatten_attribute(attr):
             if name and name not in tags:
                 tags.append(name)
 
-    to_ids = attr.get("to_ids")
-    if isinstance(to_ids, str):
-        to_ids = to_ids not in ("0", "", "false", "False")
-
     return {
         "value": attr.get("value") or "",
         "type": attr.get("type") or "",
         "category": attr.get("category") or "",
-        "to_ids": bool(to_ids),
         "uuid": attr.get("uuid") or "",
         "timestamp": attr.get("timestamp") or "",
         "comment": attr.get("comment") or "",
@@ -1388,7 +1370,6 @@ def flatten_indicator(node, stats=None):
     created_by = node.get("createdBy") or {}
     common = {
         "category": node.get("pattern_type") or "",
-        "to_ids": bool(node.get("x_opencti_detection")),
         "uuid": node.get("standard_id") or node.get("id") or "",
         "timestamp": _opencti_epoch(node.get("updated_at")
                                     or node.get("created_at")),
@@ -1526,7 +1507,6 @@ def flatten_taxii_object(obj, collection_title=None, stats=None):
     common = {
         # Shared with flatten_indicator() / flatten_attribute():
         "category": pattern_type,
-        "to_ids": True,
         "uuid": str(obj.get("id") or ""),
         "timestamp": _opencti_epoch(obj.get("modified") or obj.get("created")),
         "comment": obj.get("description") or "",
