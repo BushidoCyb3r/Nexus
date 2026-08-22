@@ -2,12 +2,12 @@
 """nexus.py - build a Zeek intel.dat from MISP, OpenCTI or TAXII, for Security
 Onion 3.2.
 
-Phases 0-6, 8 and 9: environment check, source client (MISP, OpenCTI or a
+Phases 0-6 and 8-10: environment check, source client (MISP, OpenCTI or a
 TAXII 2.0/2.1 server), the mapping/normalise/write core, the interactive
 interview, profiles and the unattended modes, the safety guardrails,
-apply-to-grid, OpenCTI and TAXII as further sources, and offline build plus
-airgapped import.  Phase 7 (systemd timer,
-install docs) is outstanding.
+apply-to-grid, offline build plus airgapped import, and OpenCTI (phase 9)
+and TAXII (phase 10) as further sources.  Phase 7 (systemd timer, install
+docs) is outstanding.
 One source per run, selected in the interview or via --source.  --offline
 builds a transfer-ready intel.dat on a host with no Security Onion installed;
 --import PATH merges one back into a manager's live file, append-only.
@@ -86,6 +86,9 @@ TAXII_ACCEPT = {
     "2.0": "application/vnd.oasis.taxii+json; version=2.0",
 }
 TAXII_DISCOVERY = {"2.1": "/taxii2/", "2.0": "/taxii/"}
+# 2.1 sends this as `limit`; 2.0 has no such parameter and can only express it
+# as the width of a Range window.
+TAXII_PAGE_SIZE = 100
 
 # Zeek Intel framework.  This is the complete Intel::Type set.
 ZEEK_TYPES = (
@@ -1119,7 +1122,7 @@ class TaxiiClient(_HttpTransport):
         return found
 
     def fetch_objects(self, collection, added_after=None, max_results=None,
-                      page_size=100):
+                      page_size=TAXII_PAGE_SIZE):
         """Yield raw STIX objects from one collection.
 
         `match[type]=indicator` and `added_after` are the only filters TAXII
@@ -4653,10 +4656,20 @@ def cmd_explain(args):
             print("No collections selected -- this profile would fetch "
                   "nothing.")
             return 0
-        print("%d GET request(s), one per collection:" % len(collections))
+        # One request per *page*, not per collection: 2.1 sends `limit` and
+        # follows `next`, 2.0 walks a Range window.  The URL below is the
+        # first page of each collection.
+        version = config.get("taxii_version") or TAXII_VERSIONS[0]
+        if version == "2.0":
+            print("%d collection(s), paged with Range headers -- one GET per "
+                  "page, starting with:" % len(collections))
+        else:
+            print("%d collection(s), paged with `next` -- one GET per page, "
+                  "starting with:" % len(collections))
         for collection in collections:
-            print("  %scollections/%s/objects/?match[type]=indicator%s"
+            print("  %scollections/%s/objects/?match[type]=indicator%s%s"
                   % (collection.get("api_root") or "?", collection.get("id"),
+                     "" if version == "2.0" else "&limit=%d" % TAXII_PAGE_SIZE,
                      "&added_after=%s" % added_after if added_after else ""))
         return 0
 

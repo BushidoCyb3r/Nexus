@@ -5457,19 +5457,37 @@ class TestTaxiiProbe(unittest.TestCase):
 class TestTaxiiExplain(unittest.TestCase):
     """--explain on a TAXII profile must not print a MISP restSearch body."""
 
-    def test_it_prints_one_request_per_collection(self):
+    def _explain(self, **over):
+        config = {"source": "taxii", "source_host": "taxii.example",
+                  "days": 90, "collections": [
+                      {"id": "c1", "title": "Feed One", "api_root": "/api1/"},
+                      {"id": "c2", "title": "Feed Two", "api_root": "/api2/"}]}
+        config.update(over)
         path = os.path.join(tempfile.mkdtemp(), "t.json")
-        nexus.save_profile({"source": "taxii", "source_host": "taxii.example",
-                            "days": 90, "collections": [
-                                {"id": "c1", "title": "Feed One",
-                                 "api_root": "/api1/"},
-                                {"id": "c2", "title": "Feed Two",
-                                 "api_root": "/api2/"}]}, path)
+        nexus.save_profile(config, path)
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            code = nexus.cmd_explain(argparse.Namespace(profile=path))
-        printed = buffer.getvalue()
-        self.assertEqual(code, 0)
+            self.assertEqual(
+                nexus.cmd_explain(argparse.Namespace(profile=path)), 0)
+        return buffer.getvalue()
+
+    def test_2_1_is_described_as_limit_and_cursor_paged(self):
+        # "one GET request per collection" was true of neither version: 2.1
+        # sends limit and follows `next`, one request per page.
+        printed = self._explain(taxii_version="2.1")
+        self.assertNotIn("GET request(s), one per collection", printed)
+        self.assertIn("limit=%d" % nexus.TAXII_PAGE_SIZE, printed)
+        self.assertIn("next", printed)
+
+    def test_2_0_is_described_as_range_paged(self):
+        # 2.0 has no limit parameter at all; page size only reaches the
+        # server as the width of a Range header, one request per page.
+        printed = self._explain(taxii_version="2.0")
+        self.assertNotIn("limit=", printed)
+        self.assertIn("Range", printed)
+
+    def test_it_prints_one_request_per_collection(self):
+        printed = self._explain()
         self.assertNotIn("restSearch", printed)
         self.assertIn("/api1/collections/c1/objects/", printed)
         self.assertIn("/api2/collections/c2/objects/", printed)
