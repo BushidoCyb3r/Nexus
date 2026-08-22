@@ -5,6 +5,7 @@ No MISP and no Security Onion required -- the MISP client is exercised against
 a local http.server that replays canned responses.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -4582,6 +4583,56 @@ class TestOpenctiEndToEnd(unittest.TestCase):
         self.assertEqual(combined[0], "evil.com\tIntel::DOMAIN\tMISP\told desc\t-")
         added, removed = nexus.indicator_delta(existing_rows, combined)
         self.assertEqual(removed, [])
+
+
+class TestResolveBuildTarget(unittest.TestCase):
+    def _args(self, **kw):
+        return argparse.Namespace(offline=kw.get("offline", False))
+
+    def test_offline_flag_skips_the_question(self):
+        def refuse(_prompt):
+            raise AssertionError("must not ask when --offline is given")
+        self.assertTrue(nexus.resolve_build_target(
+            self._args(offline=True), input_fn=refuse))
+
+    def test_flagless_run_asks(self):
+        asked = []
+
+        def record(prompt):
+            asked.append(prompt)
+            return ""
+        nexus.resolve_build_target(self._args(), input_fn=record,
+                                   intel_dir="/nonexistent/so/intel")
+        self.assertTrue(asked, "a flagless run must ask which target")
+
+    def test_flagless_run_honours_a_non_default_answer(self):
+        # No Security Onion here, so the default is offline.  ask_choice is
+        # numbered single-select, so "1" picks "manager" -- the non-default
+        # option.  That must be obeyed; a silent default would return True.
+        self.assertFalse(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "1",
+            intel_dir="/nonexistent/so/intel"))
+
+    def test_default_is_offline_when_no_security_onion_present(self):
+        self.assertTrue(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "",
+            intel_dir="/nonexistent/so/intel"))
+
+    def test_default_is_manager_when_intel_dir_exists(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertFalse(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "", intel_dir=tmp))
+
+
+class TestOfflineFlagParsing(unittest.TestCase):
+    def test_offline_defaults_to_false(self):
+        args = nexus.build_parser().parse_args([])
+        self.assertFalse(args.offline)
+
+    def test_offline_flag_sets_true(self):
+        args = nexus.build_parser().parse_args(["--offline"])
+        self.assertTrue(args.offline)
 
 
 if __name__ == "__main__":

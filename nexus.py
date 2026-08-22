@@ -2544,6 +2544,30 @@ def ask_choice(prompt, options, default=None, input_fn=input):
         print("  not a valid choice: %r" % answer)
 
 
+def resolve_build_target(args, input_fn=input, intel_dir=SO_INTEL_DIR):
+    """True for an offline build, False for a build on this manager.
+
+    Asked before check_env(), because check_env() is what refuses to run on a
+    host with no Security Onion.  The presented default is derived, but the
+    question is always asked when the flag is absent -- flags skip questions
+    for unattended replay, they do not change what a flagless run means.
+
+    A missing Security Onion means "not a manager".  A *broken* Security Onion
+    is a different thing and stays a hard error in check_env(); offline mode
+    must never become a way to paper over a damaged manager.
+    """
+    if getattr(args, "offline", False):
+        return True
+    on_manager = detect_so_version() is not None or os.path.isdir(intel_dir)
+    default = "manager" if on_manager else "offline"
+    choice = ask_choice(
+        "Where is this intel.dat going?",
+        [("manager", "this machine's Security Onion"),
+         ("offline", "another host -- write it here and transfer it")],
+        default, input_fn)
+    return choice == "offline"
+
+
 def parse_selection(answer, count):
     """Parse "1,3,5" / "1-4" / "2-3,7" to zero-based indexes; None if invalid."""
     picked = []
@@ -4181,6 +4205,10 @@ def build_parser():
     run.add_argument("--profile", metavar="NAME_OR_PATH",
                      help="replay saved answers instead of running the "
                           "interview")
+    run.add_argument("--offline", action="store_true",
+                     help="build for transfer to another host; skips the "
+                          "Security Onion checks and the apply step. Asked "
+                          "if omitted.")
     run.add_argument("--yes", action="store_true",
                      help="never prompt; requires --profile and a token from "
                           "--token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
