@@ -4881,7 +4881,8 @@ class TestImportMode(Quiet):
         args = argparse.Namespace(
             import_file=kwargs.get("import_file", self.incoming),
             yes=kwargs.get("yes", True),
-            dry_run=kwargs.get("dry_run", False))
+            dry_run=kwargs.get("dry_run", False),
+            diff=kwargs.get("diff", False))
         return nexus.cmd_import(args)
 
     def _raw(self):
@@ -4919,9 +4920,12 @@ class TestImportMode(Quiet):
     def test_header_mismatch_blocks_and_writes_nothing(self):
         self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"], False)
         before = self._raw()
+        # Six fields: valid for do_notice, so it clears the incoming lint and
+        # the header comparison is what does the blocking.
         self._write(self.incoming,
-                    ["b.example\tIntel::DOMAIN\tMISP\td\tT"], True)
+                    ["b.example\tIntel::DOMAIN\tMISP\td\t-\tT"], True)
         self.assertEqual(self._import(), 1)
+        self.assertIn("different meta.do_notice", self.printed)
         self.assertEqual(self._raw(), before)
 
     def test_malformed_incoming_file_blocks_and_writes_nothing(self):
@@ -4937,8 +4941,11 @@ class TestImportMode(Quiet):
     def test_missing_incoming_file_is_an_error(self):
         self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
         before = self._raw()
-        self.assertEqual(
-            self._import(import_file=os.path.join(self.tmp, "nope")), 2)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(
+                self._import(import_file=os.path.join(self.tmp, "nope")), 2)
+        self.assertIn("no such file", errors.getvalue())
         self.assertEqual(self._raw(), before)
 
     def test_incoming_file_with_no_indicators_is_an_error(self):
@@ -4969,6 +4976,15 @@ class TestImportMode(Quiet):
         self.assertIn("warn    1 overly broad indicator(s): 10.0.0.0/8 "
                       "(subnet at or broader than /16)", self.printed)
 
+    def test_a_bad_row_in_the_live_file_blocks_the_write(self):
+        """The merged-file lint: the live file is not ours and not trusted."""
+        self._write(self.live, ["a.example\tIntel::NOPE\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 1)
+        self.assertIn("the merged file fails lint", self.printed)
+        self.assertEqual(self._raw(), before)
+
     def test_dry_run_writes_nothing(self):
         self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
         before = self._raw()
@@ -4976,6 +4992,12 @@ class TestImportMode(Quiet):
         self.assertEqual(self._import(dry_run=True), 0)
         self.assertEqual(self._raw(), before)
         self.assertEqual(self.applied, [])
+
+    def test_dry_run_with_diff_shows_the_line_diff(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(dry_run=True, diff=True), 0)
+        self.assertIn("+b.example\tIntel::DOMAIN\tMISP\td\t-", self.printed)
 
     def test_backs_up_the_live_file_before_writing(self):
         self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])

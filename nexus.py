@@ -4211,7 +4211,8 @@ def build_parser():
     mode.add_argument("--import", dest="import_file", metavar="PATH",
                       default=None,
                       help="merge an intel.dat built on another host into "
-                           "this manager's file, append-only")
+                           "this manager's file, append-only; with --yes, "
+                           "also applies to the grid")
 
     conn = parser.add_argument_group("platform connection")
     conn.add_argument("--source", choices=SOURCES, default=None,
@@ -4250,9 +4251,10 @@ def build_parser():
                           "Security Onion checks and the apply step. Asked "
                           "if omitted.")
     run.add_argument("--yes", action="store_true",
-                     help="never prompt; requires --profile and a token from "
-                          "--token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
-                          "credentials.json")
+                     help="never prompt; a build requires --profile and a "
+                          "token from --token-file, NEXUS_TOKEN/"
+                          "NEXUS_MISP_TOKEN or credentials.json (--import "
+                          "needs neither)")
     run.add_argument("--dry-run", action="store_true",
                      help="build and compare, write nothing")
     run.add_argument("--diff", action="store_true",
@@ -4704,6 +4706,10 @@ def cmd_import(args):
 
     if args.dry_run:
         print("\nDry run -- nothing written to %s" % path)
+        if args.diff:
+            diff = unified_intel_diff(existing, lines, path)
+            print("")
+            print("\n".join(diff) if diff else "(no line-level changes)")
         return 0
 
     saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
