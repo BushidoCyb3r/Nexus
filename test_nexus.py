@@ -1048,7 +1048,15 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
         if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
             status, payload = 404, {"title": "not found"}
         elif "/collections/" in parsed.path and parsed.path.endswith("/objects/"):
-            if self.server.taxii_version == "2.0":
+            if self.server.objects_index >= self.server.max_pages:
+                # Insurance, not protocol.  The replays below are endless by
+                # design, so a client that lost a termination guard would hang
+                # the suite instead of failing a test -- and there is no CI
+                # here, so a hang reads as a stuck terminal.  This closing page
+                # ends the pull for either version (2.1: more false; 2.0: no
+                # Content-Range) and leaves a request-count assertion to fail.
+                status, payload = 200, {"objects": [], "more": False}
+            elif self.server.taxii_version == "2.0":
                 # 2.0 has no envelope: a STIX bundle plus a Content-Range
                 # header.  Kept a separate branch from 2.1 so neither
                 # version's pagination shape can quietly change the other's.
@@ -1070,8 +1078,17 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
                 # catch. Only the client's own guard (or a scripted page's own
                 # more: False) may stop the pull.
                 pages = self.server.pages
-                status, payload = 200, pages[min(self.server.objects_index,
-                                                 len(pages) - 1)]
+                index = self.server.objects_index
+                status = 200
+                if index < len(pages):
+                    payload = pages[index]
+                else:
+                    # Replaying: mint a fresh cursor each time, so the
+                    # repeated-cursor guard cannot end a pull that some other
+                    # guard was supposed to end.
+                    payload = dict(pages[-1])
+                    if payload.get("next"):
+                        payload["next"] = "replay-%d" % index
             self.server.objects_index += 1
         else:
             status, payload = self.server.routes.get(
@@ -1110,6 +1127,8 @@ class FakeTaxii(object):
         self.server.bundles = [({"type": "bundle", "objects": []}, None)]
         self.server.ranges = []
         self.server.objects_index = 0
+        # Ceiling on the endless replay above; see FakeTaxiiHandler.
+        self.server.max_pages = 50
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
         self.thread.start()
@@ -1315,6 +1334,34 @@ class TestTaxii21Fetch(unittest.TestCase):
         got = list(self.client.fetch_objects(
             {"id": "c1", "api_root": "/api1/"}))
         self.assertEqual(len(got), 2)
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_an_empty_page_stops_the_loop(self):
+        # `objects: [], more: True` with a fresh cursor every time satisfies
+        # both the missing-cursor and the repeated-cursor guard for ever --
+        # 828,493 requests in three seconds, with an indicator cap set, which
+        # never fires because no record is ever yielded to count.  Nothing but
+        # "the page was empty" can end this pull; _fetch_objects_20 has
+        # carried the same guard all along.
+        self.server.server.pages = [{"objects": [], "more": True,
+                                     "next": "n1"}]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual(got, [])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_a_final_page_with_a_fresh_cursor_stops_on_more(self):
+        # The `more` check was untestable while the fake replayed its last
+        # page verbatim: the repeated-cursor guard stopped the pull either
+        # way.  A distinct cursor on the closing page leaves `more: False` as
+        # the only thing that can end it.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True, "next": "n1"},
+            {"objects": [{"id": "b"}], "more": False, "next": "n2"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual([o["id"] for o in got], ["a", "b"])
         self.assertEqual(len(self.server.requests), 2)
 
     def test_a_missing_cursor_stops_the_loop(self):

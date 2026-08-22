@@ -1166,6 +1166,11 @@ class TaxiiClient(_HttpTransport):
                 sent += 1
                 if max_results is not None and sent >= max_results:
                     return
+            if not objects:
+                # `more: True` with a fresh cursor every page satisfies both
+                # guards below for ever, and no record is yielded for a cap to
+                # count.  _fetch_objects_20 carries the same guard.
+                return
             if not (body or {}).get("more"):
                 return
             cursor = (body or {}).get("next")

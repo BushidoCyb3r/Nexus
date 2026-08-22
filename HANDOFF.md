@@ -464,16 +464,23 @@ in the spec. None block what has already shipped, and each is a contained fix.
    explicit output path), and diff it by hand before it goes near a manager.
 
 **Accepted risk: an uncooperative TAXII 2.1 server could pull forever.** If a server
-issues a fresh cursor on every page and never sets `more: false`, `fetch_objects`'s
-single-cursor-repeat guard never fires, and the pull continues until `max_indicators`
-stops it — unbounded by default. TAXII 2.1 carries no `total` to pin the way the 2.0 path
-pins `first_total` (§3), and `more: false` is the protocol's own termination signal, so
-the only additional honest protection would be a page cap. It was deliberately not added:
-this project has already removed dead parameters for being unused, and the `max_pages`
-argument that exists on both `search_attributes` and `search_indicators` is exercised only
-by tests today, never by a real caller. If an operator hits this in practice,
-`max_indicators` is the immediate mitigation; a real page cap is the fix, added then
-rather than speculatively now.
+issues a fresh cursor on every page, keeps setting `more: true`, and keeps returning
+*non-empty* pages, `fetch_objects`'s single-cursor-repeat guard never fires and the pull
+continues until `max_indicators` stops it — unbounded by default. TAXII 2.1 carries no
+`total` to pin the way the 2.0 path pins `first_total` (§3), and `more: false` is the
+protocol's own termination signal, so the only additional honest protection would be a
+page cap. It was deliberately not added: this project has already removed dead parameters
+for being unused, and the `max_pages` argument that exists on both `search_attributes`
+and `search_indicators` is exercised only by tests today, never by a real caller. If an
+operator hits this in practice, `max_indicators` is the immediate mitigation; a real page
+cap is the fix, added then rather than speculatively now.
+
+The *empty*-page variant of that shape is not an accepted risk and is now guarded. A
+server answering `{"objects": [], "more": true, "next": "<fresh cursor>"}` yields no
+record, so `max_indicators` — which counts records — is never consulted and cannot bound
+anything (measured: 828,493 requests in three seconds with a cap of five set). `if not
+objects: return` in the 2.1 loop ends it on the first empty page, exactly as
+`_fetch_objects_20` has always done.
 
 ### Explicitly out of scope (`PLAN.md` §14)
 
