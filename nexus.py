@@ -3424,6 +3424,39 @@ def _stage3_iocs(config, discovery, input_fn, source="misp"):
     return config
 
 
+def _stage3_collections_taxii(config, discovery, input_fn):
+    """Stage 3 for TAXII: which collections to pull from.
+
+    Stands in for `_stage3_iocs` -- `match[type]=indicator` already narrows
+    every collection to indicators on the wire, so there is no local type
+    menu to offer; the only server-reachable choice left at this point is
+    which collection(s) to query.  Reuses ask_multi the way every *working*
+    caller in this file does it -- (value, single annotation) pairs -- and
+    then maps the chosen ids back to the full collection dicts, the same
+    two-step `_stage_feeds` uses.  `_stage_feeds` itself builds 3-tuple
+    options; `_opt_parts` only unpacks a 2-tuple, so a 3-tuple's value comes
+    back as the tuple's own repr and the id lookup below can never match --
+    that is a pre-existing, pre-dates-this-branch bug in `_stage_feeds`
+    (confirmed no test exercises its selection path), not a pattern worth
+    reproducing here.
+    """
+    _stage(3, "Collections")
+    collections = discovery.get("collections") or []
+    if not collections:
+        print("  no collections were discovered; check TAXII discovery and "
+              "API-root access")
+        config["collections"] = []
+        return config
+
+    options = [(c["id"], "%s (%s)" % (c["title"], c.get("api_root") or "?"))
+              for c in collections]
+    chosen = ask_multi("Collections to pull from", options,
+                       [c["id"] for c in collections], input_fn)
+    by_id = dict((c["id"], c) for c in collections)
+    config["collections"] = [by_id[cid] for cid in chosen if cid in by_id]
+    return config
+
+
 def _stage4_quality(config, input_fn):
     _stage(4, "Quality filters")
     config["to_ids"] = ask_yes_no(
@@ -3557,6 +3590,54 @@ def _stage5_scope_opencti(config, discovery, input_fn):
         config["date_to"] = ask_date("To (YYYY-MM-DD)", None, input_fn)
     config["timestamp_field"] = ask_choice(
         "Timestamp field", ["created_at", "valid_from"], "created_at", input_fn)
+    return config
+
+
+def _stage5_scope_taxii(config, discovery, input_fn):
+    """Stage 5 for TAXII: the one filter the server can act on (time, as
+    added_after) and the six it cannot.
+
+    TAXII's query syntax only reaches `match[type]` (fixed to `indicator`,
+    stage 3 picks the collection instead) and `added_after`.  Labels,
+    markings, confidence, validity and author all live inside the STIX
+    object, so every one of them is filtered locally, after the object has
+    already been downloaded.  Telling the operator otherwise would make them
+    believe a filter is cutting transfer volume when it is doing nothing of
+    the kind -- so every question below the time window says plainly that it
+    is applied after download.
+    """
+    _stage(5, "Scope")
+    print("  Days back is the one answer in this stage TAXII narrows itself "
+          "(sent as added_after).  Every other answer here is applied AFTER "
+          "DOWNLOAD -- it thins what Nexus keeps, not what it fetches.")
+
+    config["days"] = ask_int(
+        "Days back, sent to the server as added_after (0 = no time filter)",
+        DEFAULT_DAYS, 0, None, input_fn)
+
+    if config.get("taxii_version") == "2.0":
+        print("  This is a TAXII 2.0 feed: STIX 2.0 indicators carry no "
+              "confidence property at all, so the minimum-confidence answer "
+              "below will not exclude anything on this feed.")
+
+    config["include_labels"] = ask_list(
+        "Include labels, applied after download (none = all)", "none",
+        input_fn=input_fn)
+    config["exclude_labels"] = ask_list(
+        "Exclude labels, applied after download (none = none)", "none",
+        input_fn=input_fn)
+    config["include_markings"] = ask_list(
+        "Include marking-definition refs, applied after download "
+        "(none = all)", "none", input_fn=input_fn)
+    config["include_authors"] = ask_list(
+        "Include created_by_ref authors, applied after download "
+        "(none = all)", "none", input_fn=input_fn)
+    config["min_confidence"] = ask_int(
+        "Minimum confidence, applied after download (0 = no filter)",
+        0, 0, 100, input_fn)
+    config["drop_expired"] = ask_yes_no(
+        "Drop indicators past valid_until? (checked after download)",
+        True, input_fn)
     return config
 
 
@@ -3721,13 +3802,20 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
     config["discovery"] = discovery
 
     _stage_feeds(config, discovery, input_fn, source=config["source"])
-    _stage3_iocs(config, discovery, input_fn, source=config["source"])
-    if config["source"] == "opencti":
-        _stage4_quality_opencti(config, input_fn)
-        _stage5_scope_opencti(config, discovery, input_fn)
+    if config["source"] == "taxii":
+        # TAXII has no local IOC-type menu (stage 3 asks collections
+        # instead, above) and no separate quality stage -- everything that
+        # would live there is one of the post-download filters stage 5 asks.
+        _stage3_collections_taxii(config, discovery, input_fn)
+        _stage5_scope_taxii(config, discovery, input_fn)
     else:
-        _stage4_quality(config, input_fn)
-        _stage5_scope(config, discovery, input_fn)
+        _stage3_iocs(config, discovery, input_fn, source=config["source"])
+        if config["source"] == "opencti":
+            _stage4_quality_opencti(config, input_fn)
+            _stage5_scope_opencti(config, discovery, input_fn)
+        else:
+            _stage4_quality(config, input_fn)
+            _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
     _stage7_metadata(config, input_fn, offline=offline)
     _stage8_output(config, input_fn, offline=offline)

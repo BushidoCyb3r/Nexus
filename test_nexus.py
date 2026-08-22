@@ -2969,6 +2969,125 @@ class TestDiscoverTaxii(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# STAGE 3 -- TAXII collection selection
+# ---------------------------------------------------------------------------
+
+class TestTaxiiCollectionsStage(Quiet):
+
+    def discovery(self):
+        return {"collections": [
+            {"id": "c1", "title": "Feed One", "api_root": "/api1/"},
+            {"id": "c2", "title": "Feed Two", "api_root": "/api2/"},
+        ]}
+
+    def test_defaults_to_every_collection(self):
+        config = {}
+        nexus._stage3_collections_taxii(config, self.discovery(),
+                                        scripted([""]))
+        self.assertEqual([c["id"] for c in config["collections"]],
+                         ["c1", "c2"])
+
+    def test_a_narrower_answer_is_honoured(self):
+        # "1" -> Feed One only.  Enter (the default) would pick both, so
+        # scripting "all" here could not distinguish "asked and honoured"
+        # from "never asked, defaulted to all" -- pick the subset instead.
+        config = {}
+        nexus._stage3_collections_taxii(config, self.discovery(),
+                                        scripted(["1"]))
+        self.assertEqual([c["id"] for c in config["collections"]], ["c1"])
+
+    def test_no_collections_discovered_is_handled_not_crashed(self):
+        config = {}
+        nexus._stage3_collections_taxii(config, {"collections": []},
+                                        scripted([]))
+        self.assertEqual(config["collections"], [])
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 -- TAXII scope: the post-download filters
+# ---------------------------------------------------------------------------
+
+class TestTaxiiScopeStage(Quiet):
+    """`_stage5_scope_taxii` prints with plain print(), the same as every
+    other interview stage in this file -- there is no printer= seam
+    anywhere else in the interview, so this task does not introduce one.
+    Quiet/self.printed (redirect_stdout) is how every other stage's wording
+    is asserted; these tests follow that, not the brief's printer=
+    suggestion."""
+
+    def test_the_wording_says_the_filters_are_applied_after_download(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertIn("after download", self.printed.lower())
+
+    def test_a_20_feed_is_warned_about_confidence(self):
+        config = {"source": "taxii", "taxii_version": "2.0"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        text = self.printed.lower()
+        self.assertIn("confidence", text)
+        self.assertIn("2.0", text)
+
+    def test_a_21_feed_is_not_warned_about_confidence(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertNotIn("2.0", self.printed)
+
+    def test_answers_are_honoured_not_defaulted(self):
+        # Every default in this stage is 0, "none" or True -- each scripted
+        # answer below differs from its default, so this can only pass if
+        # the answer was actually read.
+        fake = by_prompt([
+            ("Days back", "14"),
+            ("Include labels", "phishing,apt"),
+            ("Exclude labels", "benign"),
+            ("Include marking-definition refs", "marking-definition--m1"),
+            ("Include created_by_ref authors", "identity--a1"),
+            ("Minimum confidence", "75"),
+            ("Drop indicators past valid_until", "n"),
+        ])
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, fake)
+        self.assertEqual(config["days"], 14)
+        self.assertEqual(config["include_labels"], ["phishing", "apt"])
+        self.assertEqual(config["exclude_labels"], ["benign"])
+        self.assertEqual(config["include_markings"],
+                         ["marking-definition--m1"])
+        self.assertEqual(config["include_authors"], ["identity--a1"])
+        self.assertEqual(config["min_confidence"], 75)
+        self.assertIs(config["drop_expired"], False)
+
+    def test_defaults_when_the_operator_answers_nothing(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertEqual(config["days"], nexus.DEFAULT_DAYS)
+        self.assertEqual(config["include_labels"], [])
+        self.assertEqual(config["exclude_labels"], [])
+        self.assertEqual(config["include_markings"], [])
+        self.assertEqual(config["include_authors"], [])
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["drop_expired"], True)
+
+
+class TestTaxiiInterviewRouting(Quiet):
+    """run_interview must route a TAXII source through the new stages, not
+    fall through to the MISP-shaped ones -- if the dispatch in run_interview
+    regressed to unconditionally calling _stage3_iocs/_stage4_quality, this
+    would fail because config would carry ioc_classes/to_ids instead of
+    collections."""
+
+    def test_run_interview_routes_taxii_through_the_new_stages(self):
+        fake = scripted(["taxii.example"], fill="")
+        config = nexus.run_interview(
+            None, input_fn=fake, getpass_fn=lambda prompt: "tok",
+            source="taxii", offline=True)
+        self.assertEqual(config["collections"], [])
+        self.assertNotIn("ioc_classes", config)
+        self.assertNotIn("to_ids", config)
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["drop_expired"], True)
+
+
+# ---------------------------------------------------------------------------
 # STAGES 2, 2b, 3 -- OpenCTI discovery, feeds and IOC types
 # ---------------------------------------------------------------------------
 
