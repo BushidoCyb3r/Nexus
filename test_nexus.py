@@ -2901,6 +2901,68 @@ class TestOpenctiStage1(Quiet):
         self.assertEqual(config["source"], "opencti")
 
 
+class TestTaxiiStage1(Quiet):
+    """Real prompt order (client=None, verified by hand): address, scheme,
+    port, verify TLS, proxy, TAXII version, auth type, [username if basic],
+    secret (getpass), timeout, retries."""
+
+    def test_basic_auth_collects_both_secrets(self):
+        fake = scripted(["taxii.test", "1", "443", "y", "none",
+                         "1", "2", "alice", "30", "3"])
+        config = {}
+        nexus._stage1_connection(
+            config, None, fake, lambda _p: "s3cret", source="taxii")
+        self.assertEqual(config["taxii_auth"], "basic")
+        self.assertEqual(config["taxii_username"], "alice")
+        self.assertEqual(config["token"], "s3cret")
+
+    def test_bearer_auth_asks_no_username(self):
+        fake = scripted(["taxii.test", "1", "443", "y", "none",
+                         "1", "1", "30", "3"])
+        config = {}
+        nexus._stage1_connection(
+            config, None, fake, lambda _p: "s3cret", source="taxii")
+        self.assertEqual(config["taxii_auth"], "bearer")
+        self.assertIsNone(config["taxii_username"])
+        self.assertEqual(config["token"], "s3cret")
+
+    def test_neither_secret_is_persisted(self):
+        # A Basic username is half a credential -- it must be excluded from
+        # a saved profile exactly like the password/token it is paired with.
+        # Checked against the raw file text, not the reloaded dict, so a
+        # future refactor that changes save_profile's read-back path cannot
+        # hide a leak.
+        config = {"token": "pw", "taxii_username": "alice",
+                  "source": "taxii"}
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "p.json")
+        nexus.save_profile(config, path)
+        raw = open(path).read()
+        self.assertNotIn("pw", raw)
+        self.assertNotIn("alice", raw)
+
+
+class TestDiscoverTaxii(unittest.TestCase):
+
+    def test_no_client_is_empty_not_a_crash(self):
+        self.assertEqual(nexus.discover_taxii(None), {"collections": []})
+
+    def test_forwards_get_collections(self):
+        class Stub(object):
+            def get_collections(self):
+                return [{"id": "c1", "title": "Feed", "api_root": "/api1/"}]
+        found = nexus.discover_taxii(Stub())
+        self.assertEqual(found["collections"][0]["id"], "c1")
+
+    def test_a_source_error_is_swallowed_not_raised(self):
+        class Stub(object):
+            def get_collections(self):
+                raise nexus.SourceError("down")
+        found = nexus.discover_taxii(Stub())
+        self.assertEqual(found["collections"], [])
+
+
 # ---------------------------------------------------------------------------
 # STAGES 2, 2b, 3 -- OpenCTI discovery, feeds and IOC types
 # ---------------------------------------------------------------------------

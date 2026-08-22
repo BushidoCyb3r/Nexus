@@ -65,9 +65,11 @@ SO_ZEEK_POLICY_DIRS = (
 NEXUS_HOME = "/opt/nexus"
 
 PROFILE_VERSION = 2
-# Never persisted.  The token is a secret; `discovery` is a cache of live MISP
-# lists that would be stale the moment it is written.
-PROFILE_EXCLUDED_KEYS = ("token", "discovery", "_stats")
+# Never persisted.  `token` and `taxii_username` are secrets -- a Basic
+# username is half a credential and is excluded exactly like the password it
+# is paired with; `discovery` is a cache of live MISP lists that would be
+# stale the moment it is written.
+PROFILE_EXCLUDED_KEYS = ("token", "taxii_username", "discovery", "_stats")
 # v1 predates OpenCTI support and named everything after MISP.
 PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
                       "misp_base_url": "source_base_url"}
@@ -3182,6 +3184,18 @@ def discover_opencti(client, probe_limit=None):
     return found
 
 
+def discover_taxii(client):
+    """Collections the credentials can actually see."""
+    found = {"collections": []}
+    if client is None:
+        return found
+    try:
+        found["collections"] = client.get_collections()
+    except SourceError as exc:
+        log.warning("TAXII discovery failed: %s", exc)
+    return found
+
+
 # -- stages -----------------------------------------------------------------
 
 def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
@@ -3231,11 +3245,52 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
     proxy = ask("HTTP proxy URL", "none", input_fn)
     config["proxy"] = None if proxy.strip().lower() in NONE_WORDS else proxy
 
-    # An existing client already holds a working token; re-prompting for it
-    # would only be a chance to fat-finger it.
-    config["token"] = (client.token if client is not None
-                       else ask_token("%s API token" % label,
-                                      getpass_fn=getpass_fn))
+    if source == "taxii":
+        # TAXII carries its own protocol version and can authenticate two
+        # ways, so secret collection branches instead of the single token
+        # below.  The version question is always asked -- the standing
+        # no-implicit-default rule -- a reachable client only supplies the
+        # default via detect_version().
+        default_version = TAXII_VERSIONS[0]
+        if client is not None:
+            try:
+                default_version = client.detect_version()
+            except SourceError as exc:
+                log.warning("could not detect the TAXII version: %s", exc)
+        config["taxii_version"] = ask_choice(
+            "TAXII version", list(TAXII_VERSIONS), default_version, input_fn)
+
+        auth_default = ("basic" if client is not None and client.username
+                        else "bearer")
+        config["taxii_auth"] = ask_choice(
+            "Authentication",
+            [("bearer", "Bearer token"),
+             ("basic", "Basic (username + password)")],
+            auth_default, input_fn)
+
+        if config["taxii_auth"] == "basic":
+            # A Basic username is not secret to *type* -- it goes out in the
+            # clear on every request -- but it is secret to *store*: paired
+            # with the password it is half a credential, so ask_required
+            # (echoed) collects it while getpass_fn (silent) collects the
+            # password.  Both are excluded from saved profiles regardless.
+            config["taxii_username"] = (
+                client.username if client is not None
+                else ask_required("Username", None, input_fn))
+            config["token"] = (client.token if client is not None
+                               else ask_token("%s password" % label,
+                                              getpass_fn=getpass_fn))
+        else:
+            config["taxii_username"] = None
+            config["token"] = (client.token if client is not None
+                               else ask_token("%s API token" % label,
+                                              getpass_fn=getpass_fn))
+    else:
+        # An existing client already holds a working token; re-prompting for
+        # it would only be a chance to fat-finger it.
+        config["token"] = (client.token if client is not None
+                           else ask_token("%s API token" % label,
+                                          getpass_fn=getpass_fn))
 
     config["timeout"] = ask_int(
         "Request timeout (seconds)",
@@ -3649,6 +3704,12 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
             print("  %d labels, %d markings, %d organisations"
                   % (len(discovery["labels"]), len(discovery["markings"]),
                      len(discovery["orgs"])))
+    elif config["source"] == "taxii":
+        discovery = discover_taxii(client)
+        if client is None:
+            print("  skipped -- no TAXII connection, no collections to offer")
+        else:
+            print("  %d collections" % len(discovery["collections"]))
     else:
         discovery = discover(client)
         if client is None:
