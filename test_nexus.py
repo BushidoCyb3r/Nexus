@@ -5324,6 +5324,43 @@ class TestTaxiiProbe(unittest.TestCase):
         self.assertEqual(nexus._cmd_probe_taxii(client, None), 1)
         self.assertIn("none readable", self.buffer.getvalue())
 
+    def test_probe_says_its_counts_are_pre_filter(self):
+        # TAXII has no way to count a filtered subset -- the label,
+        # marking, confidence, validity and author filters all run after
+        # download. A probe count that didn't say so would read as "what
+        # you'll get", which it is not.
+        token = os.path.join(tempfile.mkdtemp(), "token")
+        with io.open(token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        args = nexus.build_parser().parse_args(
+            ["--probe", "--source", "taxii", "--host", "127.0.0.1",
+             "--scheme", "http", "--port", str(self.server.port),
+             "--insecure", "--retries", "1", "--token-file", token])
+        self.assertEqual(nexus.cmd_probe(args), 0)
+        printed = self.buffer.getvalue().lower()
+        self.assertIn("before the post-download filters", printed)
+
+    def test_probe_reports_the_real_object_count_per_collection(self):
+        # A probe that printed a constant, or the collection count instead
+        # of the object count, would still satisfy the wording test above --
+        # this catches that.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T", "api_roots": ["/api1/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Feed One"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--%d" % n,
+             "pattern": "[domain-name:value = 'x%d.example']" % n,
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}
+            for n in range(3)]}]
+        client = self.server.client()
+        args = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, args), 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("Feed One", printed)
+        self.assertRegex(printed, r"Feed One\s+3\s")
+
 
 class TestTaxiiExplain(unittest.TestCase):
     """--explain on a TAXII profile must not print a MISP restSearch body."""

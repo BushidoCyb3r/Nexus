@@ -4739,15 +4739,36 @@ def _cmd_probe_taxii(client, args):
     print("  title         : %s" % version.get("title", "unknown"))
 
     print("\nCollections (%d)" % len(collections))
-    for collection in collections:
-        print("  %-40s %s" % ((collection["title"] or "")[:40],
-                              collection["api_root"]))
     if not collections:
         print("  none readable -- check the API root permissions for this "
               "account")
         return 1
-    print("\nOnly match[type]=indicator and added_after are filtered on the "
-          "server;\neverything else Nexus asks for is applied after download.")
+
+    # TAXII has no way to count a filtered subset -- match[type]=indicator
+    # and added_after are the only filters the server understands, so a
+    # collection's object count is "everything in it", not "what Nexus will
+    # keep". Bounded by --probe-limit for the same reason MISP/OpenCTI's
+    # counts are: an unbounded pull here would make --probe itself a slow,
+    # unbounded download.
+    probe_limit = args.probe_limit if args and args.probe_limit else 5000
+    print("  %-40s %9s  %s" % ("title", "objects", "api root"))
+    for collection in collections:
+        try:
+            count = 0
+            for _ in client.fetch_objects(collection, max_results=probe_limit):
+                count += 1
+        except SourceError as exc:
+            print("  %-40s %9s  %s" % ((collection["title"] or "")[:40],
+                                       "ERR", exc))
+            continue
+        marker = "" if count < probe_limit else "+"
+        print("  %-40s %8d%s  %s" % ((collection["title"] or "")[:40],
+                                     count, marker, collection["api_root"]))
+
+    print("\nThese are object counts in each collection, before the "
+          "post-download filters: TAXII can filter on type and added_after "
+          "only, so labels, markings, confidence, validity and authors are "
+          "all applied after download, on objects already fetched.")
     return 0
 
 
