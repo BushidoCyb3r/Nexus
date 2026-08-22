@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import nexus
@@ -356,7 +357,7 @@ class TestBuild(unittest.TestCase):
             exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {category}",
-            misp_base_url="https://misp.example",
+            base_url="https://misp.example",
         )
         params.update(kwargs)
         return nexus.build_indicators(sample_records(), **params)
@@ -380,14 +381,17 @@ class TestBuild(unittest.TestCase):
     def test_report_is_printable(self):
         _, stats = self.build()
         report = stats.report()
-        self.assertIn("fetched 7 attributes -> 4 indicators", report)
+        self.assertIn("fetched 7 records -> 4 indicators", report)
         self.assertIn("private_ip", report)
 
     def test_type_selection_filters_input(self):
         rows, stats = self.build(types=["ip-dst"])
         self.assertEqual([r[1] for r in rows], ["Intel::ADDR"])
-        # types the operator did not select are skipped, not tallied as unmapped
-        self.assertEqual(stats.unmapped, {})
+        # A mappable type the operator did not select is skipped in silence.
+        self.assertNotIn("domain", stats.unmapped)
+        # "ssdeep" is in no mapping table, so it is a loss whether or not it
+        # was selected, and a loss is always counted.
+        self.assertEqual(stats.unmapped, {"ssdeep": 1})
 
     def test_dedup_is_per_indicator_and_type(self):
         records = [
@@ -589,7 +593,7 @@ class TestFileIO(unittest.TestCase):
             sample_records(), exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {category}",
-            misp_base_url="https://misp.example")
+            base_url="https://misp.example")
         self.write([nexus.header_line()] + nexus.rows_to_lines(rows))
         self.assertEqual(nexus.lint_file(self.path), [])
         _, parsed = nexus.read_existing(self.path)
@@ -858,7 +862,7 @@ class TestMispClient(unittest.TestCase):
             exclusions=nexus.ExclusionSet(),
             source_fmt="MISP-event-{event_id}",
             desc_template="{event_info} | {tags}",
-            misp_base_url="https://misp.example")
+            base_url="https://misp.example")
         lines = nexus.rows_to_lines(rows)
         self.assertEqual(stats.emitted, 2)
         self.assertEqual(
@@ -866,6 +870,263 @@ class TestMispClient(unittest.TestCase):
             "45.33.32.7\tIntel::ADDR\tMISP-event-1\tEvent 1 | tlp:amber"
             "\thttps://misp.example/events/view/1")
         self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
+
+
+# ---------------------------------------------------------------------------
+# OPENCTI CLIENT (against a local fake)
+# ---------------------------------------------------------------------------
+
+class FakeOpenctiHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        self.server.requests.append({
+            "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "body": json.loads(raw.decode("utf-8")) if raw else {},
+        })
+        if self.server.script:
+            status, payload = self.server.script.pop(0)
+        else:
+            status, payload = 200, {"data": {}}
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class FakeOpencti(object):
+    """A local GraphQL endpoint replaying a scripted list of responses."""
+
+    def __init__(self, script=None):
+        self.server = HTTPServer(("127.0.0.1", 0), FakeOpenctiHandler)
+        self.server.script = list(script or [])
+        self.server.requests = []
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    @property
+    def requests(self):
+        return self.server.requests
+
+    def client(self, **kwargs):
+        return nexus.OpenctiClient("127.0.0.1", "tok", scheme="http",
+                                   port=self.port, retries=1, **kwargs)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestOpenctiClient(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def test_bearer_token_and_graphql_path(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"about": {"version": "6.4.1"}}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_version(), {"version": "6.4.1"})
+        request = self.cti.requests[0]
+        self.assertEqual(request["path"], "/graphql")
+        self.assertEqual(request["auth"], "Bearer tok")
+        self.assertIn("query", request["body"])
+
+    def test_errors_in_a_200_body_raise(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "Something went wrong"}], "data": None})])
+        client = self.cti.client()
+        with self.assertRaises(nexus.SourceError) as ctx:
+            client.get_version()
+        # Must be the base type, not the auth subtype -- a generic failure
+        # should never be reported to the operator as a rejected token.
+        self.assertIs(type(ctx.exception), nexus.SourceError)
+
+    def test_non_auth_message_does_not_raise_auth_error(self):
+        # "Author" contains "auth"; a validation error naming a field must not
+        # be misread as a rejected API token and sent the operator to rotate
+        # credentials over an unrelated GraphQL input error.
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "Author field is required"}], "data": None})])
+        client = self.cti.client()
+        with self.assertRaises(nexus.SourceError) as ctx:
+            client.get_version()
+        self.assertIs(type(ctx.exception), nexus.SourceError)
+
+    def test_auth_message_in_a_200_body_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "You must be logged in to do this."}],
+                   "data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_not_authenticated_phrasing_raises_auth_error(self):
+        # The common OpenCTI wording; "authentication"/"authenticate" alone
+        # missed it and the operator got a generic error instead of "rotate
+        # your token".
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "User is not authenticated"}],
+                   "data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_auth_extension_code_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[
+            (200, {"errors": [{"message": "nope",
+                               "extensions": {"code": "FORBIDDEN_ACCESS"}}]})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_null_data_without_errors_raises(self):
+        self.cti = FakeOpencti(script=[(200, {"data": None})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceError, client.get_version)
+
+    def test_http_401_still_raises_auth_error(self):
+        self.cti = FakeOpencti(script=[(401, {"errors": []})])
+        client = self.cti.client()
+        self.assertRaises(nexus.SourceAuthError, client.get_version)
+
+    def test_variables_are_sent(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"x": 1}})])
+        client = self.cti.client()
+        client._graphql("query Q($a: Int) { x }", {"a": 3})
+        self.assertEqual(self.cti.requests[0]["body"]["variables"], {"a": 3})
+
+
+class TestOpenctiDiscovery(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def conn(self, nodes, **page_info):
+        info = {"endCursor": None, "hasNextPage": False}
+        info.update(page_info)
+        return {"pageInfo": info,
+                "edges": [{"node": n} for n in nodes]}
+
+    def test_labels_flatten_from_edges(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"labels": self.conn(
+            [{"id": "l1", "value": "malware"}, {"id": "l2", "value": "apt"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_labels(),
+                         [{"id": "l1", "value": "malware"},
+                          {"id": "l2", "value": "apt"}])
+
+    def test_markings_flatten(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"markingDefinitions": self.conn(
+            [{"id": "m1", "definition": "TLP:AMBER", "definition_type": "TLP"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_markings(),
+                         [{"id": "m1", "definition": "TLP:AMBER",
+                           "definition_type": "TLP"}])
+
+    def test_organizations_flatten(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"organizations": self.conn(
+            [{"id": "o1", "name": "CIRCL"}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_organizations(), [{"id": "o1", "name": "CIRCL"}])
+
+    def test_nodes_without_a_name_are_dropped(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"labels": self.conn(
+            [{"id": "l1", "value": "malware"}, {"id": "l2", "value": ""}])}})])
+        client = self.cti.client()
+        self.assertEqual(client.get_labels(), [{"id": "l1", "value": "malware"}])
+
+    def test_count_type_uses_global_count_and_is_exact(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 4231, "endCursor": None,
+                         "hasNextPage": False},
+            "edges": []}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("IPv4-Addr"), (4231, True))
+
+    def test_count_type_sends_the_type_filter(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 1, "endCursor": None,
+                         "hasNextPage": False}, "edges": []}}})])
+        client = self.cti.client()
+        client.count_type("Domain-Name")
+        sent = self.cti.requests[0]["body"]["variables"]["filters"]
+        keys = [f["key"] for f in sent["filters"]]
+        self.assertIn(["x_opencti_main_observable_type"], keys)
+        values = [f["values"] for f in sent["filters"]
+                  if f["key"] == ["x_opencti_main_observable_type"]][0]
+        self.assertEqual(values, ["Domain-Name"])
+
+    def test_count_type_merges_base_filters(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": 1, "endCursor": None,
+                         "hasNextPage": False}, "edges": []}}})])
+        client = self.cti.client()
+        base = {"mode": "and",
+                "filters": [{"key": ["revoked"], "values": ["false"],
+                             "operator": "eq", "mode": "or"}],
+                "filterGroups": []}
+        client.count_type("Url", base)
+        sent = self.cti.requests[0]["body"]["variables"]["filters"]
+        keys = [f["key"] for f in sent["filters"]]
+        self.assertIn(["revoked"], keys)
+        self.assertIn(["x_opencti_main_observable_type"], keys)
+
+    def test_count_type_falls_back_to_edge_length(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": True},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, False))
+
+    def test_count_type_no_global_count_closed_page_one_edge_is_exact(self):
+        # first: 1 means a closed page (hasNextPage=False) already saw the
+        # whole result set, so this is exact even without globalCount.
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, True))
+
+    def test_count_type_no_global_count_closed_page_zero_edges_is_exact(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": []}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (0, True))
+
+    def test_count_type_unparseable_global_count_falls_back(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": "many", "endCursor": None,
+                         "hasNextPage": False},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, True))
+
+    def test_count_type_null_global_count_falls_back(self):
+        self.cti = FakeOpencti(script=[(200, {"data": {"indicators": {
+            "pageInfo": {"globalCount": None, "endCursor": None,
+                         "hasNextPage": True},
+            "edges": [{"node": {"id": "a"}}]}}})])
+        client = self.cti.client()
+        self.assertEqual(client.count_type("Url"), (1, False))
+
+    def test_edge_nodes_tolerates_malformed_connection(self):
+        self.assertEqual(nexus._edge_nodes("not a dict"), [])
+        self.assertEqual(nexus._edge_nodes(
+            {"edges": ["not a dict", {"node": "not a dict"},
+                       {"node": {"id": "ok"}}]}),
+            [{"id": "ok"}])
 
 
 class TestFlatten(unittest.TestCase):
@@ -1649,6 +1910,136 @@ class TestBuildSearchParams(unittest.TestCase):
         self.assertEqual(config, before)
 
 
+class TestBuildOpenctiFilters(unittest.TestCase):
+
+    FIXED_NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    def keys(self, group):
+        return [f["key"][0] for f in group["filters"]]
+
+    def filter_for(self, group, key):
+        for entry in group["filters"]:
+            if entry["key"] == [key]:
+                return entry
+        return None
+
+    def test_empty_config_is_a_valid_empty_group(self):
+        out = nexus.build_opencti_filters({}, now=self.FIXED_NOW)
+        self.assertEqual(out, {"mode": "and", "filters": [], "filterGroups": []})
+
+    def test_types_become_one_or_filter(self):
+        out = nexus.build_opencti_filters(
+            {"types": ["IPv4-Addr", "Domain-Name"]}, now=self.FIXED_NOW)
+        entry = self.filter_for(out, "x_opencti_main_observable_type")
+        self.assertEqual(entry["values"], ["IPv4-Addr", "Domain-Name"])
+        self.assertEqual(entry["operator"], "eq")
+        self.assertEqual(entry["mode"], "or")
+
+    def test_min_score_uses_gte(self):
+        out = nexus.build_opencti_filters({"min_score": 60}, now=self.FIXED_NOW)
+        entry = self.filter_for(out, "x_opencti_score")
+        self.assertEqual(entry["values"], ["60"])
+        self.assertEqual(entry["operator"], "gte")
+
+    def test_zero_min_score_is_not_a_filter(self):
+        out = nexus.build_opencti_filters({"min_score": 0}, now=self.FIXED_NOW)
+        self.assertIsNone(self.filter_for(out, "x_opencti_score"))
+
+    def test_min_confidence_uses_gte(self):
+        out = nexus.build_opencti_filters({"min_confidence": 75},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "confidence")["values"], ["75"])
+
+    def test_exclude_revoked(self):
+        out = nexus.build_opencti_filters({"exclude_revoked": True},
+                                          now=self.FIXED_NOW)
+        entry = self.filter_for(out, "revoked")
+        self.assertEqual(entry["values"], ["false"])
+        self.assertEqual(entry["operator"], "eq")
+
+    def test_require_detection(self):
+        out = nexus.build_opencti_filters({"require_detection": True},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "x_opencti_detection")["values"],
+                         ["true"])
+
+    def test_exclude_expired_uses_the_injected_now(self):
+        out = nexus.build_opencti_filters({"exclude_expired": True},
+                                          now=self.FIXED_NOW)
+        entry = self.filter_for(out, "valid_until")
+        self.assertEqual(entry["values"], ["2026-08-17T12:00:00Z"])
+        self.assertEqual(entry["operator"], "gt")
+
+    def test_last_n_days_on_created_at(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "last", "days": 30, "timestamp_field": "created_at"},
+            now=self.FIXED_NOW)
+        entry = self.filter_for(out, "created_at")
+        self.assertEqual(entry["values"], ["2026-07-18T12:00:00Z"])
+        self.assertEqual(entry["operator"], "gte")
+
+    def test_last_n_days_on_valid_from(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "last", "days": 7, "timestamp_field": "valid_from"},
+            now=self.FIXED_NOW)
+        self.assertIsNotNone(self.filter_for(out, "valid_from"))
+
+    def test_explicit_range_emits_both_bounds(self):
+        out = nexus.build_opencti_filters(
+            {"time_mode": "range", "date_from": "2026-01-01",
+             "date_to": "2026-06-30", "timestamp_field": "created_at"},
+            now=self.FIXED_NOW)
+        bounds = [f for f in out["filters"] if f["key"] == ["created_at"]]
+        self.assertEqual(sorted(b["operator"] for b in bounds), ["gte", "lte"])
+
+    def test_time_mode_all_emits_no_time_filter(self):
+        out = nexus.build_opencti_filters({"time_mode": "all", "days": 30},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+
+    def test_include_labels_markings_authors(self):
+        out = nexus.build_opencti_filters(
+            {"include_label_ids": ["l1", "l2"], "marking_ids": ["m1"],
+             "author_ids": ["o1"]}, now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "objectLabel")["values"],
+                         ["l1", "l2"])
+        self.assertEqual(self.filter_for(out, "objectMarking")["values"], ["m1"])
+        self.assertEqual(self.filter_for(out, "createdBy")["values"], ["o1"])
+
+    def test_excluded_labels_go_into_a_nested_group(self):
+        out = nexus.build_opencti_filters({"exclude_label_ids": ["bad"]},
+                                          now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+        group = out["filterGroups"][0]
+        self.assertEqual(group["filters"][0]["key"], ["objectLabel"])
+        self.assertEqual(group["filters"][0]["operator"], "not_eq")
+        self.assertEqual(group["filters"][0]["values"], ["bad"])
+
+    def test_include_and_exclude_labels_coexist(self):
+        out = nexus.build_opencti_filters(
+            {"include_label_ids": ["good"], "exclude_label_ids": ["bad"]},
+            now=self.FIXED_NOW)
+        self.assertEqual(self.filter_for(out, "objectLabel")["values"], ["good"])
+        self.assertEqual(out["filterGroups"][0]["filters"][0]["values"], ["bad"])
+
+    def test_result_is_json_serialisable(self):
+        out = nexus.build_opencti_filters(
+            {"types": ["Url"], "min_score": 50, "exclude_revoked": True},
+            now=self.FIXED_NOW)
+        json.dumps(out)
+
+    def test_non_iso_date_from_is_skipped_and_warns(self):
+        # ask_date accepts MISP-style relative windows ("30d"); those are
+        # meaningless as an OpenCTI timestamp comparison, so silently passing
+        # one through would build a filter that matches nothing.
+        with self.assertLogs("nexus", level="WARNING") as cm:
+            out = nexus.build_opencti_filters(
+                {"time_mode": "range", "date_from": "30d",
+                 "timestamp_field": "created_at"}, now=self.FIXED_NOW)
+        self.assertEqual(self.keys(out), [])
+        self.assertIn("30d", cm.output[0])
+
+
 # ---------------------------------------------------------------------------
 # FULL INTERVIEW
 # ---------------------------------------------------------------------------
@@ -1656,14 +2047,17 @@ class TestBuildSearchParams(unittest.TestCase):
 class TestRunInterview(Quiet):
 
     def run_it(self, input_fn, client=None, token="scripted-token-1234"):
+        # source="misp" -- this class exercises the MISP path itself; the
+        # new source question is covered separately by TestOpenctiStage1.
         return nexus.run_interview(
-            client, input_fn=input_fn, getpass_fn=lambda prompt: token)
+            client, input_fn=input_fn, getpass_fn=lambda prompt: token,
+            source="misp")
 
     def test_all_defaults_produces_a_usable_config(self):
         fake = scripted(["misp.example"], fill="")
         config = self.run_it(fake)
 
-        self.assertEqual(config["misp_host"], "misp.example")
+        self.assertEqual(config["source_host"], "misp.example")
         self.assertEqual(config["scheme"], "https")
         self.assertEqual(config["port"], 443)
         self.assertIs(config["verify_tls"], True)
@@ -1705,7 +2099,7 @@ class TestRunInterview(Quiet):
         self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
         self.assertEqual(config["desc_template"],
                          nexus.DEFAULT_DESC_TEMPLATE)
-        self.assertEqual(config["misp_base_url"], "https://misp.example")
+        self.assertEqual(config["source_base_url"], "https://misp.example")
         self.assertIs(config["do_notice"], False)
         self.assertEqual(config["meta_maxlen"], 200)
 
@@ -1762,7 +2156,7 @@ class TestRunInterview(Quiet):
         ]
         config = self.run_it(by_prompt(rules))
 
-        self.assertEqual(config["misp_host"], "10.9.8.7")
+        self.assertEqual(config["source_host"], "10.9.8.7")
         self.assertEqual(config["scheme"], "http")
         self.assertEqual(config["port"], 8080)
         self.assertIs(config["verify_tls"], False)
@@ -1783,7 +2177,7 @@ class TestRunInterview(Quiet):
         self.assertEqual(config["own_networks"], ["10.0.0.0/8"])
         self.assertEqual(config["own_domains"], ["corp.example"])
         self.assertEqual(config["source_fmt"], "OURSOC")
-        self.assertIsNone(config["misp_base_url"])
+        self.assertIsNone(config["source_base_url"])
         self.assertIs(config["do_notice"], True)
         self.assertEqual(config["meta_maxlen"], 80)
         self.assertEqual(config["output_path"], "/tmp/intel.dat")
@@ -1818,7 +2212,7 @@ class TestRunInterview(Quiet):
     def test_non_standard_port_lands_in_the_meta_url(self):
         config = self.run_it(by_prompt([("MISP address", "a.example"),
                                         ("Port", "8443")]))
-        self.assertEqual(config["misp_base_url"], "https://a.example:8443")
+        self.assertEqual(config["source_base_url"], "https://a.example:8443")
 
     def test_declining_the_summary_aborts(self):
         with self.assertRaises(nexus.InterviewAborted):
@@ -1835,14 +2229,15 @@ class TestRunInterview(Quiet):
         with self.assertRaises(nexus.InterviewAborted):
             nexus.run_interview(None,
                                     input_fn=scripted(["a.example"], fill=""),
-                                    getpass_fn=refuse)
+                                    getpass_fn=refuse, source="misp")
 
     def test_a_connected_client_supplies_the_defaults_and_the_token(self):
         def no_token(prompt):
             raise AssertionError("must not re-prompt for a known token")
         config = nexus.run_interview(
-            StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token)
-        self.assertEqual(config["misp_host"], "misp.example")
+            StubClient(), input_fn=scripted([], fill=""), getpass_fn=no_token,
+            source="misp")
+        self.assertEqual(config["source_host"], "misp.example")
         self.assertEqual(config["port"], 8443)
         self.assertEqual(config["token"], "stub-token-1234")
         self.assertEqual((config["timeout"], config["retries"]), (45, 2))
@@ -1854,6 +2249,447 @@ class TestRunInterview(Quiet):
 
 
 # ---------------------------------------------------------------------------
+# STAGE 1 -- source selection
+# ---------------------------------------------------------------------------
+
+class TestOpenctiStage1(Quiet):
+
+    def test_source_question_is_asked_when_not_supplied(self):
+        fake = scripted(["2", "cti.local", "1", "443", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok")
+        self.assertEqual(config["source"], "opencti")
+        self.assertEqual(config["source_host"], "cti.local")
+
+    def test_source_question_is_skipped_when_supplied(self):
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        self.assertEqual(config["source"], "opencti")
+        self.assertEqual(config["source_host"], "cti.local")
+
+    def test_prompts_name_the_selected_platform(self):
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        nexus._stage1_connection({}, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        joined = " ".join(fake.state["prompts"])
+        self.assertIn("OpenCTI address", joined)
+
+    def test_http_default_port_is_4000_for_opencti(self):
+        fake = scripted(["cti.local", "2", "", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti")
+        self.assertEqual(config["port"], nexus.OPENCTI_DEFAULT_PORT_HTTP)
+
+    def test_misp_http_default_port_is_unchanged(self):
+        fake = scripted(["misp.local", "2", "", "y", "none", "30", "3"])
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="misp")
+        self.assertEqual(config["port"], 80)
+
+    def test_token_prompt_names_the_platform(self):
+        seen = {}
+
+        def getpass_fn(prompt=""):
+            seen["prompt"] = prompt
+            return "tok"
+
+        fake = scripted(["cti.local", "1", "443", "y", "none", "30", "3"])
+        nexus._stage1_connection({}, None, fake, getpass_fn, source="opencti")
+        self.assertIn("OpenCTI", seen["prompt"])
+
+    def test_flagless_run_interview_asks_and_honours_the_answer(self):
+        # The boundary that matters: main() calls run_interview(), not
+        # _stage1_connection() directly.  With no `source` argument -- the
+        # shape of a real flagless run -- it must still ask, and the answer
+        # must actually be read.  OpenCTI (not the "misp" default) proves
+        # that: a silently-defaulting implementation would fail this.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["2", "cti.local"], fill=""),
+            getpass_fn=lambda prompt: "tok")
+        self.assertEqual(config["source"], "opencti")
+
+
+# ---------------------------------------------------------------------------
+# STAGES 2, 2b, 3 -- OpenCTI discovery, feeds and IOC types
+# ---------------------------------------------------------------------------
+
+class StubOpenctiClient(object):
+    """A no-network OpenCTI client for interview tests."""
+
+    def __init__(self):
+        self.host = "cti.local"
+        self.scheme = "https"
+        self.port = 443
+        self.token = "tok"
+        self.verify_tls = True
+        self.timeout = 30
+        self.retries = 3
+
+    def get_version(self):
+        return {"version": "6.4.1"}
+
+    def get_labels(self):
+        return [{"id": "l1", "value": "phishing"},
+                {"id": "l2", "value": "apt"}]
+
+    def get_markings(self):
+        return [{"id": "m1", "definition": "TLP:AMBER",
+                 "definition_type": "TLP"}]
+
+    def get_organizations(self):
+        return [{"id": "o1", "name": "CIRCL"}]
+
+    def count_type(self, main_type, base_filters=None, probe_limit=None):
+        return ({"IPv4-Addr": 100, "Domain-Name": 50}.get(main_type, 0), True)
+
+
+class TestOpenctiInterviewStages(Quiet):
+
+    def test_discovery_returns_names_and_id_maps(self):
+        found = nexus.discover_opencti(StubOpenctiClient())
+        self.assertEqual(found["labels"], ["phishing", "apt"])
+        self.assertEqual(found["label_ids"]["phishing"], "l1")
+        self.assertEqual(found["markings"], ["TLP:AMBER"])
+        self.assertEqual(found["marking_ids"]["TLP:AMBER"], "m1")
+        self.assertEqual(found["orgs"], ["CIRCL"])
+        self.assertEqual(found["org_ids"]["CIRCL"], "o1")
+        self.assertEqual(found["counts"]["IPv4-Addr"], (100, True))
+
+    def test_discovery_with_no_client_is_empty_not_a_crash(self):
+        found = nexus.discover_opencti(None)
+        self.assertEqual(found["labels"], [])
+        self.assertEqual(found["counts"], {})
+
+    def test_feed_stage_prints_a_skip_line_for_opencti(self):
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            nexus._stage_feeds(config, {}, scripted([]), source="opencti")
+        self.assertIn("Not applicable to OpenCTI", out.getvalue())
+        self.assertEqual(config["feeds"], [])
+
+    def test_ioc_stage_offers_opencti_classes(self):
+        discovery = {"counts": {"IPv4-Addr": (100, True)},
+                     "types": ["IPv4-Addr", "Domain-Name"]}
+        # "1" -> network class only, "all" -> every discovered network type;
+        # everything after that (composite/hostname/subnet) is MISP-shaped
+        # boilerplate this test does not care about, so fill="" takes the
+        # default for the rest of the (unbranched) tail of the stage.
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertIn("IPv4-Addr", out.getvalue())
+        self.assertTrue(set(config["types"]) <= {
+            "IPv4-Addr", "IPv6-Addr", "Domain-Name", "Hostname", "Url"})
+
+    def test_ioc_stage_still_offers_misp_classes_by_default(self):
+        discovery = {"counts": {}, "types": []}
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake)
+        self.assertIn("ip-dst", config["types"])
+
+    def test_opencti_hostname_answer_drops_the_capitalised_type(self):
+        # OpenCTI's type literal is "Hostname" (capital H), not MISP's
+        # "hostname" -- answering "no" here must actually remove it, or an
+        # OpenCTI operator declining hostname-as-domain silently keeps them.
+        discovery = {"counts": {}, "types": ["Hostname", "Domain-Name"]}
+        fake = by_prompt([("Network -", "all"), ("Treat hostname", "n")])
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertNotIn("Hostname", config["types"])
+
+    def test_opencti_skips_the_composite_question_entirely(self):
+        # No OPENCTI_TO_ZEEK entry has more than one spec, so the composite
+        # split question cannot do anything on this path; it must not be
+        # asked, and the config value stays at the "both" default.
+        discovery = {"counts": {}, "types": []}
+        fake = scripted(["1", "all"], fill="")
+        config = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage3_iocs(config, discovery, fake, source="opencti")
+        self.assertEqual(config["split_composites"], "both")
+        self.assertNotIn("Composite types", " ".join(fake.state["prompts"]))
+
+
+# ---------------------------------------------------------------------------
+# STAGES 4, 5 -- OpenCTI quality and scope
+# ---------------------------------------------------------------------------
+
+class TestOpenctiQualityAndScope(Quiet):
+
+    def discovery(self):
+        return {"labels": ["phishing", "apt"], "markings": ["TLP:AMBER"],
+                "orgs": ["CIRCL"],
+                "label_ids": {"phishing": "l1", "apt": "l2"},
+                "marking_ids": {"TLP:AMBER": "m1"},
+                "org_ids": {"CIRCL": "o1"}}
+
+    def test_quality_defaults(self):
+        fake = scripted(["", "", "", "", ""])
+        config = {}
+        nexus._stage4_quality_opencti(config, fake)
+        self.assertEqual(config["min_score"], 50)
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["exclude_revoked"], True)
+        self.assertIs(config["require_detection"], False)
+        self.assertIs(config["exclude_expired"], True)
+
+    def test_quality_answers_are_taken(self):
+        fake = scripted(["70", "60", "n", "y", "n"])
+        config = {}
+        nexus._stage4_quality_opencti(config, fake)
+        self.assertEqual(config["min_score"], 70)
+        self.assertEqual(config["min_confidence"], 60)
+        self.assertIs(config["exclude_revoked"], False)
+        self.assertIs(config["require_detection"], True)
+        self.assertIs(config["exclude_expired"], False)
+
+    def test_names_to_ids_translates_and_drops_unknowns(self):
+        mapping = {"phishing": "l1"}
+        with self.assertLogs("nexus", level="WARNING"):
+            out = nexus._names_to_ids(["phishing", "ghost"], mapping)
+        self.assertEqual(out, ["l1"])
+
+    def test_scope_translates_names_to_ids(self):
+        # include labels, exclude labels, markings, authors, time mode, field
+        fake = by_prompt([
+            ("Include labels", "1"),
+            ("Exclude labels", "2"),
+            ("TLP markings", "1"),
+            ("Created by", "1"),
+            ("Time window", "1"),
+            ("Timestamp field", "1"),
+        ])
+        config = {}
+        nexus._stage5_scope_opencti(config, self.discovery(), fake)
+        self.assertEqual(config["include_label_ids"], ["l1"])
+        self.assertEqual(config["exclude_label_ids"], ["l2"])
+        self.assertEqual(config["marking_ids"], ["m1"])
+        self.assertEqual(config["author_ids"], ["o1"])
+
+    def test_summary_names_the_source_and_shows_the_filter_group(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "types": ["IPv4-Addr"], "min_score": 50,
+                  "exclude_revoked": True, "output_path": "/tmp/intel.dat"}
+        text = nexus.summarise_config(config)
+        self.assertIn("opencti", text)
+        self.assertIn("x_opencti_main_observable_type", text)
+        self.assertNotIn("restSearch", text)
+
+    def test_misp_summary_still_shows_restsearch(self):
+        config = {"source": "misp", "source_host": "misp.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "types": ["ip-dst"], "output_path": "/tmp/intel.dat"}
+        text = nexus.summarise_config(config)
+        self.assertIn("restSearch", text)
+
+
+# ---------------------------------------------------------------------------
+# STAGE 7 -- meta.source is source-aware
+# ---------------------------------------------------------------------------
+
+class TestStage7SourceFormats(Quiet):
+
+    def stage7(self, source, input_fn=None):
+        config = {"source": source, "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        fake = input_fn or scripted([], fill="")
+        nexus._stage7_metadata(config, fake)
+        return config, fake
+
+    def test_opencti_default_is_not_a_misp_event(self):
+        # meta.url points at OpenCTI, so a MISP-flavoured meta.source sends an
+        # analyst chasing an intel.log hit into a MISP with no such event.
+        config, _ = self.stage7("opencti")
+        self.assertEqual(config["source_fmt"], "OpenCTI-{event_id}")
+
+    def test_opencti_prompts_never_say_misp(self):
+        fake = scripted([], fill="")
+        self.stage7("opencti", fake)
+        joined = " ".join(fake.state["prompts"]) + self.printed
+        self.assertNotIn("MISP", joined)
+
+    def test_opencti_fixed_string_default_is_opencti(self):
+        config, _ = self.stage7(
+            "opencti", by_prompt([("meta.source format", "4")], fill=""))
+        self.assertEqual(config["source_fmt"], "OpenCTI")
+
+    def test_misp_stage7_is_byte_identical(self):
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        fake = scripted([], fill="")
+        nexus._stage7_metadata(config, fake)
+        self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
+        self.assertEqual(
+            fake.state["prompts"],
+            ["  meta.source format -- choose 1-4 [1]: ",
+             "meta.desc template ({event_info} {category} {tags} {comment} "
+             "{type} {org} {uuid}) [{event_info} | {category}]: ",
+             "Link meta.url back to the MISP event? [Y/n]: ",
+             "Emit the meta.do_notice column? [y/N]: ",
+             "Max metadata field length [200]: "])
+        self.assertEqual(
+            self.printed,
+            "\n-- Stage 7: Metadata\n"
+            "meta.source format\n"
+            "    1) MISP-event-{event_id}          MISP-event-42\n"
+            "    2) MISP-{org}                     MISP-CIRCL\n"
+            "    3) MISP                           MISP\n"
+            "    4) fixed string                   type your own\n")
+
+    def test_a_shipped_opencti_row_names_opencti(self):
+        # Built by flatten_indicator rather than by hand: event_id comes from
+        # node["id"], the internal uuid meta.url also points at, not from
+        # standard_id, and a hand-written fixture can quietly disagree.
+        uuid = "6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45"
+        record = nexus.flatten_indicator({
+            "id": uuid, "standard_id": "indicator--" + uuid, "name": "i",
+            "pattern_type": "stix", "x_opencti_detection": True,
+            "createdBy": {"name": "CIRCL"},
+            "observables": {"edges": [{"node": {
+                "entity_type": "Domain-Name",
+                "observable_value": "evil.com"}}]}})[0]
+        config, _ = self.stage7("opencti")
+        rows, _ = nexus.build_indicators(
+            [record], mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti",
+            source_fmt=config["source_fmt"])
+        self.assertEqual(rows[0][2], "OpenCTI-" + uuid)
+        # The menu example has to show that shape, not a standard_id.
+        example = dict(nexus.OPENCTI_SOURCE_FORMATS)["OpenCTI-{event_id}"]
+        self.assertNotIn("indicator--", example)
+        self.assertRegex(example, r"^OpenCTI-[0-9a-f]{8}-")
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2 -- the interview connects for itself
+# ---------------------------------------------------------------------------
+
+class TestInterviewConnectsForDiscovery(Quiet):
+    """Stage 5's OpenCTI filters are entity ids; only a live client resolves
+    a typed name to one.  With no connection the whole stage is inert."""
+
+    def interview(self, connect, input_fn=None, source="opencti"):
+        return nexus.run_interview(
+            None,
+            input_fn=input_fn or by_prompt(
+                [("OpenCTI address", "cti.local"),
+                 ("Include labels", "1"),
+                 ("TLP markings", "1"),
+                 ("Created by", "1")], fill=""),
+            getpass_fn=lambda prompt: "tok", source=source, connect=connect)
+
+    def test_scope_names_resolve_to_ids_on_a_connected_run(self):
+        seen = {}
+
+        def connect(config):
+            seen["config"] = config
+            return StubOpenctiClient()
+
+        config = self.interview(connect)
+        self.assertEqual(config["include_labels"], ["phishing"])
+        self.assertEqual(config["include_label_ids"], ["l1"])
+        self.assertEqual(config["marking_ids"], ["m1"])
+        self.assertEqual(config["author_ids"], ["o1"])
+        # The client is built from stage 1's own answers, not from thin air.
+        self.assertEqual(seen["config"]["source_host"], "cti.local")
+        self.assertEqual(seen["config"]["token"], "tok")
+
+    def test_filters_built_from_that_config_actually_carry_the_ids(self):
+        config = self.interview(lambda c: StubOpenctiClient())
+        filters = nexus.build_opencti_filters(config)
+        keys = [f["key"][0] for f in filters["filters"]]
+        self.assertIn("objectMarking", keys)
+        self.assertIn("objectLabel", keys)
+
+    def test_a_dead_host_degrades_to_an_offline_interview(self):
+        def connect(config):
+            raise nexus.SourceError("no route to host")
+
+        config = self.interview(connect)
+        self.assertEqual(config["source_host"], "cti.local")
+        self.assertIn("could not connect", self.printed)
+
+    def test_no_connect_callable_means_no_connection_attempt(self):
+        # Every existing caller passes nothing and must stay offline.
+        config = nexus.run_interview(
+            None, input_fn=by_prompt([("OpenCTI address", "cti.local")],
+                                     fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti")
+        self.assertEqual(config["include_label_ids"], [])
+
+    def test_summary_flags_scope_terms_that_resolved_to_nothing(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "markings": ["TLP:GREEN"], "marking_ids": [],
+                  "include_labels": ["phishing"], "include_label_ids": ["l1"]}
+        text = nexus.summarise_config(config)
+        self.assertIn("TLP:GREEN", text)
+        self.assertIn("not filtered", text)
+        # A term that did resolve must not be smeared with the same warning.
+        label_line = [l for l in text.splitlines() if "include labels" in l][0]
+        self.assertNotIn("not filtered", label_line)
+
+
+class TestMalformedHostDoesNotCrashTheRun(Quiet):
+    """urllib rejects some hostnames before it opens a socket, and it raises
+    UnicodeError / http.client.InvalidURL to do it.  Neither is an OSError, so
+    both used to sail past `except SourceError` and kill the interview."""
+
+    def client(self, host):
+        return nexus.OpenctiClient(host=host, token="tok", retries=1, timeout=1)
+
+    def test_an_empty_dns_label_is_a_source_error(self):
+        with self.assertRaises(nexus.SourceError):
+            self.client("cti..local").get_version()
+
+    def test_a_space_in_the_host_is_a_source_error(self):
+        with self.assertRaises(nexus.SourceError):
+            self.client("cti local").get_version()
+
+    def test_the_interview_degrades_to_offline_instead_of_crashing(self):
+        config = nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti..local")], fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti",
+            connect=nexus.make_client)
+        self.assertEqual(config["source_host"], "cti..local")
+        self.assertIn("could not connect", self.printed)
+
+    def test_a_host_default_is_stripped_before_it_reaches_urllib(self):
+        config = {}
+        nexus._stage1_connection(config, None, scripted([], fill=""),
+                                 lambda *a, **k: "tok", source="opencti",
+                                 host="cti.local ")
+        self.assertEqual(config["source_host"], "cti.local")
+
+    def test_the_connect_failure_message_is_redacted(self):
+        token = "supersecret-token-1234"
+
+        def connect(config):
+            # Building the client is what registers the token with REDACTOR,
+            # exactly as make_client does; the failure comes after.
+            nexus.OpenctiClient(host=config["source_host"],
+                                token=config["token"], retries=1, timeout=1)
+            raise nexus.SourceError(
+                "HTTP 500 from https://cti.local/graphql %s" % config["token"])
+
+        nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti.local")], fill=""),
+            getpass_fn=lambda prompt: token, source="opencti", connect=connect)
+        self.assertIn("could not connect", self.printed)
+        self.assertNotIn(token, self.printed)
+
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY
 # ---------------------------------------------------------------------------
 
@@ -1862,7 +2698,7 @@ class TestSummarise(Quiet):
     def config(self):
         return nexus.run_interview(
             None, input_fn=scripted(["misp.example"], fill=""),
-            getpass_fn=lambda prompt: "scripted-token-1234")
+            getpass_fn=lambda prompt: "scripted-token-1234", source="misp")
 
     def test_summary_covers_every_stage(self):
         text = nexus.summarise_config(self.config())
@@ -2314,6 +3150,31 @@ class TestFeedMetadata(unittest.TestCase):
         self.assertIn("MISP-feed-CIRCL-OSINT", lines[1])
 
 
+class TestSourceAwareMetaUrl(unittest.TestCase):
+    """meta.url must point at a page that exists on the source platform."""
+
+    def test_misp_url_shape_is_unchanged(self):
+        _, _, url = nexus.render_meta({"event_id": "42"},
+                                      base_url="https://misp.example")
+        self.assertEqual(url, "https://misp.example/events/view/42")
+
+    def test_opencti_url_points_at_the_indicator_dashboard(self):
+        _, _, url = nexus.render_meta({"event_id": "abc-123"},
+                                      base_url="https://cti.local",
+                                      source="opencti")
+        self.assertEqual(
+            url, "https://cti.local/dashboard/observations/indicators/abc-123")
+
+    def test_build_indicators_threads_source_into_the_url(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "IPv4-Addr", "value": "1.2.3.4", "event_id": "9"}],
+            types=["IPv4-Addr"], exclusions=nexus.ExclusionSet(),
+            base_url="https://cti.local", source="opencti",
+            mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(rows[0][4],
+                         "https://cti.local/dashboard/observations/indicators/9")
+
+
 class TestFeedDiscovery(Quiet):
 
     def test_feeds_are_discovered_and_split_by_selectability(self):
@@ -2579,7 +3440,7 @@ class TestProfiles(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def config(self, **extra):
-        base = {"misp_host": "misp.example", "scheme": "https", "port": 443,
+        base = {"source_host": "misp.example", "scheme": "https", "port": 443,
                 "token": "super-secret-token-value", "types": ["ip-dst"],
                 "to_ids": True, "days": 90, "time_mode": "last",
                 "discovery": {"tags": [{"name": "tlp:amber"}] * 500}}
@@ -2589,7 +3450,7 @@ class TestProfiles(unittest.TestCase):
     def test_round_trip_preserves_the_answers(self):
         nexus.save_profile(self.config(), self.path)
         loaded = nexus.load_profile(self.path)
-        self.assertEqual(loaded["misp_host"], "misp.example")
+        self.assertEqual(loaded["source_host"], "misp.example")
         self.assertEqual(loaded["types"], ["ip-dst"])
         self.assertIs(loaded["to_ids"], True)
 
@@ -2655,6 +3516,65 @@ class TestProfiles(unittest.TestCase):
 
     def test_a_path_is_taken_as_given(self):
         self.assertEqual(nexus.profile_path("/tmp/x.json"), "/tmp/x.json")
+
+
+class TestProfileMigration(unittest.TestCase):
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "p.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, payload):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def test_v1_profile_migrates_forward(self):
+        self.write({"profile_version": 1, "config": {
+            "misp_host": "misp.local", "misp_base_url": "https://misp.local",
+            "types": ["ip-dst"]}})
+        config = nexus.load_profile(self.path)
+        self.assertEqual(config["source"], "misp")
+        self.assertEqual(config["source_host"], "misp.local")
+        self.assertEqual(config["source_base_url"], "https://misp.local")
+        self.assertNotIn("misp_host", config)
+
+    def test_v1_migration_is_logged(self):
+        self.write({"profile_version": 1, "config": {"misp_host": "m"}})
+        with self.assertLogs("nexus", level="INFO"):
+            nexus.load_profile(self.path)
+
+    def test_v1_token_is_still_stripped(self):
+        self.write({"profile_version": 1,
+                    "config": {"misp_host": "m", "token": "leaked"}})
+        self.assertNotIn("token", nexus.load_profile(self.path))
+
+    def test_v2_round_trip(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "types": ["IPv4-Addr"], "token": "secret"}
+        nexus.save_profile(config, self.path)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["profile_version"], 2)
+        loaded = nexus.load_profile(self.path)
+        self.assertEqual(loaded["source"], "opencti")
+        self.assertEqual(loaded["source_host"], "cti.local")
+        self.assertNotIn("token", loaded)
+
+    def test_unknown_version_is_rejected(self):
+        self.write({"profile_version": 99, "config": {}})
+        self.assertRaises(ValueError, nexus.load_profile, self.path)
+
+    def test_v2_files_stay_0600(self):
+        nexus.save_profile({"source": "misp", "source_host": "m"}, self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_migration_defaults_source_to_misp_only_when_absent(self):
+        self.write({"profile_version": 1,
+                    "config": {"misp_host": "m", "source": "opencti"}})
+        self.assertEqual(nexus.load_profile(self.path)["source"], "opencti")
 
 
 # ---------------------------------------------------------------------------
@@ -2761,6 +3681,838 @@ class TestResolveToken(unittest.TestCase):
         with self.assertLogs(nexus.log, level="ERROR"):
             self.assertEqual(
                 nexus.resolve_token(self.args, interactive=False), "")
+
+
+class TestTransportRefactor(unittest.TestCase):
+    """The shared transport is what OpenCTI reuses; MISP behaviour must not move."""
+
+    def test_neutral_exception_names_exist_and_alias(self):
+        self.assertTrue(issubclass(nexus.SourceAuthError, nexus.SourceError))
+        self.assertIs(nexus.MispError, nexus.SourceError)
+        self.assertIs(nexus.MispAuthError, nexus.SourceAuthError)
+
+    def test_misp_client_is_a_transport(self):
+        self.assertTrue(issubclass(nexus.MispClient, nexus._HttpTransport))
+
+    def test_transport_base_refuses_to_guess_auth(self):
+        transport = nexus._HttpTransport("10.0.0.1", "tok")
+        self.assertRaises(NotImplementedError, transport._auth_headers)
+
+    def test_misp_auth_header_is_the_bare_token(self):
+        client = nexus.MispClient("10.0.0.1", "tok")
+        self.assertEqual(client._auth_headers(), {"Authorization": "tok"})
+
+    def test_base_url_still_built_from_scheme_host_port(self):
+        client = nexus.MispClient("10.0.0.1", "tok", scheme="http", port=8080)
+        self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+
+
+class TestOpenctiMapping(unittest.TestCase):
+
+    def rec(self, value_type, value):
+        return {"type": value_type, "value": value}
+
+    def test_observable_types_map_to_zeek(self):
+        cases = [
+            ("IPv4-Addr", "45.33.32.1", [("45.33.32.1", "Intel::ADDR")]),
+            ("IPv6-Addr", "2606:4700::1", [("2606:4700::1", "Intel::ADDR")]),
+            ("Domain-Name", "evil.com", [("evil.com", "Intel::DOMAIN")]),
+            ("Hostname", "a.evil.com", [("a.evil.com", "Intel::DOMAIN")]),
+            ("Url", "http://evil.com/a", [("http://evil.com/a", "Intel::URL")]),
+            ("Email-Addr", "a@evil.com", [("a@evil.com", "Intel::EMAIL")]),
+            ("File-Name", "bad.exe", [("bad.exe", "Intel::FILE_NAME")]),
+            ("SHA-256", "a" * 64, [("a" * 64, "Intel::FILE_HASH")]),
+            ("X509-SHA-1", "b" * 40, [("b" * 40, "Intel::CERT_HASH")]),
+            ("User-Account", "bad_actor", [("bad_actor", "Intel::USER_NAME")]),
+            ("Software", "Mozilla/4.0", [("Mozilla/4.0", "Intel::SOFTWARE")]),
+        ]
+        for value_type, value, expected in cases:
+            with self.subTest(value_type=value_type):
+                self.assertEqual(
+                    nexus.map_attribute(self.rec(value_type, value),
+                                        table=nexus.OPENCTI_TO_ZEEK),
+                    expected)
+
+    def test_cidr_valued_ipv4_becomes_a_subnet(self):
+        out = nexus.map_attribute(self.rec("IPv4-Addr", "45.33.32.0/24"),
+                                  table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(out, [("45.33.32.0/24", "Intel::SUBNET")])
+
+    def test_cidr_dropped_when_subnets_disallowed(self):
+        out = nexus.map_attribute(self.rec("IPv4-Addr", "45.33.32.0/24"),
+                                  allow_subnet=False,
+                                  table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(out, [])
+
+    def test_misp_table_is_still_the_default(self):
+        self.assertEqual(nexus.map_attribute(self.rec("ip-dst", "45.33.32.1")),
+                         [("45.33.32.1", "Intel::ADDR")])
+
+    def test_unmappable_types_carry_reasons(self):
+        for key in ("Mutex", "Windows-Registry-Key", "X509-MD5", "TLSH"):
+            self.assertIn(key, nexus.OPENCTI_UNMAPPABLE)
+            self.assertTrue(nexus.OPENCTI_UNMAPPABLE[key])
+
+    def test_cert_hash_is_sha1_only(self):
+        self.assertIn("X509-SHA-1", nexus.OPENCTI_TO_ZEEK)
+        self.assertNotIn("X509-SHA-256", nexus.OPENCTI_TO_ZEEK)
+        self.assertNotIn("X509-MD5", nexus.OPENCTI_TO_ZEEK)
+
+    def test_hash_algorithm_labels_normalise(self):
+        for raw in ("sha-256", "SHA256", "sha256", "SHA-256"):
+            self.assertEqual(nexus.normalise_hash_algorithm(raw), "SHA-256")
+        self.assertEqual(nexus.normalise_hash_algorithm("md5"), "MD5")
+        self.assertEqual(nexus.normalise_hash_algorithm("SHA-1"), "SHA-1")
+        self.assertEqual(nexus.normalise_hash_algorithm("ssdeep"), "SSDEEP")
+
+    def test_ioc_classes_cover_the_mappable_surface(self):
+        listed = set()
+        for _, types in nexus.OPENCTI_IOC_CLASSES.values():
+            listed.update(types)
+        self.assertIn("IPv4-Addr", listed)
+        self.assertIn("StixFile", listed)
+        self.assertIn("X509-Certificate", listed)
+
+    def test_mappable_types_follows_the_table(self):
+        self.assertIn("IPv4-Addr", nexus.mappable_types(nexus.OPENCTI_TO_ZEEK))
+        self.assertIn("ip-dst", nexus.mappable_types())
+
+    def test_build_indicators_accepts_the_opencti_table(self):
+        records = [{"type": "Domain-Name", "value": "evil.com", "to_ids": True,
+                    "uuid": "x", "event_info": "i", "event_id": "1",
+                    "event_tags": [], "org": "o", "comment": "", "category": "",
+                    "timestamp": ""}]
+        rows, _ = nexus.build_indicators(records,
+                                         mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual([r[0] for r in rows], ["evil.com"])
+
+
+class TestFlattenIndicator(unittest.TestCase):
+
+    def node(self, **overrides):
+        base = {
+            "id": "indicator--1",
+            "standard_id": "indicator--std",
+            "name": "Evil domain",
+            "description": "seen in phishing",
+            "pattern": "[domain-name:value = 'evil.com']",
+            "pattern_type": "stix",
+            "x_opencti_score": 80,
+            "confidence": 75,
+            "revoked": False,
+            "x_opencti_detection": True,
+            "valid_from": "2026-08-01T00:00:00Z",
+            "valid_until": "2027-08-01T00:00:00Z",
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "objectLabel": [{"id": "l1", "value": "phishing"}],
+            "objectMarking": [{"id": "m1", "definition": "TLP:AMBER"}],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": []},
+        }
+        base.update(overrides)
+        return base
+
+    def observables(self, nodes, has_next=False):
+        return {"pageInfo": {"hasNextPage": has_next},
+                "edges": [{"node": n} for n in nodes]}
+
+    def test_simple_observable_becomes_one_record(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        records = nexus.flatten_indicator(node)
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec["value"], "evil.com")
+        self.assertEqual(rec["type"], "Domain-Name")
+        self.assertEqual(rec["category"], "stix")
+        self.assertIs(rec["to_ids"], True)
+        self.assertEqual(rec["uuid"], "indicator--std")
+        self.assertEqual(rec["event_id"], "indicator--1")
+        self.assertEqual(rec["event_info"], "Evil domain")
+        self.assertEqual(rec["comment"], "seen in phishing")
+        self.assertEqual(rec["org"], "CIRCL")
+
+    def test_labels_and_markings_both_land_in_event_tags(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertIn("phishing", rec["event_tags"])
+        self.assertIn("TLP:AMBER", rec["event_tags"])
+
+    def test_stixfile_yields_one_record_per_hash_plus_the_name(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "StixFile",
+            "observable_value": "bad.exe",
+            "name": "bad.exe",
+            "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                       {"algorithm": "sha-256", "hash": "e" * 64}],
+        }]))
+        records = nexus.flatten_indicator(node)
+        pairs = sorted((r["type"], r["value"]) for r in records)
+        self.assertEqual(pairs, sorted([
+            ("File-Name", "bad.exe"),
+            ("MD5", "d" * 32),
+            ("SHA-256", "e" * 64),
+        ]))
+
+    def test_x509_hashes_are_keyed_separately(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "X509-Certificate",
+            "observable_value": "cert",
+            "hashes": [{"algorithm": "SHA-1", "hash": "b" * 40},
+                       {"algorithm": "SHA-256", "hash": "c" * 64}],
+        }]))
+        types = sorted(r["type"] for r in nexus.flatten_indicator(node))
+        self.assertEqual(types, ["X509-SHA-1", "X509-SHA-256"])
+
+    def test_user_account_uses_account_login(self):
+        node = self.node(observables=self.observables([{
+            "entity_type": "User-Account", "observable_value": "",
+            "account_login": "bad_actor"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertEqual(rec["value"], "bad_actor")
+        self.assertEqual(rec["type"], "User-Account")
+
+    def test_missing_created_by_is_empty_not_a_crash(self):
+        node = self.node(createdBy=None, observables=self.observables(
+            [{"entity_type": "Url", "observable_value": "http://evil.com/a"}]))
+        self.assertEqual(nexus.flatten_indicator(node)[0]["org"], "")
+
+    def test_updated_at_becomes_epoch_seconds(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        rec = nexus.flatten_indicator(node)[0]
+        self.assertIsInstance(rec["timestamp"], int)
+        self.assertGreater(rec["timestamp"], 1750000000)
+
+    def test_unparseable_timestamp_is_empty(self):
+        node = self.node(updated_at="not a date", observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        self.assertEqual(nexus.flatten_indicator(node)[0]["timestamp"], "")
+
+    def test_detection_false_sets_to_ids_false(self):
+        node = self.node(x_opencti_detection=False, observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
+        self.assertIs(nexus.flatten_indicator(node)[0]["to_ids"], False)
+
+    def test_truncated_observables_are_counted(self):
+        stats = nexus.BuildStats()
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}],
+            has_next=True))
+        nexus.flatten_indicator(node, stats=stats)
+        self.assertEqual(stats.opencti_truncated_observables, 1)
+
+    def test_observable_with_no_usable_value_is_skipped(self):
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Domain-Name", "observable_value": ""}]))
+        self.assertEqual(nexus.flatten_indicator(node), [])
+
+    def test_unknown_entity_type_passes_through_for_the_mapping_layer(self):
+        # Mutex has no Zeek equivalent, but it must still surface as a record
+        # of type "Mutex" so build_indicators can count it against
+        # OPENCTI_UNMAPPABLE instead of it vanishing without a trace.
+        node = self.node(observables=self.observables(
+            [{"entity_type": "Mutex", "observable_value": "Global\\evil"}]))
+        records = nexus.flatten_indicator(node)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["type"], "Mutex")
+        self.assertEqual(records[0]["value"], "Global\\evil")
+
+
+class TestOpenctiTimestamp(unittest.TestCase):
+    """3.6 does not accept a colon in strptime's %z offset (bpo-30618, fixed
+    in 3.7); these tests pin the colon-stripping fix at the text level so a
+    3.9+ CI run -- which would parse the colon form silently -- can still
+    catch a regression here."""
+
+    def test_z_suffix_normalises_to_colon_free_utc_offset(self):
+        text = nexus._opencti_timestamp_text("2026-08-02T12:00:00Z")
+        self.assertEqual(text, "2026-08-02T12:00:00+0000")
+        self.assertNotIn(":", text[-5:])  # the offset itself, not the time
+
+    def test_explicit_offset_colon_is_stripped(self):
+        text = nexus._opencti_timestamp_text("2026-08-02T12:00:00+01:00")
+        self.assertEqual(text, "2026-08-02T12:00:00+0100")
+
+    def test_epoch_from_z_timestamp(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00Z"),
+                         1785672000)
+
+    def test_epoch_honours_an_explicit_offset(self):
+        # 13:00+01:00 is the same instant as 12:00Z -- if the offset were
+        # ignored (or stripped instead of normalised) these would diverge.
+        utc = nexus._opencti_epoch("2026-08-02T12:00:00Z")
+        offset = nexus._opencti_epoch("2026-08-02T13:00:00+01:00")
+        self.assertEqual(utc, offset)
+
+    def test_epoch_from_millisecond_precision(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00.123Z"),
+                         1785672000)
+
+    def test_epoch_from_naive_timestamp_with_no_timezone(self):
+        self.assertEqual(nexus._opencti_epoch("2026-08-02T12:00:00"),
+                         1785672000)
+
+    def test_epoch_from_unparseable_text_is_empty(self):
+        self.assertEqual(nexus._opencti_epoch("not a date"), "")
+
+
+class TestStixPattern(unittest.TestCase):
+
+    def test_simple_comparisons(self):
+        cases = [
+            ("[ipv4-addr:value = '45.33.32.1']", [("IPv4-Addr", "45.33.32.1")]),
+            ("[ipv6-addr:value = '2606:4700::1']", [("IPv6-Addr", "2606:4700::1")]),
+            ("[domain-name:value = 'evil.com']", [("Domain-Name", "evil.com")]),
+            ("[url:value = 'http://evil.com/a']", [("Url", "http://evil.com/a")]),
+            ("[email-addr:value = 'a@evil.com']", [("Email-Addr", "a@evil.com")]),
+            ("[file:name = 'bad.exe']", [("File-Name", "bad.exe")]),
+        ]
+        for pattern, expected in cases:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(nexus.parse_stix_pattern(pattern), expected)
+
+    def test_quoted_hash_property(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[file:hashes.'SHA-256' = '%s']" % ("a" * 64)),
+            [("SHA-256", "a" * 64)])
+
+    def test_unquoted_hash_property(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[file:hashes.MD5 = '%s']" % ("d" * 32)),
+            [("MD5", "d" * 32)])
+
+    def test_certificate_hash_keys_separately(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern(
+                "[x509-certificate:hashes.'SHA-1' = '%s']" % ("b" * 40)),
+            [("X509-SHA-1", "b" * 40)])
+
+    def test_or_joined_comparisons_all_extracted(self):
+        pattern = ("[domain-name:value = 'a.com' OR domain-name:value = 'b.com']")
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("Domain-Name", "a.com"), ("Domain-Name", "b.com")])
+
+    def test_qualifiers_are_ignored(self):
+        pattern = "[ipv4-addr:value = '45.33.32.1'] REPEATS 2 TIMES WITHIN 60 SECONDS"
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("IPv4-Addr", "45.33.32.1")])
+
+    def test_unsupported_property_yields_nothing(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[windows-registry-key:key = 'HKLM\\\\Run']"),
+            [])
+
+    def test_not_equals_is_not_treated_as_an_indicator(self):
+        self.assertEqual(
+            nexus.parse_stix_pattern("[domain-name:value != 'good.com']"), [])
+
+    def test_empty_and_none_are_safe(self):
+        self.assertEqual(nexus.parse_stix_pattern(""), [])
+        self.assertEqual(nexus.parse_stix_pattern(None), [])
+
+    def test_duplicate_values_are_deduped_in_order(self):
+        pattern = "[domain-name:value = 'a.com' OR domain-name:value = 'a.com']"
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("Domain-Name", "a.com")])
+
+
+class TestOpenctiSearch(unittest.TestCase):
+
+    def tearDown(self):
+        if getattr(self, "cti", None):
+            self.cti.stop()
+
+    def node(self, value, ident="i1", **overrides):
+        node = {
+            "id": ident, "standard_id": "indicator--" + ident,
+            "name": "n", "description": "", "pattern": "",
+            "pattern_type": "stix", "x_opencti_detection": True,
+            "updated_at": "2026-08-02T12:00:00Z", "createdBy": None,
+            "objectLabel": [], "objectMarking": [],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": "Domain-Name",
+                          "observable_value": value}}]},
+        }
+        node.update(overrides)
+        return node
+
+    def page(self, nodes, cursor, has_next):
+        return {"data": {"indicators": {
+            "pageInfo": {"endCursor": cursor, "hasNextPage": has_next,
+                         "globalCount": len(nodes)},
+            "edges": [{"node": n} for n in nodes]}}}
+
+    def test_single_page(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com")], "c1", False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com"])
+
+    def test_walks_pages_with_the_cursor(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c2", False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com", "b.com"])
+        self.assertIsNone(self.cti.requests[0]["body"]["variables"]["after"])
+        self.assertEqual(self.cti.requests[1]["body"]["variables"]["after"], "c1")
+
+    def test_repeated_cursor_stops_the_walk(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c1", True)),
+            (200, self.page([self.node("c.com", "i3")], "c1", True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com", "b.com"])
+
+    def test_null_cursor_with_more_pages_stops_the_walk(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com")], None, True)),
+            (200, self.page([self.node("b.com", "i2")], None, True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}))
+        self.assertEqual([r["value"] for r in records], ["a.com"])
+
+    def test_max_results_stops_early(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1"),
+                             self.node("b.com", "i2")], "c1", True))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, max_results=1))
+        self.assertEqual(len(records), 1)
+
+    def test_max_pages_ceiling(self):
+        self.cti = FakeOpencti(script=[
+            (200, self.page([self.node("a.com", "i1")], "c1", True)),
+            (200, self.page([self.node("b.com", "i2")], "c2", True))])
+        client = self.cti.client()
+        with self.assertLogs("nexus", level="WARNING"):
+            records = list(client.search_indicators({}, max_pages=1))
+        self.assertEqual(len(records), 1)
+
+    def test_empty_page_terminates(self):
+        self.cti = FakeOpencti(script=[(200, self.page([], None, False))])
+        client = self.cti.client()
+        self.assertEqual(list(client.search_indicators({})), [])
+
+    def test_pattern_fallback_when_no_observables(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern"] = "[domain-name:value = 'pattern.com']"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, stats=stats))
+        self.assertEqual([r["value"] for r in records], ["pattern.com"])
+        self.assertEqual(records[0]["type"], "Domain-Name")
+        self.assertEqual(stats.opencti_pattern_fallbacks, 1)
+
+    def test_non_stix_pattern_is_counted_not_mined(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern_type"] = "yara"
+        node["pattern"] = "rule x { strings: $a = 'evil.com' condition: $a }"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        records = list(client.search_indicators({}, stats=stats))
+        self.assertEqual(records, [])
+        self.assertEqual(stats.opencti_non_stix_patterns, 1)
+
+    def test_unparseable_stix_pattern_is_counted(self):
+        stats = nexus.BuildStats()
+        node = self.node("unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": []}
+        node["pattern"] = "[windows-registry-key:key = 'HKLM']"
+        self.cti = FakeOpencti(script=[(200, self.page([node], None, False))])
+        client = self.cti.client()
+        self.assertEqual(list(client.search_indicators({}, stats=stats)), [])
+        self.assertEqual(stats.opencti_unparsed_patterns, 1)
+
+    def test_filters_and_page_size_are_sent(self):
+        self.cti = FakeOpencti(script=[(200, self.page([], None, False))])
+        client = self.cti.client(page_size=250)
+        filters = {"mode": "and", "filters": [], "filterGroups": []}
+        list(client.search_indicators(filters))
+        variables = self.cti.requests[0]["body"]["variables"]
+        self.assertEqual(variables["first"], 250)
+        self.assertEqual(variables["filters"], filters)
+
+
+class TestSourceCli(unittest.TestCase):
+
+    def parse(self, argv):
+        return nexus.build_parser().parse_args(argv)
+
+    def test_source_flag(self):
+        self.assertEqual(self.parse(["--source", "opencti"]).source, "opencti")
+
+    def test_source_defaults_to_none_so_the_interview_asks(self):
+        self.assertIsNone(self.parse([]).source)
+
+    def test_host_flag(self):
+        self.assertEqual(self.parse(["--host", "cti.local"]).host, "cti.local")
+
+    def test_misp_alias_sets_host_and_source(self):
+        args = self.parse(["--misp", "misp.local"])
+        resolved = nexus.resolve_source_args(args)
+        self.assertEqual(resolved.host, "misp.local")
+        self.assertEqual(resolved.source, "misp")
+
+    def test_explicit_host_wins_over_the_alias(self):
+        args = self.parse(["--host", "a", "--misp", "b"])
+        self.assertEqual(nexus.resolve_source_args(args).host, "a")
+
+    def test_make_client_picks_the_opencti_client(self):
+        config = {"source": "opencti", "source_host": "cti.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "proxy": None, "timeout": 30, "retries": 3, "token": "tok"}
+        self.assertIsInstance(nexus.make_client(config), nexus.OpenctiClient)
+
+    def test_make_client_picks_the_misp_client(self):
+        config = {"source": "misp", "source_host": "misp.local",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "proxy": None, "timeout": 30, "retries": 3, "token": "tok"}
+        self.assertIsInstance(nexus.make_client(config), nexus.MispClient)
+
+    def test_neutral_token_env_var_is_read_first(self):
+        args = self.parse([])
+        os.environ["NEXUS_TOKEN"] = "neutral"
+        os.environ["NEXUS_MISP_TOKEN"] = "legacy"
+        try:
+            self.assertEqual(nexus.resolve_token(args, interactive=False),
+                             "neutral")
+        finally:
+            del os.environ["NEXUS_TOKEN"]
+            del os.environ["NEXUS_MISP_TOKEN"]
+
+    def test_legacy_token_env_var_still_works(self):
+        args = self.parse([])
+        os.environ["NEXUS_MISP_TOKEN"] = "legacy"
+        try:
+            self.assertEqual(nexus.resolve_token(args, interactive=False),
+                             "legacy")
+        finally:
+            del os.environ["NEXUS_MISP_TOKEN"]
+
+    def test_fetch_records_uses_the_opencti_path(self):
+        class Client(object):
+            def __init__(self):
+                self.calls = []
+
+            def search_indicators(self, filters, max_results=None, stats=None):
+                self.calls.append(filters)
+                return iter([{"value": "evil.com", "type": "Domain-Name"}])
+
+        client = Client()
+        config = {"source": "opencti", "types": ["Domain-Name"]}
+        records = list(nexus._fetch_records(client, config))
+        self.assertEqual(records[0]["value"], "evil.com")
+        self.assertEqual(len(client.calls), 1)
+
+
+class TestBuildHonoursSourceAndHostFlags(Quiet):
+    """--source/--host say "asked if omitted" in the help; on a build run they
+    were read by nobody, so they changed nothing at all."""
+
+    def build(self, argv, interview):
+        args = nexus.resolve_source_args(nexus.build_parser().parse_args(argv))
+        seen = {}
+
+        def fake_interview(client, **kwargs):
+            seen.update(kwargs)
+            return interview(kwargs)
+
+        real = (nexus.run_interview, nexus.check_env)
+        nexus.run_interview = fake_interview
+        nexus.check_env = lambda: (True, [])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                nexus.cmd_build(args)
+        finally:
+            nexus.run_interview, nexus.check_env = real
+        return seen
+
+    def test_flags_reach_the_interview(self):
+        def stop(kwargs):
+            raise nexus.InterviewAborted("enough")
+
+        seen = self.build(["--source", "opencti", "--host", "cti.local"], stop)
+        self.assertEqual(seen["source"], "opencti")
+        self.assertEqual(seen["host"], "cti.local")
+
+    def test_a_flagless_run_still_asks(self):
+        # The interactivity rule: absent the switch, the script asks.  A fix
+        # that silently defaulted to "misp" would pass the test above and
+        # fail this one.
+        def stop(kwargs):
+            raise nexus.InterviewAborted("enough")
+
+        seen = self.build([], stop)
+        self.assertIsNone(seen["source"])
+        self.assertIsNone(seen["host"])
+
+        # ...and run_interview with source=None does ask.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["2", "cti.local"], fill=""),
+            getpass_fn=lambda prompt: "tok", source=None)
+        self.assertEqual(config["source"], "opencti")
+
+    def test_host_flag_is_only_a_default_the_question_still_runs(self):
+        fake = scripted([], fill="")
+        config = {}
+        nexus._stage1_connection(config, None, fake, lambda *a, **k: "tok",
+                                 source="opencti", host="cti.local")
+        self.assertEqual(config["source_host"], "cti.local")
+        self.assertIn("cti.local", fake.state["prompts"][0])
+
+        typed = scripted(["other.local"], fill="")
+        config = {}
+        nexus._stage1_connection(config, None, typed, lambda *a, **k: "tok",
+                                 source="opencti", host="cti.local")
+        self.assertEqual(config["source_host"], "other.local")
+
+
+class TestBuildTranslatesTheTypeVocabulary(Quiet):
+    """cmd_build must expand config["types"] (main observable type names) into
+    record types before build_indicators filters on them.  Every helper around
+    that call was covered; the call itself was not, so reverting it -- and
+    dropping every file hash -- passed the whole suite."""
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        # Without __load__.Zeek the guardrails block before anything is written.
+        with io.open(os.path.join(self.dir, nexus.SO_LOAD_FILE), "w"):
+            pass
+
+    def config(self):
+        config = nexus.run_interview(
+            None,
+            input_fn=by_prompt([("OpenCTI address", "cti.local")], fill=""),
+            getpass_fn=lambda prompt: "tok", source="opencti")
+        # An operator who picked the "file" IOC class: class names, not the
+        # finer record types flatten_indicator() emits.
+        config["types"] = ["StixFile"]
+        config["output_path"] = os.path.join(self.dir, "intel.dat")
+        config["profile_path"] = None
+        config["backup"] = False
+        config["dry_run"] = False
+        config["apply"] = False
+        return config
+
+    def records(self):
+        node = {
+            "id": "6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45",
+            "standard_id": "indicator--6c1f0a2e-2b7d-4a55-9d3e-1f0a2e2b7d45",
+            "name": "dropper", "description": "", "pattern_type": "stix",
+            "x_opencti_detection": True, "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": "StixFile", "name": "bad.exe",
+                          "observable_value": "bad.exe",
+                          "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                                     {"algorithm": "sha-256",
+                                      "hash": "e" * 64}]}}]},
+        }
+        return nexus.flatten_indicator(node)
+
+    def test_the_hashes_reach_the_written_file(self):
+        records = self.records()
+        # The record types are finer than the class name in config["types"];
+        # filtering the second vocabulary with the first matches nothing.
+        self.assertIn("MD5", [r["type"] for r in records])
+
+        class Client(object):
+            host = "cti.local"
+
+            def get_version(self):
+                return {"version": "6.2.0"}
+
+            def search_indicators(self, filters, max_results=None, stats=None):
+                return iter(records)
+
+        config = self.config()
+        real = (nexus.check_env, nexus.run_interview, nexus.make_client)
+        nexus.check_env = lambda: (True, [])
+        nexus.run_interview = lambda client, **kwargs: config
+        nexus.make_client = lambda cfg: Client()
+        try:
+            args = nexus.resolve_source_args(nexus.build_parser().parse_args([]))
+            rc = nexus.cmd_build(args)
+        finally:
+            nexus.check_env, nexus.run_interview, nexus.make_client = real
+
+        self.assertEqual(rc, 0)
+        with io.open(config["output_path"], encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertIn("d" * 32, body)
+        self.assertIn("e" * 64, body)
+        self.assertIn("bad.exe", body)
+
+
+class TestOpenctiEndToEnd(unittest.TestCase):
+    """An OpenCTI profile all the way to rendered intel lines."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def indicator(self, ident, entity_type, value):
+        return {
+            "id": ident, "standard_id": "indicator--" + ident,
+            "name": "bad thing", "description": "seen in phishing",
+            "pattern": "", "pattern_type": "stix",
+            "x_opencti_detection": True, "updated_at": "2026-08-02T12:00:00Z",
+            "createdBy": {"name": "CIRCL"},
+            "objectLabel": [{"id": "l1", "value": "phishing"}],
+            "objectMarking": [{"id": "m1", "definition": "TLP:AMBER"}],
+            "observables": {"pageInfo": {"hasNextPage": False}, "edges": [
+                {"node": {"entity_type": entity_type,
+                          "observable_value": value}}]},
+        }
+
+    def test_records_render_to_valid_intel_lines(self):
+        nodes = [self.indicator("i1", "Domain-Name", "evil.com"),
+                 self.indicator("i2", "IPv4-Addr", "45.33.32.1"),
+                 self.indicator("i3", "Url", "http://evil.com/payload")]
+        records = []
+        for node in nodes:
+            records.extend(nexus.flatten_indicator(node))
+
+        rows, stats = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="OpenCTI", desc_template="{event_info}",
+            exclusions=nexus.ExclusionSet(exclude_private=True))
+
+        lines = [nexus.header_line(False)] + nexus.rows_to_lines(rows, False)
+        self.assertEqual(nexus.lint_lines(lines, False), [])
+
+        indicators = sorted(r[0] for r in rows)
+        self.assertEqual(indicators,
+                         ["45.33.32.1", "evil.com", "evil.com/payload"])
+        self.assertTrue(all(row[2] == "OpenCTI" for row in rows))
+
+    def test_private_addresses_are_still_excluded(self):
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "IPv4-Addr", "10.0.0.1"))
+        rows, stats = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            exclusions=nexus.ExclusionSet(exclude_private=True))
+        self.assertEqual(rows, [])
+        # rows == [] alone doesn't distinguish "excluded" from "never mapped"
+        # (an unmapped type hits stats.unmap() before exclusions run at all).
+        # Pin down the actual exclusion reason so a broken OPENCTI_TO_ZEEK
+        # entry or a broken exclusion check would fail this differently.
+        self.assertEqual(stats.excluded.get("private_ip"), 1)
+        self.assertEqual(stats.unmapped, {})
+
+    def test_selected_ioc_classes_keep_their_hashes(self):
+        # config["types"] holds x_opencti_main_observable_type names, but
+        # flatten_indicator() emits the finer OPENCTI_TO_ZEEK keys.  Filtering
+        # the second vocabulary with the first drops every file and cert hash
+        # without a stats bucket or a warning.
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "name": "bad.exe",
+                      "hashes": [{"algorithm": "MD5", "hash": "d" * 32},
+                                 {"algorithm": "sha-256", "hash": "e" * 64}]}},
+            {"node": {"entity_type": "X509-Certificate",
+                      "observable_value": "cert",
+                      "hashes": [{"algorithm": "SHA-1", "hash": "b" * 40}]}},
+        ]}
+        records = nexus.flatten_indicator(node)
+
+        selected = (nexus.OPENCTI_IOC_CLASSES["file"][1]
+                    + nexus.OPENCTI_IOC_CLASSES["tls"][1])
+        rows, stats = nexus.build_indicators(
+            records, types=nexus.opencti_record_types(selected),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+
+        self.assertEqual(sorted(r[0] for r in rows),
+                         sorted(["bad.exe", "d" * 32, "e" * 64, "b" * 40]))
+        self.assertEqual(stats.by_type.get("Intel::CERT_HASH"), 1)
+        self.assertEqual(stats.by_type.get("Intel::FILE_HASH"), 2)
+
+    def test_expansion_is_identity_where_the_vocabularies_agree(self):
+        for main_type in nexus.OPENCTI_IOC_CLASSES["network"][1]:
+            self.assertEqual(nexus.opencti_record_types([main_type]),
+                             [main_type])
+
+    def test_every_offered_class_expands_to_mappable_record_types(self):
+        for key, (_, main_types) in nexus.OPENCTI_IOC_CLASSES.items():
+            expanded = nexus.opencti_record_types(main_types)
+            mappable = [t for t in expanded if t in nexus.OPENCTI_TO_ZEEK]
+            self.assertTrue(mappable, "%s expands to nothing mappable" % key)
+
+    def test_unmappable_emissions_are_counted_not_dropped_silently(self):
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "hashes": [{"algorithm": "SSDEEP", "hash": "3:abc"}]}}]}
+        _, stats = nexus.build_indicators(
+            nexus.flatten_indicator(node),
+            types=nexus.opencti_record_types(["StixFile"]),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped.get("SSDEEP"), 1)
+
+    def test_an_unknown_hash_algorithm_is_counted_not_dropped(self):
+        # A connector shipping SHA3-256 produces record type "SHA3-256", which
+        # is in no expansion list, so the types filter used to eat it with no
+        # stats bucket -- the same silent loss the class-name filter caused.
+        node = self.indicator("i1", "Domain-Name", "unused")
+        node["observables"] = {"pageInfo": {"hasNextPage": False}, "edges": [
+            {"node": {"entity_type": "StixFile", "observable_value": "bad.exe",
+                      "hashes": [{"algorithm": "SHA3-256", "hash": "f" * 64}]}}]}
+        _, stats = nexus.build_indicators(
+            nexus.flatten_indicator(node),
+            types=nexus.opencti_record_types(["StixFile"]),
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped.get("SHA3-256"), 1)
+
+    def test_a_deselected_but_mappable_type_stays_silent(self):
+        # Counting the unknown must not turn every deselected type into noise:
+        # the operator chose not to have those.
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "IPv4-Addr", "45.33.32.1"))
+        _, stats = nexus.build_indicators(
+            records, types=["Domain-Name"],
+            mapping_table=nexus.OPENCTI_TO_ZEEK, source="opencti")
+        self.assertEqual(stats.unmapped, {})
+
+    def test_append_only_merge_across_sources(self):
+        path = os.path.join(self.dir, "intel.dat")
+        existing = [nexus.header_line(False),
+                    "evil.com\tIntel::DOMAIN\tMISP\told desc\t-"]
+        nexus.write_atomic(path, existing)
+
+        records = nexus.flatten_indicator(
+            self.indicator("i1", "Domain-Name", "evil.com"))
+        rows, _ = nexus.build_indicators(
+            records, mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="OpenCTI", desc_template="{event_info}")
+        _, existing_rows = nexus.read_existing(path)
+        combined = nexus.merge_additive(
+            existing_rows, nexus.rows_to_lines(rows, False))
+
+        # The MISP row owns the key; the OpenCTI run adds nothing and removes
+        # nothing. The existing row must survive byte-for-byte.
+        self.assertEqual(len(combined), 1)
+        self.assertEqual(combined[0], "evil.com\tIntel::DOMAIN\tMISP\told desc\t-")
+        added, removed = nexus.indicator_delta(existing_rows, combined)
+        self.assertEqual(removed, [])
 
 
 if __name__ == "__main__":

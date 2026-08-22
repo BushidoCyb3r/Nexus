@@ -1,34 +1,34 @@
-# Nexus — MISP → Zeek `intel.dat` Builder for Security Onion
+# Nexus — MISP / OpenCTI → Zeek `intel.dat` Builder for Security Onion
 
-**Status:** phases 0–6 built and tested, plus feed selection; phase 7 (systemd timer, install docs) is all that remains
+**Status:** phases 0–6 and 8 built and tested — two IOC sources (MISP, OpenCTI), one per run, plus feed selection; phase 7 (systemd timer, install docs) is all that remains
 **Target host:** Security Onion 3.2 manager node
 **Form:** a single Python 3 script, `nexus.py`, stdlib only — no pip, no venv, no packaging
 
 ```
 nexus.py        the tool          python3 nexus.py
-test_nexus.py   313 tests         python3 -m unittest test_nexus
+test_nexus.py   449 tests         python3 -m unittest test_nexus
 ```
 
 **New assistant picking this up: read `HANDOFF.md` first.**
 
-Working today: the full interview end-to-end including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run --diff`.
+Working today: the full interview end-to-end against either platform, including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run --diff`. `--source {misp,opencti}` and `--host` select the platform; `--misp` remains as a deprecated alias for `--host --source misp`.
 
 ---
 
 ## 1. What Nexus does
 
-Nexus is an interactive script that runs on a Security Onion 3.2 manager. It:
+Nexus is an interactive script that runs on a Security Onion 3.2 manager, against **one IOC source per run — MISP or OpenCTI**, chosen in the interview or via `--source`. It:
 
-1. Prompts for a MISP instance address and API token.
-2. Connects and *interrogates* the MISP instance to discover what's actually there — attribute types in use, tags, taxonomies, organisations, sharing groups, live counts.
-3. Walks the operator through a full interview: which IOC classes, which specific attribute types, which tags to include/exclude, what time window, what quality filters, what metadata to embed.
-4. Pulls matching attributes via `/attributes/restSearch` (paginated).
-5. Normalises, validates, deduplicates and maps them to Zeek Intel framework types.
-6. Preserves every existing indicator, appends newly discovered MISP IOCs,
-   and atomically publishes the resulting `intel.dat`.
+1. Prompts for which platform, then that platform's address and API token.
+2. Connects and *interrogates* the instance to discover what's actually there — for MISP: attribute types in use, tags, taxonomies, organisations, sharing groups, live counts; for OpenCTI: labels, marking definitions, organisations, and exact per-type indicator counts.
+3. Walks the operator through a full interview: which IOC classes, which specific attribute/observable types, which tags or labels to include/exclude, what time window, what quality filters, what metadata to embed. Stages 2, 2b, 3, 4 and 5 branch by source; the rest of the interview and everything downstream of it is shared.
+4. Pulls matching records — MISP via `/attributes/restSearch` (paginated), OpenCTI via `POST /graphql` (cursor-paginated), reading indicators and the observables linked to them.
+5. Normalises, validates, deduplicates and maps them to Zeek Intel framework types through the same table-driven pipeline regardless of source.
+6. Preserves every existing indicator, appends newly discovered IOCs from
+   whichever source was queried, and atomically publishes the resulting `intel.dat`.
 7. Optionally backs up, validates, and applies it out to the grid.
 
-Interview answers can be saved as a **profile** so later runs are non-interactive (systemd timer friendly).
+Interview answers can be saved as a **profile** so later runs are non-interactive (systemd timer friendly). A MISP profile and an OpenCTI profile run as two separate scheduled jobs; both converge into the same append-only `intel.dat` with no merge step of their own — see `HANDOFF.md` §5 (Decisions already made).
 
 ---
 
@@ -86,6 +86,17 @@ Interview answers can be saved as a **profile** so later runs are non-interactiv
 - Body params used: `value`, `type`, `category`, `org`, `tags` (`OR` / `NOT` lists), `from`, `to`, `last`, `timestamp`, `publish_timestamp`, `published`, `eventid`, `uuid`, `to_ids`, `deleted`, `enforceWarninglist`, `includeEventUuid`, `includeEventTags`, `limit`, `page`, `returnFormat`.
 - Discovery: `GET /servers/getVersion`, `GET /attributes/describeTypes`, `GET /tags`, `GET /organisations`, `GET /sharing_groups`.
 
+### OpenCTI API
+
+- Single endpoint: `POST /graphql` — header `Authorization: Bearer <token>`. Version probe, discovery, counts and the indicator search are all one query shape over this one path.
+- **GraphQL answers HTTP 200 even on a rejected token.** Errors arrive as a 200 response carrying an `errors` array in the body, never a 401/403. `_check_errors` reads that array before any caller touches `data`, so an auth failure raises `SourceAuthError` instead of silently looking like an empty result set.
+- Pagination is cursor-based — `first` / `after` / `pageInfo.{endCursor,hasNextPage}` — not page-numbered. A cursor that fails to advance (a proxy or endpoint ignoring `after`) stops the walk with a warning rather than looping forever.
+- Filters use **OpenCTI 6.x `FilterGroup` syntax only** — nested `{mode, filters, filterGroups}` objects — not the flat 5.x filter shape. `build_opencti_filters(config)` is the pure builder, the OpenCTI counterpart to `build_search_params(config)`.
+- **Filters take entity ids, not names.** Labels, marking definitions and organisations are resolved `name -> id` during discovery; a name with no discovered id is dropped with a warning rather than passed through as a guess.
+- Discovery: one GraphQL query each for labels, marking definitions and organisations.
+- Counts: `pageInfo.globalCount` is an exact total, permission-dependent; `count_type` falls back to a `first: 1` probe's `len(nodes)` when it's absent, which is still exact for that fallback shape (see `HANDOFF.md` §3).
+- Body/entity: only **Indicators** are queried, not raw Observables — see §2 (Decisions taken) in the OpenCTI design spec, `docs/superpowers/specs/2026-08-17-opencti-source-design.md`. An indicator's linked observables (`observables(first: 50) { edges { node { ... } } }`) supply the actual IOC values; `parse_stix_pattern` is a fallback for indicators with no linked observables, and only for `pattern_type == "stix"` — YARA/Sigma pattern bodies are never mined for values.
+
 ---
 
 ## 3. Script structure
@@ -96,22 +107,40 @@ Internally organised into banner-delimited sections, in dependency order so the 
 
 ```
 #!/usr/bin/env python3
-"""nexus.py — build a Zeek intel.dat from MISP, for Security Onion 3.2."""
+"""nexus.py — build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2."""
 
 # ── CONSTANTS ──────────────────────────────────────────────
-#   SO paths, Zeek type set, MISP→Zeek mapping table, defaults
+#   SO paths, Zeek type set, MISP→Zeek and OpenCTI→Zeek mapping tables, defaults
 
 # ── LOGGING ────────────────────────────────────────────────
 #   setup_logging(), a redacting Filter that scrubs the API token
 
-# ── MISP CLIENT ────────────────────────────────────────────
-#   class MispClient:  _request, get_version, describe_types,
+# ── CLIENT ─────────────────────────────────────────────────
+#   class _HttpTransport:  shared urllib/TLS/retry base
+#   class MispClient(_HttpTransport):  get_version, describe_types,
 #                      get_tags, get_orgs, get_sharing_groups,
 #                      count_type, search_attributes (generator, paginated)
+#   class OpenctiClient(_HttpTransport):  _graphql, _check_errors,
+#                      get_version, get_labels, get_markings,
+#                      get_organizations, count_type, search_indicators
+#                      (cursor-paginated generator)
+#   flatten_attribute(attr) → one record; flatten_indicator(node,
+#   stats=None) → a *list*, one record per extracted observable value
+#   (an indicator carrying both an MD5 and a SHA-256 yields two rows).
+#   Both emit the same record shape (below), so everything downstream
+#   of this seam is source-agnostic
+#   parse_stix_pattern(pattern) — fallback for OpenCTI indicators with no
+#   linked observables; only for pattern_type == "stix"
+
+# ── FEEDS ──────────────────────────────────────────────────
+#   feed_provenance(), feed_is_selectable(), apply_feed_to_params()
+#   (MISP only — OpenCTI has no feed concept)
 
 # ── MAPPING ────────────────────────────────────────────────
-#   map_attribute(attr) -> [(indicator, intel_type), ...]
+#   map_attribute(record, table=MISP_TO_ZEEK or OPENCTI_TO_ZEEK)
+#     -> [(indicator, intel_type), ...]
 #   handles composite splitting: domain|ip, ip-src|port, filename|md5
+#   (OpenCTI observables carry no composite types of their own)
 
 # ── NORMALISE / VALIDATE ───────────────────────────────────
 #   norm_addr, norm_subnet, norm_domain, norm_url, norm_hash,
@@ -122,30 +151,49 @@ Internally organised into banner-delimited sections, in dependency order so the 
 #   ExclusionSet: RFC1918, own CIDRs, own domain suffixes, allowlist file
 
 # ── INTEL FILE ─────────────────────────────────────────────
-#   render_lines(), dedupe(), lint_lines(), read_existing(),
-#   merge_additive(), write_atomic(), backup()
+#   header_line(), render_meta(), render_line(), build_indicators()
+#   (dedup by (indicator, Intel::Type) happens inline here — there is no
+#   separate dedupe function), rows_to_lines(), lint_lines(), lint_file(),
+#   read_existing(), merge_additive(), backup_file(), write_atomic()
 
-# ── PROFILES ───────────────────────────────────────────────
-#   load_profile(), save_profile()   (JSON — no YAML dependency)
+# ── ENVIRONMENT CHECK ──────────────────────────────────────
+#   detect_so_version(), notice_policy_loaded(), check_env()  — stage 0
+
+# ── GUARDRAILS ─────────────────────────────────────────────
+#   check_size(), check_not_empty(), check_delta(), check_load_file(),
+#   check_broad_indicators(), run_guardrails()   (§8)
 
 # ── INTERVIEW ──────────────────────────────────────────────
 #   ask(), ask_yes_no(), ask_int(), ask_choice(), ask_multi(),
-#   then run_interview() -> Config, one stage per §4 heading
+#   discover() (MISP) / discover_opencti(),
+#   build_search_params() (MISP) / build_opencti_filters() (OpenCTI),
+#   then run_interview() -> Config, one stage per §4 heading,
+#   stages 2/2b/3/4/5 branching by source
+
+# ── PROFILES ───────────────────────────────────────────────
+#   load_profile(), save_profile()   (JSON, v2 schema with a v1 reader
+#   that migrates old MISP-only key names forward in memory)
+
+# ── DIFF ───────────────────────────────────────────────────
+#   indicator_delta(), summarise_delta(), unified_intel_diff()
 
 # ── APPLY ──────────────────────────────────────────────────
-#   ensure_load_file(), salt_apply(), check_reporter_log()
+#   seed_load_file(), salt_apply(), log_offset(), log_errors_since(),
+#   verify_runtime(), apply_to_grid()
 
 # ── MAIN ───────────────────────────────────────────────────
-#   argparse, mode dispatch, summary printing
+#   argparse (--source/--host/--misp), client factory picking
+#   MispClient or OpenctiClient from config["source"],
+#   mode dispatch, summary printing
 ```
 
 **Design rules that survive the single-file form:**
 
 - The mapping / normalise / filter / intel-file sections must not touch the network or the filesystem — pure functions over plain dicts, so they're testable by importing `nexus.py` from a test script.
 - Only `write_atomic()` may write to the live intel path.
-- `MispClient` is the only thing that speaks HTTP.
+- `_HttpTransport` is the only thing that speaks HTTP; `MispClient` and `OpenctiClient` both subclass it and are the only things that call it.
 
-Internal record shape after fetch:
+Internal record shape after fetch — produced by both `flatten_attribute(attr)` (MISP, one record per attribute) and `flatten_indicator(node, stats=None)` (OpenCTI, a *list* of records — one per observable value extracted from the indicator, so a file indicator carrying an MD5 and a SHA-256 fans out to two). The shape is identical either way, so mapping, normalisation and everything after it runs unchanged regardless of source:
 
 ```python
 {
@@ -162,7 +210,9 @@ Deploy: copy to `/usr/local/bin/nexus`, `chmod 750`, root-owned. Working state (
 
 ## 4. The interview
 
-The heart of the tool. Every question has a default in `[brackets]`; Enter accepts it. Every list-select is populated **live from the MISP instance**, never hardcoded. Answers are echoed as a summary for confirmation before anything is fetched or written.
+The heart of the tool. Every question has a default in `[brackets]`; Enter accepts it. Every list-select is populated **live from the connected instance**, never hardcoded. Answers are echoed as a summary for confirmation before anything is fetched or written.
+
+Stages 0, 6, 7 and 8 below call the same code regardless of source. Stages 1, 2, 2b, 3, 4 and 5 branch by source — MISP and OpenCTI variants are described side by side within each. (Stage 7's question wording is a partial exception — see the note under item 31.)
 
 ### Stage 0 — Environment check (no questions)
 
@@ -170,18 +220,30 @@ Detects SO version, verifies `/opt/so/saltstack/local/salt/zeek/policy/intel/` e
 
 ### Stage 1 — Connection
 
-1. MISP address (IP or hostname)
-2. Scheme + port `[https / 443]`
-3. Verify TLS certificate? `[yes]` — `no` warns and requires typed confirmation
+0. Threat intel platform `[misp / opencti]` — asked whenever `--source` was not already supplied on the command line; a caller that already knows skips the question.
+1. Platform address (IP or hostname) — prompt text is `MISP address` or `OpenCTI address` depending on the answer above.
+2. Scheme + port `[https / 443]` for either source; the http default is `[80]` for MISP and `[4000]` for OpenCTI (OpenCTI's conventional plaintext port).
+3. Verify TLS certificate? `[yes]` — `no` warns and requires typed confirmation (`INSECURE`), identical for both sources.
 4. HTTP proxy? `[none]`
-5. API token — `getpass`, never echoed, never logged
+5. API token — `getpass`, never echoed, never logged; prompt text is `MISP API token` or `OpenCTI API token`.
 6. Timeout / retries `[30s / 3]`
 
-→ `GET /servers/getVersion`. Shows MISP version and the token's owning org. Clean abort on 401/403.
+→ MISP: `GET /servers/getVersion`, showing MISP version and the token's owning org. OpenCTI: a `{ about { version } }` GraphQL query. Both abort cleanly on an authentication failure — for OpenCTI that means reading the `errors` array out of a 200 response, since GraphQL never uses 401/403 (see §2, OpenCTI API).
 
 ### Stage 2 — Discovery (no questions)
 
-Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap count per candidate attribute type so the operator sees **how many of each actually exist** before choosing.
+MISP: fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap count per candidate attribute type so the operator sees **how many of each actually exist** before choosing.
+
+OpenCTI: fetches labels, marking definitions, organisations, then an exact per-type indicator count from `pageInfo.globalCount`. Prints `N labels, N markings, N organisations` in the same shape as the MISP discovery line.
+
+### Stage 2b — Feeds
+
+MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On an OpenCTI run this stage prints one line and moves straight to stage 3 — skipping it silently would look like a bug to an operator used to the MISP flow:
+
+```
+-- Stage 2b: feeds
+  Not applicable to OpenCTI; provenance is filtered by author and label in stage 5.
+```
 
 ### Stage 3 — What IOCs do you want?
 
@@ -195,8 +257,10 @@ Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap
    [ ] filename         2,441   → Intel::FILE_NAME   (noisy)
    ```
 9. Composite types (`domain|ip`, `ip-src|port`, `filename|md5`) — emit both halves or one? `[both]`
-10. Treat `hostname` as `Intel::DOMAIN`? `[yes]`
+10. Treat `hostname` as `Intel::DOMAIN`? `[yes]` — the prompt text is identical on both sources; what branches is the type literal used to act on a `no`. MISP drops types starting `"hostname"`, OpenCTI drops `"Hostname"`, since the two platforms spell the type differently and a shared literal would silently do nothing on one of them.
 11. Emit `Intel::SUBNET` for CIDR values in IP attributes? `[yes]`
+
+**OpenCTI variant of stage 3.** Driven by `OPENCTI_IOC_CLASSES` instead of MISP's attribute-type table, annotated with live counts the same way, with `OPENCTI_OFF_BY_DEFAULT` (`User-Account`, `Software`) left unselected. The composite-type question (item 9) is skipped — no `OPENCTI_TO_ZEEK` entry has more than one target Zeek type, so it would be pure noise. The result populates the `x_opencti_main_observable_type` filter.
 
 ### Stage 4 — Quality filters
 
@@ -207,6 +271,18 @@ Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap
 16. Minimum event threat level? `[any]`
 17. Event analysis state? `[any / initial / ongoing / completed]`
 
+**Stage 4, OpenCTI variant** — MISP's `to_ids`/warninglist/threat-level questions have no OpenCTI counterpart, so this variant asks different questions entirely rather than a subset of the above:
+
+| Question | Default |
+|---|---|
+| Minimum `x_opencti_score` (0 = no filter) | 50 |
+| Minimum `confidence` (0 = no filter) | 0 |
+| Exclude revoked indicators? | yes |
+| Only indicators flagged for detection? | no |
+| Exclude indicators past their `valid_until`? | yes |
+
+`valid_until` is compared against the run's own UTC timestamp, resolved at query-build time; `build_opencti_filters(config, now=None)` takes an optional fixed `now` so tests stay deterministic.
+
 ### Stage 5 — Scope
 
 18. Time window: `last N days` / explicit `from`–`to` / `all` `[last 90d]`
@@ -216,6 +292,17 @@ Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap
 22. Restrict to organisations? `[all]`
 23. Restrict to sharing groups / distribution level? `[all]`
 24. Restrict to specific event IDs/UUIDs? `[none]`
+
+**Stage 5, OpenCTI variant** — the MISP questions with no OpenCTI counterpart (sharing groups, event ids, threat level, analysis state) are simply not asked:
+
+| Question | Notes |
+|---|---|
+| Include labels | multi-select from discovery, translated name→id; an unresolvable name is dropped with a warning, never guessed at |
+| Exclude labels | same, as a nested "not" filter group |
+| TLP markings | multi-select from discovery, translated name→id |
+| Created by (organisations) | multi-select from discovery, translated name→id |
+| Time window | `all` / `last N days` / explicit range `[all]` |
+| Timestamp field | `created_at` or `valid_from` `[created_at]` |
 
 ### Stage 6 — Local exclusions
 
@@ -230,7 +317,7 @@ Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap
 
 29. `meta.source` format: fixed string / `MISP` / `MISP-<org>` / `MISP-event-<id>` `[MISP-event-<id>]`
 30. `meta.desc` template over `{event_info}`, `{category}`, `{tags}`, `{comment}`, `{type}`, `{org}`, `{uuid}` `[{event_info} | {category}]`
-31. `meta.url` — link back to the MISP event? `[yes → https://<misp>/events/view/<id>]`
+31. `meta.url` — link back to the source event/indicator? `[yes]`. The question wording and the `meta.source` preset choices (item 29) are still MISP-flavored on an OpenCTI run — a cosmetic gap, not a functional one, since "fixed string" is always available. The computed URL itself is correct either way: `[https://<misp>/events/view/<id>]` for MISP, `[https://<opencti>/dashboard/observations/indicators/<id>]` for OpenCTI — `render_meta` branches on `config["source"]`.
 32. Emit `meta.do_notice`? `[no]` — detects whether `do_notice.zeek` is loaded
 33. Max metadata field length `[200]`
 
@@ -246,13 +333,13 @@ Fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a cheap
 
 ### Pre-flight summary
 
-Before fetching: prints the resolved MISP query, estimated result count, and every filter in effect, then one final confirmation. Before writing: prints a per-type breakdown (kept / dropped / deduped / excluded) and asks again.
+Before fetching: prints the resolved query for whichever source was chosen — the MISP restSearch parameters or the OpenCTI `FilterGroup` from `build_opencti_filters` — plus estimated result count and every filter in effect, then one final confirmation. Before writing: prints a per-type breakdown (kept / dropped / deduped / excluded) and asks again. `summarise_config` leads with a `source` line so a saved profile or `--explain` output is unambiguous about which platform it targets.
 
 ---
 
 ## 4b. Feed selection
 
-Stage 2b, between discovery and IOC selection. `GET /feeds` lists what's configured; the operator picks which to pull from.
+Stage 2b, between discovery and IOC selection. `GET /feeds` lists what's configured; the operator picks which to pull from. **MISP only** — OpenCTI has no post-ingest feed concept to trace; on an OpenCTI run this stage prints one line and moves on, and the equivalent provenance narrowing (author, label) happens in stage 5 instead (see §4 above).
 
 **The constraint that shapes everything here:** `/attributes/restSearch` has **no `feed_id` filter**. Once a feed's data is ingested it is just attributes. A feed is only recoverable through the trace it leaves, and Nexus uses the most precise one available:
 
@@ -275,6 +362,8 @@ Feed choice ANDs with every existing filter — `to_ids`, warninglist, time wind
 ---
 
 ## 5. Type mapping
+
+This table is `MISP_TO_ZEEK`. The OpenCTI equivalent, `OPENCTI_TO_ZEEK`, is a separate, smaller table keyed on OpenCTI observable entity types (`IPv4-Addr`, `Domain-Name`, `X509-SHA-1`, …) — see `HANDOFF.md` §4 (Architecture) for where it lives, and §6 for the certificate-hash gotcha specific to it. `map_attribute` takes either table as its `table=` argument, so the splitting/dedup logic below is shared, not duplicated.
 
 | MISP attribute type | Zeek `Intel::Type` | Notes |
 |---|---|---|
@@ -327,7 +416,7 @@ Per Intel type, before an indicator enters the file:
 6. Exactly one `\n` after the last record, no trailing blank line.
 7. Confirm `__load__.Zeek` is still present alongside it.
 
-**Merge mode**: existing lines whose `meta.source` does *not* match the Nexus source prefix are preserved verbatim at the top, so hand-maintained entries survive regeneration.
+**Merge mode**: append-only. `cmd_build` calls `merge_additive()`, which keeps *every* existing line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
 
 **Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count.
 
@@ -379,11 +468,11 @@ nexus --profile daily.json             # replay answers, prompt only for token
 nexus --profile daily.json --yes       # fully unattended
 nexus --profile daily.json --dry-run --diff
 nexus --lint /path/to/intel.dat        # validate a file, no MISP needed
-nexus --explain --profile daily.json   # print the resolved MISP query, fetch nothing
+nexus --explain --profile daily.json   # print the resolved platform query, fetch nothing
 nexus --check-env                      # stage 0 only: paths, __load__.Zeek, SO version
 ```
 
-Token resolution order: `--token-file` → `NEXUS_MISP_TOKEN` env → `/opt/nexus/credentials.json` (0600) → interactive prompt. Under `--yes` the prompt is skipped and the run fails loudly instead — an unattended job must never block forever on a `getpass` nobody will answer.
+Token resolution order: `--token-file` → env (`NEXUS_TOKEN`, then the deprecated `NEXUS_MISP_TOKEN` for back-compat) → `/opt/nexus/credentials.json` (0600) → interactive prompt. Under `--yes` the prompt is skipped and the run fails loudly instead — an unattended job must never block forever on a `getpass` nobody will answer.
 
 **Profiles never store the token**, and never store the `discovery` cache either (live MISP lists are stale the moment they're written). Written `0600`, and an existing looser file is re-tightened on overwrite. A token hand-added to a profile is dropped on load rather than honoured.
 
@@ -407,11 +496,12 @@ Scheduled runs via a systemd timer (`nexus.service` + `nexus.timer`), not cron, 
 
 A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constraint, runnable with `python3 -m unittest`.
 
-- **Unit** — mapping, normalisation, filters, rendering against fixture attribute dicts. Table-driven, one case per MISP type including every malformed variant.
-- **Golden file** — fixture MISP response → expected `intel.dat`, byte-for-byte. Catches the whitespace regressions the SO docs explicitly warn about.
-- **Fake MISP** — `http.server` responder replaying canned `restSearch` pages; exercises pagination, 401, 403, 429, timeout, malformed JSON, mid-pagination failure.
-- **Linter self-test** — writer output must always pass `--lint`.
-- **Integration** — against a MISP training VM or `demo.misp-project.org`, then a lab SO 3.2 grid: seed `__load__.Zeek`, apply, confirm the file reaches `/opt/so/conf/zeek/policy/intel/`, clean `reporter.log`, generate a hit, confirm it lands in `intel.log`.
+- **Unit** — mapping, normalisation, filters, rendering against fixture attribute/indicator dicts. Table-driven, one case per MISP type and per OpenCTI observable type, including every malformed variant.
+- **Golden file** — fixture MISP response → expected `intel.dat`, byte-for-byte. Catches the whitespace regressions the SO docs explicitly warn about. A parallel OpenCTI fixture exercises the same golden-file path through `flatten_indicator` and the STIX pattern fallback.
+- **Fake MISP** — `http.server` responder (`FakeMisp`/`FakeMispHandler`) replaying canned `restSearch` pages; exercises pagination, 401, 403, 429, timeout, malformed JSON, mid-pagination failure.
+- **Fake OpenCTI** — the GraphQL counterpart (`FakeOpencti`/`FakeOpenctiHandler`), replaying canned query responses; exercises cursor pagination, a 200-with-`errors` auth rejection, and a cursor that fails to advance.
+- **Linter self-test** — writer output must always pass `--lint`, for either source.
+- **Integration** — against a MISP training VM or `demo.misp-project.org`, and an OpenCTI instance, then a lab SO 3.2 grid: seed `__load__.Zeek`, apply, confirm the file reaches `/opt/so/conf/zeek/policy/intel/`, clean `reporter.log`, generate a hit, confirm it lands in `intel.log`. Not yet done against a real OpenCTI — see `HANDOFF.md` §7.
 
 ---
 
@@ -427,8 +517,9 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 | 5 ✅ | Local exclusions + all §8 guardrails | a test per refusal path |
 | 6 ✅ | Apply — `__load__.Zeek` seeding, salt apply, reporter check | lab grid: apply → hit in `intel.log` |
 | 7 | systemd timer, install steps, operator README | fresh-manager install works |
+| 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (449 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
 
-Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for.
+Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phase 8 was taken out of numeric order — it landed after phase 6 while phase 7 (systemd timer, install docs) was still outstanding, since it is source-neutral to the deployment mechanics phase 7 covers.
 
 ---
 
@@ -440,6 +531,7 @@ Phases 1–2 are independently useful and fully testable without a Security Onio
 - Feedback loop: query Elastic for `intel.log` hits to find which indicators actually fire, and prune the dead weight.
 - MISP **event**-level pull (`/events/restSearch`) for richer `meta.desc` context.
 - PyMISP as an optional backend where it's already installed.
+- Specific to OpenCTI (spec §13): querying MISP and OpenCTI in the same run; OpenCTI Observables as a source (Indicators only, per the decision in `HANDOFF.md` §5); OpenCTI 5.x flat-filter syntax; writing anything back to OpenCTI (no sightings, no hit feedback — Nexus stays read-only against both platforms); OpenCTI connectors, streams and the live-stream API (this is a polled pull, the same shape as the MISP path); relationship traversal (indicator → intrusion set → campaign) for richer `meta.desc`.
 
 ---
 
@@ -447,8 +539,8 @@ Phases 1–2 are independently useful and fully testable without a Security Onio
 
 1. Exact 3.2.x point release on the target manager, and whether the local intel dir is currently populated (does `__load__.Zeek` exist there today?).
 2. Does that grid already have an intel feed or anything else managing that file? Merge mode depends on the answer.
-4. Expected indicator volume from your MISP — drives the cap, and whether aging moves up from §14.
-5. Unattended on a schedule from day one, or interactive-only until it's trusted?
+3. Expected indicator volume from your MISP — drives the cap, and whether aging moves up from §14.
+4. Unattended on a schedule from day one, or interactive-only until it's trusted?
 
 ---
 

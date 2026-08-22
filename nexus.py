@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""nexus.py - build a Zeek intel.dat from MISP, for Security Onion 3.2.
+"""nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
 
-Phases 0-3 and 5: environment check, MISP client, the mapping/normalise/write
-core, the interactive interview, and the safety guardrails.
+Phases 0-6 and 8: environment check, source client (MISP or OpenCTI), the
+mapping/normalise/write core, the interactive interview, profiles and the
+unattended modes, the safety guardrails, apply-to-grid, and OpenCTI as a
+second source.  Phase 7 (systemd timer, install docs) is outstanding.
+One source per run, selected in the interview or via --source.
 
 Standard library only.  Python 3.6+.
 """
@@ -10,6 +13,7 @@ Standard library only.  Python 3.6+.
 import argparse
 import difflib
 import getpass
+import http.client
 import ipaddress
 import json
 import logging
@@ -24,9 +28,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-__version__ = "0.2.0-dev"
+__version__ = "0.3.0-dev"
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -56,10 +60,16 @@ SO_ZEEK_POLICY_DIRS = (
 # Nexus working state.
 NEXUS_HOME = "/opt/nexus"
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 # Never persisted.  The token is a secret; `discovery` is a cache of live MISP
 # lists that would be stale the moment it is written.
-PROFILE_EXCLUDED_KEYS = ("token", "discovery")
+PROFILE_EXCLUDED_KEYS = ("token", "discovery", "_stats")
+# v1 predates OpenCTI support and named everything after MISP.
+PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
+                      "misp_base_url": "source_base_url"}
+
+SOURCES = ("misp", "opencti")
+SOURCE_LABELS = {"misp": "MISP", "opencti": "OpenCTI"}
 
 # Zeek Intel framework.  This is the complete Intel::Type set.
 ZEEK_TYPES = (
@@ -172,6 +182,151 @@ IOC_CLASSES = {
               "whois-registrant-name"]),
 }
 
+# -- OpenCTI ---------------------------------------------------------------
+# Keys here are the value types flatten_indicator() emits, not OpenCTI entity
+# types: a StixFile observable yields one record per hash plus one for its name,
+# so the hash algorithm is the key that reaches the mapper.
+OPENCTI_TO_ZEEK = {
+    "IPv4-Addr":    [(0, "Intel::ADDR")],
+    "IPv6-Addr":    [(0, "Intel::ADDR")],
+    "Domain-Name":  [(0, "Intel::DOMAIN")],
+    "Hostname":     [(0, "Intel::DOMAIN")],
+    "Url":          [(0, "Intel::URL")],
+    "Email-Addr":   [(0, "Intel::EMAIL")],
+    "File-Name":    [(0, "Intel::FILE_NAME")],
+    "MD5":          [(0, "Intel::FILE_HASH")],
+    "SHA-1":        [(0, "Intel::FILE_HASH")],
+    "SHA-224":      [(0, "Intel::FILE_HASH")],
+    "SHA-256":      [(0, "Intel::FILE_HASH")],
+    "SHA-384":      [(0, "Intel::FILE_HASH")],
+    "SHA-512":      [(0, "Intel::FILE_HASH")],
+    # Certificate SHA-1 is Intel::CERT_HASH, not Intel::FILE_HASH, so it needs
+    # a key of its own rather than sharing "SHA-1".
+    "X509-SHA-1":   [(0, "Intel::CERT_HASH")],
+    "User-Account": [(0, "Intel::USER_NAME")],
+    "Software":     [(0, "Intel::SOFTWARE")],
+}
+
+OPENCTI_UNMAPPABLE = {
+    "Mutex": "no Zeek Intel equivalent",
+    "Windows-Registry-Key": "no Zeek Intel equivalent",
+    "Autonomous-System": "no Zeek Intel equivalent",
+    "Process": "no Zeek Intel equivalent",
+    "Directory": "no Zeek Intel equivalent",
+    "Network-Traffic": "no Zeek Intel equivalent",
+    "Cryptocurrency-Wallet": "no Zeek Intel equivalent",
+    "Phone-Number": "no Zeek Intel equivalent",
+    "Text": "free-form, not an indicator",
+    "X509-MD5": "Intel::CERT_HASH is SHA-1 only",
+    "X509-SHA-256": "Intel::CERT_HASH is SHA-1 only",
+    "SSDEEP": "fuzzy hash, no Zeek equivalent",
+    "TLSH": "fuzzy hash, no Zeek equivalent",
+}
+
+# Keyed on x_opencti_main_observable_type, which is what the type filter takes.
+OPENCTI_IOC_CLASSES = {
+    "network": ("Network - IP / subnet / domain / URL",
+                ["IPv4-Addr", "IPv6-Addr", "Domain-Name", "Hostname", "Url"]),
+    "file": ("File - hashes / filenames", ["StixFile", "Artifact"]),
+    "email": ("Email - addresses", ["Email-Addr"]),
+    "tls": ("TLS - certificate hashes", ["X509-Certificate"]),
+    "host": ("Host - user agents / usernames", ["User-Account", "Software"]),
+}
+
+OPENCTI_IOC_CLASS_ORDER = ("network", "file", "email", "tls", "host")
+
+OPENCTI_OFF_BY_DEFAULT = frozenset(("User-Account", "Software"))
+
+# Two vocabularies meet here.  config["types"] holds
+# x_opencti_main_observable_type names, because that is what the server-side
+# type filter takes; flatten_indicator() emits the finer OPENCTI_TO_ZEEK keys,
+# because a StixFile carries several value types at once.  This is the
+# expansion between them -- identity where the two happen to agree.
+_OPENCTI_FILE_RECORD_TYPES = ["File-Name", "MD5", "SHA-1", "SHA-224",
+                              "SHA-256", "SHA-384", "SHA-512", "SSDEEP",
+                              "TLSH"]
+
+OPENCTI_MAIN_TO_RECORD_TYPES = {
+    "IPv4-Addr":        ["IPv4-Addr"],
+    "IPv6-Addr":        ["IPv6-Addr"],
+    "Domain-Name":      ["Domain-Name"],
+    "Hostname":         ["Hostname"],
+    "Url":              ["Url"],
+    "Email-Addr":       ["Email-Addr"],
+    "StixFile":         _OPENCTI_FILE_RECORD_TYPES,
+    "Artifact":         _OPENCTI_FILE_RECORD_TYPES,
+    "X509-Certificate": ["X509-SHA-1", "X509-MD5", "X509-SHA-256"],
+    "User-Account":     ["User-Account"],
+    "Software":         ["Software"],
+}
+
+
+def opencti_record_types(main_types):
+    """Selected main observable types -> the record types they can emit.
+
+    Emissions with no Zeek equivalent (SSDEEP, X509-SHA-256) are included on
+    purpose: they then reach build_indicators' unmapped counter instead of
+    being dropped without a word.
+    """
+    out = []
+    for main_type in main_types or ():
+        for record_type in OPENCTI_MAIN_TO_RECORD_TYPES.get(main_type,
+                                                            [main_type]):
+            if record_type not in out:
+                out.append(record_type)
+    return out
+
+
+def opencti_zeek_types(main_type):
+    """The Zeek Intel types one main observable type can produce, in order."""
+    out = []
+    for record_type in OPENCTI_MAIN_TO_RECORD_TYPES.get(main_type,
+                                                        [main_type]):
+        for _, zeek_type in OPENCTI_TO_ZEEK.get(record_type, ()):
+            if zeek_type not in out:
+                out.append(zeek_type)
+    return out
+
+# Observable entity types whose observable_value maps straight to a mapping-table
+# key.  Anything not here needs field-specific extraction (hashes, logins).
+OPENCTI_OBSERVABLE_TYPE_ALIASES = {
+    "IPv4-Addr": "IPv4-Addr",
+    "IPv6-Addr": "IPv6-Addr",
+    "Domain-Name": "Domain-Name",
+    "Hostname": "Hostname",
+    "Url": "Url",
+    "Email-Addr": "Email-Addr",
+}
+
+GRAPHQL_PATH = "/graphql"
+OPENCTI_DEFAULT_PORT_HTTP = 4000
+# GraphQL answers 200 even when it refuses you, so auth failure has to be read
+# out of the error body rather than the status line.
+OPENCTI_AUTH_ERROR_CODES = frozenset(
+    ("AUTH_REQUIRED", "FORBIDDEN_ACCESS", "AUTH_FAILURE", "UNAUTHORIZED"))
+_OPENCTI_AUTH_PATTERN = re.compile(
+    r"\bunauthori[sz]ed\b|\bforbidden\b|\bauthenticat\w*\b"
+    r"|\bmust be logged in\b|\blogged in\b|invalid token|expired token"
+    r"|missing token", re.IGNORECASE)
+
+# Connectors write the same algorithm a dozen ways; the mapping table holds one.
+_HASH_ALGORITHM_ALIASES = {
+    "MD5": "MD5", "SHA1": "SHA-1", "SHA-1": "SHA-1",
+    "SHA224": "SHA-224", "SHA-224": "SHA-224",
+    "SHA256": "SHA-256", "SHA-256": "SHA-256",
+    "SHA384": "SHA-384", "SHA-384": "SHA-384",
+    "SHA512": "SHA-512", "SHA-512": "SHA-512",
+    "SSDEEP": "SSDEEP", "TLSH": "TLSH",
+}
+
+
+def normalise_hash_algorithm(label):
+    """OpenCTI hash algorithm label -> the OPENCTI_TO_ZEEK key."""
+    key = (label or "").strip().upper().replace("_", "-")
+    return _HASH_ALGORITHM_ALIASES.get(key, _HASH_ALGORITHM_ALIASES.get(
+        key.replace("-", ""), key))
+
+
 log = logging.getLogger("nexus")
 
 
@@ -266,7 +421,7 @@ def setup_logging(verbose=False, logfile=None, required=True):
 
 
 # ---------------------------------------------------------------------------
-# MISP CLIENT
+# CLIENT
 # ---------------------------------------------------------------------------
 
 def _is_loopback(host):
@@ -297,24 +452,31 @@ class NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
             self, req, fp, code, msg, headers, newurl)
 
 
-class MispError(Exception):
-    """Any failure talking to MISP."""
+class SourceError(Exception):
+    """Any failure talking to a threat intel platform."""
 
 
-class MispAuthError(MispError):
-    """401/403 -- bad or unprivileged token."""
+class SourceAuthError(SourceError):
+    """The platform rejected the API token."""
 
 
-class MispClient(object):
-    """Minimal MISP REST client over urllib.
+# The MISP names predate OpenCTI support.  Kept so existing call sites and
+# tests keep working; new code raises and catches the neutral names.
+MispError = SourceError
+MispAuthError = SourceAuthError
 
-    Only this class speaks HTTP.  Everything downstream sees flattened dicts.
+
+class _HttpTransport(object):
+    """Shared HTTP plumbing.  Subclasses own their auth header and their API.
+
+    Only transport subclasses speak HTTP.  Everything downstream sees flattened
+    dicts.
     """
 
     RETRY_STATUS = frozenset((429, 500, 502, 503, 504))
 
     def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
-                 proxy=None, timeout=30, retries=3, page_size=1000):
+                 proxy=None, timeout=30, retries=3):
         self.host = host
         self.scheme = scheme
         self.port = port
@@ -322,7 +484,6 @@ class MispClient(object):
         self.verify_tls = verify_tls
         self.timeout = timeout
         self.retries = max(1, retries)  # retries=0 would send no request at all
-        self.page_size = page_size
         REDACTOR.add_secret(token)
 
         netloc = host if not port else "%s:%d" % (host, port)
@@ -348,18 +509,19 @@ class MispClient(object):
             handlers.append(urllib.request.ProxyHandler({}))
         self._opener = urllib.request.build_opener(*handlers)
 
-    # -- transport ---------------------------------------------------------
+    def _auth_headers(self):
+        raise NotImplementedError("a transport subclass must supply its auth header")
 
     def _request(self, method, path, body=None):
         """Return (parsed_json, headers).  Retries on transient failures."""
         url = urllib.parse.urljoin(self.base_url, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {
-            "Authorization": self.token,
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": "nexus/%s" % __version__,
         }
+        headers.update(self._auth_headers())
 
         last_exc = None
         for attempt in range(1, self.retries + 1):
@@ -371,8 +533,9 @@ class MispClient(object):
                     return self._decode(raw, url), resp.headers
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
-                    raise MispAuthError(
-                        "MISP rejected the API token (HTTP %d) for %s" % (exc.code, url)
+                    raise SourceAuthError(
+                        "the platform rejected the API token (HTTP %d) for %s"
+                        % (exc.code, url)
                     )
                 if exc.code in self.RETRY_STATUS and attempt < self.retries:
                     last_exc = exc
@@ -383,15 +546,21 @@ class MispClient(object):
                     detail = exc.read().decode("utf-8", "replace")[:500]
                 except Exception:  # pragma: no cover - best effort only
                     pass
-                raise MispError("HTTP %d from %s %s" % (exc.code, url, detail))
+                raise SourceError("HTTP %d from %s %s" % (exc.code, url, detail))
+            except (UnicodeError, http.client.InvalidURL) as exc:
+                # urllib rejects a malformed host before it opens a socket,
+                # and neither of these is an OSError.  Retrying cannot help:
+                # the URL will be just as unbuildable next time.
+                raise SourceError("cannot build a request for %s: %s"
+                                  % (url, exc))
             except (urllib.error.URLError, ssl.SSLError, OSError) as exc:
                 if attempt < self.retries:
                     last_exc = exc
                     self._backoff(attempt, str(exc))
                     continue
-                raise MispError("could not reach %s: %s" % (url, exc))
-        raise MispError("giving up on %s after %d attempts: %s"
-                        % (url, self.retries, last_exc))
+                raise SourceError("could not reach %s: %s" % (url, exc))
+        raise SourceError("giving up on %s after %d attempts: %s"
+                          % (url, self.retries, last_exc))
 
     @staticmethod
     def _decode(raw, url):
@@ -400,13 +569,27 @@ class MispClient(object):
         try:
             return json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
-            raise MispError("malformed JSON from %s: %s" % (url, exc))
+            raise SourceError("malformed JSON from %s: %s" % (url, exc))
 
     @staticmethod
     def _backoff(attempt, reason):
         delay = min(2 ** attempt, 30)
         log.debug("retrying in %ss (%s)", delay, reason)
         time.sleep(delay)
+
+
+class MispClient(_HttpTransport):
+    """Minimal MISP REST client over urllib."""
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, page_size=1000):
+        _HttpTransport.__init__(self, host, token, scheme=scheme, port=port,
+                                verify_tls=verify_tls, proxy=proxy,
+                                timeout=timeout, retries=retries)
+        self.page_size = page_size
+
+    def _auth_headers(self):
+        return {"Authorization": self.token}
 
     # -- discovery ---------------------------------------------------------
 
@@ -555,11 +738,284 @@ class MispClient(object):
         return [a for a in attrs if isinstance(a, dict)]
 
 
+def merge_opencti_filters(base, extra_filters):
+    """Return a FilterGroup with `extra_filters` ANDed onto `base`."""
+    merged = {"mode": "and", "filters": [], "filterGroups": []}
+    if isinstance(base, dict):
+        merged["mode"] = base.get("mode") or "and"
+        merged["filters"] = list(base.get("filters") or [])
+        merged["filterGroups"] = list(base.get("filterGroups") or [])
+    merged["filters"] = merged["filters"] + list(extra_filters or [])
+    return merged
+
+
+class OpenctiClient(_HttpTransport):
+    """Minimal OpenCTI 6.x GraphQL client over urllib."""
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, page_size=100):
+        _HttpTransport.__init__(self, host, token, scheme=scheme, port=port,
+                                verify_tls=verify_tls, proxy=proxy,
+                                timeout=timeout, retries=retries)
+        self.page_size = page_size
+
+    def _auth_headers(self):
+        return {"Authorization": "Bearer %s" % self.token}
+
+    def _graphql(self, query, variables=None):
+        body = {"query": query, "variables": variables or {}}
+        payload, _ = self._request("POST", GRAPHQL_PATH, body)
+        self._check_errors(payload)
+        return payload.get("data") or {}
+
+    @staticmethod
+    def _check_errors(payload):
+        """GraphQL reports failure inside a 200 response, so read the body.
+
+        Unhandled, a rejected token looks exactly like an empty result set and
+        a scheduled run would report "0 new indicators" forever.
+        """
+        if not isinstance(payload, dict):
+            raise SourceError("OpenCTI returned %s, not a JSON object"
+                              % type(payload).__name__)
+        errors = payload.get("errors") or []
+        if errors:
+            first = errors[0] if isinstance(errors[0], dict) else {}
+            message = str(first.get("message") or "unspecified GraphQL error")
+            code = str((first.get("extensions") or {}).get("code") or "")
+            if code in OPENCTI_AUTH_ERROR_CODES or _OPENCTI_AUTH_PATTERN.search(message):
+                raise SourceAuthError("OpenCTI rejected the API token: %s" % message)
+            raise SourceError("OpenCTI error: %s" % message)
+        if payload.get("data") is None:
+            raise SourceError("OpenCTI returned no data and no error")
+
+    def get_version(self):
+        data = self._graphql("query NexusVersion { about { version } }")
+        about = data.get("about") or {}
+        return {"version": about.get("version") or "unknown"}
+
+    # -- discovery ---------------------------------------------------------
+
+    LABELS_QUERY = """
+    query NexusLabels($first: Int!) {
+      labels(first: $first) { edges { node { id value } } }
+    }
+    """
+
+    MARKINGS_QUERY = """
+    query NexusMarkings($first: Int!) {
+      markingDefinitions(first: $first) {
+        edges { node { id definition definition_type } }
+      }
+    }
+    """
+
+    ORGANIZATIONS_QUERY = """
+    query NexusOrganizations($first: Int!) {
+      organizations(first: $first) { edges { node { id name } } }
+    }
+    """
+
+    COUNT_QUERY = """
+    query NexusCount($filters: FilterGroup) {
+      indicators(first: 1, filters: $filters) {
+        pageInfo { globalCount endCursor hasNextPage }
+        edges { node { id } }
+      }
+    }
+    """
+
+    def get_labels(self, first=500):
+        data = self._graphql(self.LABELS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "value": n.get("value")}
+                for n in _edge_nodes(data.get("labels"))
+                if n.get("value")]
+
+    def get_markings(self, first=200):
+        data = self._graphql(self.MARKINGS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "definition": n.get("definition"),
+                 "definition_type": n.get("definition_type")}
+                for n in _edge_nodes(data.get("markingDefinitions"))
+                if n.get("definition")]
+
+    def get_organizations(self, first=500):
+        data = self._graphql(self.ORGANIZATIONS_QUERY, {"first": first})
+        return [{"id": n.get("id"), "name": n.get("name")}
+                for n in _edge_nodes(data.get("organizations"))
+                if n.get("name")]
+
+    def count_type(self, main_observable_type, base_filters=None,
+                   probe_limit=None):
+        """Return (count, exact).
+
+        globalCount is an exact total, unlike MISP's bounded probe.  It is
+        permission-dependent, so when it's missing or unreadable we fall back
+        to what the page actually returned and say so rather than reporting a
+        guess as fact.
+
+        The fallback's exactness still holds even without globalCount:
+        COUNT_QUERY asks for `first: 1`, so `hasNextPage=False` means that
+        single row *was* the whole result set and len(nodes) (0 or 1) is the
+        true total, not a lower bound.  This is coupled to the query's page
+        size — if COUNT_QUERY's `first:` ever grows past 1, `not hasNextPage`
+        stops meaning "we saw everything" and this exactness claim must
+        change with it.
+
+        probe_limit is accepted and ignored so this stays call-compatible
+        with MispClient.count_type; a later stage calls both through one
+        code path.
+        """
+        filters = merge_opencti_filters(base_filters, [{
+            "key": ["x_opencti_main_observable_type"],
+            "values": [main_observable_type],
+            "operator": "eq", "mode": "or"}])
+        data = self._graphql(self.COUNT_QUERY, {"filters": filters})
+        connection = data.get("indicators") or {}
+        page_info = connection.get("pageInfo") or {}
+        if page_info.get("globalCount") is not None:
+            try:
+                return int(page_info["globalCount"]), True
+            except (TypeError, ValueError):
+                pass
+        # first: 1 above means a closed page (no hasNextPage) already saw the
+        # entire result set, so len(nodes) is exact even without globalCount.
+        nodes = _edge_nodes(connection)
+        return len(nodes), not page_info.get("hasNextPage")
+
+    # -- search ------------------------------------------------------------
+
+    INDICATORS_QUERY = """
+    query NexusIndicators($first: Int!, $after: ID, $filters: FilterGroup) {
+      indicators(first: $first, after: $after, filters: $filters,
+                 orderBy: created_at, orderMode: asc) {
+        pageInfo { endCursor hasNextPage globalCount }
+        edges {
+          node {
+            id
+            standard_id
+            name
+            description
+            pattern
+            pattern_type
+            x_opencti_detection
+            created_at
+            updated_at
+            createdBy { ... on Identity { name } }
+            objectLabel { id value }
+            objectMarking { id definition }
+            observables(first: 50) {
+              pageInfo { hasNextPage }
+              edges {
+                node {
+                  id
+                  entity_type
+                  observable_value
+                  ... on StixFile { name hashes { algorithm hash } }
+                  ... on Artifact { hashes { algorithm hash } }
+                  ... on X509Certificate { hashes { algorithm hash } }
+                  ... on UserAccount { account_login }
+                  ... on Software { name }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    def search_indicators(self, filters, max_results=None, max_pages=None,
+                          stats=None):
+        """Yield flattened records, walking the cursor until OpenCTI runs dry.
+
+        The sort is fixed so the cursor walk is stable: an instance ingesting
+        during a long pull would otherwise shift the window and drop rows.
+        """
+        after = None
+        previous_cursor = None
+        yielded = 0
+        pages = 0
+        while max_pages is None or pages < max_pages:
+            data = self._graphql(self.INDICATORS_QUERY, {
+                "first": self.page_size, "after": after, "filters": filters})
+            connection = data.get("indicators") or {}
+            nodes = _edge_nodes(connection)
+            page_info = connection.get("pageInfo") or {}
+            pages += 1
+
+            for node in nodes:
+                for record in self._records_for(node, stats):
+                    yield record
+                    yielded += 1
+                    if max_results is not None and yielded >= max_results:
+                        log.info("stopped at max_results=%d", max_results)
+                        return
+
+            if not page_info.get("hasNextPage"):
+                return
+            cursor = page_info.get("endCursor")
+            # A proxy that drops `after` would otherwise replay page one for ever.
+            if not cursor or cursor == previous_cursor:
+                log.warning("stopped because OpenCTI did not advance the cursor "
+                            "-- does this endpoint honour `after`?")
+                return
+            previous_cursor = cursor
+            after = cursor
+        log.warning("stopped at the explicit %d page ceiling", max_pages)
+
+    def _records_for(self, node, stats):
+        """Records from linked observables, falling back to the STIX pattern."""
+        records = flatten_indicator(node, stats=stats)
+        if records:
+            return records
+
+        pattern_type = (node.get("pattern_type") or "").lower()
+        if pattern_type not in OPENCTI_PARSEABLE_PATTERN_TYPES:
+            if stats is not None:
+                stats.opencti_non_stix_patterns += 1
+            return []
+
+        pairs = parse_stix_pattern(node.get("pattern"))
+        if not pairs:
+            if stats is not None:
+                stats.opencti_unparsed_patterns += 1
+            return []
+        if stats is not None:
+            stats.opencti_pattern_fallbacks += 1
+
+        # flatten_indicator with no observables still produced the shared
+        # metadata; rebuild records around the parsed values.
+        stripped = dict(node)
+        out = []
+        for value_type, value in pairs:
+            stripped["observables"] = {"pageInfo": {"hasNextPage": False},
+                                       "edges": [{"node": {
+                                           "entity_type": "__parsed__",
+                                           "observable_value": value}}]}
+            built = flatten_indicator(stripped)
+            if built:
+                built[0]["type"] = value_type
+                out.append(built[0])
+        return out
+
+
 def _misp_bool(value):
     """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""
     if isinstance(value, str):
         return value not in ("0", "", "false", "False")
     return bool(value)
+
+
+def _edge_nodes(connection):
+    """Relay connection -> the list of node dicts, tolerating nulls."""
+    if not isinstance(connection, dict):
+        return []
+    out = []
+    for edge in connection.get("edges") or []:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if isinstance(node, dict):
+            out.append(node)
+    return out
 
 
 def flatten_attribute(attr):
@@ -590,6 +1046,192 @@ def flatten_attribute(attr):
         "event_tags": tags,
         "org": (event.get("Orgc") or {}).get("name") or event.get("org_id") or "",
     }
+
+
+def _opencti_timestamp_text(value):
+    """OpenCTI ISO-8601 -> a string strptime("%z") can take on Python 3.6.
+
+    strptime's %z directive only learned to accept a colon in the offset in
+    3.7 (the ":?" in CPython's _strptime.TimeRE pattern) -- this project's
+    floor is 3.6, so "+00:00" has to become "+0000" before parsing, not after.
+    """
+    text = str(value).strip().replace("Z", "+0000")
+    # OpenCTI emits millisecond precision; datetime in 3.6 will not take it.
+    text = re.sub(r"\.\d+", "", text)
+    return re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", text)
+
+
+def _opencti_epoch(value):
+    """ISO-8601 from OpenCTI -> epoch seconds, or "" when it will not parse."""
+    if not value:
+        return ""
+    text = _opencti_timestamp_text(value)
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return ""
+    return int(parsed.timestamp())
+
+
+def _observable_values(observable):
+    """One observable -> [(mapping_table_key, value), ...]."""
+    entity_type = observable.get("entity_type") or ""
+    value = (observable.get("observable_value") or "").strip()
+
+    alias = OPENCTI_OBSERVABLE_TYPE_ALIASES.get(entity_type)
+    if alias:
+        return [(alias, value)] if value else []
+
+    out = []
+    if entity_type in ("StixFile", "Artifact"):
+        name = (observable.get("name") or "").strip()
+        if name:
+            out.append(("File-Name", name))
+        for entry in observable.get("hashes") or []:
+            digest = (entry.get("hash") or "").strip()
+            if digest:
+                out.append((normalise_hash_algorithm(entry.get("algorithm")),
+                            digest))
+    elif entity_type == "X509-Certificate":
+        for entry in observable.get("hashes") or []:
+            digest = (entry.get("hash") or "").strip()
+            if digest:
+                # Certificate hashes are Intel::CERT_HASH, and only SHA-1 is;
+                # the X509- prefix keeps them out of the file-hash keys.
+                out.append(("X509-%s"
+                            % normalise_hash_algorithm(entry.get("algorithm")),
+                            digest))
+    elif entity_type == "User-Account":
+        login = (observable.get("account_login") or value).strip()
+        if login:
+            out.append(("User-Account", login))
+    elif entity_type == "Software":
+        name = (observable.get("name") or value).strip()
+        if name:
+            out.append(("Software", name))
+    elif value:
+        # Unknown observable type: pass its entity_type through so
+        # build_indicators reports it against OPENCTI_UNMAPPABLE rather than
+        # dropping it without a word.
+        out.append((entity_type, value))
+    return out
+
+
+def flatten_indicator(node, stats=None):
+    """OpenCTI indicator node -> the internal records the rest of Nexus uses.
+
+    One record per extracted value: an indicator carrying both an MD5 and a
+    SHA-256 for one file produces two rows, which is correct -- Zeek matches
+    whichever algorithm it is configured to compute.
+    """
+    tags = []
+    for label in node.get("objectLabel") or []:
+        name = label.get("value") if isinstance(label, dict) else None
+        if name and name not in tags:
+            tags.append(name)
+    for marking in node.get("objectMarking") or []:
+        name = marking.get("definition") if isinstance(marking, dict) else None
+        if name and name not in tags:
+            tags.append(name)
+
+    created_by = node.get("createdBy") or {}
+    common = {
+        "category": node.get("pattern_type") or "",
+        "to_ids": bool(node.get("x_opencti_detection")),
+        "uuid": node.get("standard_id") or node.get("id") or "",
+        "timestamp": _opencti_epoch(node.get("updated_at")
+                                    or node.get("created_at")),
+        "comment": node.get("description") or "",
+        "event_id": str(node.get("id") or ""),
+        "event_uuid": node.get("standard_id") or "",
+        "event_info": node.get("name") or "",
+        "event_tags": tags,
+        "org": created_by.get("name") or "",
+    }
+
+    connection = node.get("observables") or {}
+    if (connection.get("pageInfo") or {}).get("hasNextPage") and stats is not None:
+        stats.opencti_truncated_observables += 1
+
+    records = []
+    for observable in _edge_nodes(connection):
+        for value_type, value in _observable_values(observable):
+            record = dict(common)
+            record["type"] = value_type
+            record["value"] = value
+            records.append(record)
+    return records
+
+
+# Only STIX patterns are parsed.  A YARA/Sigma/Snort/PCRE rule's string
+# literals are not indicators, and mining them would arm Zeek against
+# whatever text a detection rule happened to mention.
+OPENCTI_PARSEABLE_PATTERN_TYPES = frozenset(("stix",))
+
+STIX_PROPERTY_TO_TYPE = {
+    "ipv4-addr:value": "IPv4-Addr",
+    "ipv6-addr:value": "IPv6-Addr",
+    "domain-name:value": "Domain-Name",
+    "hostname:value": "Hostname",
+    "url:value": "Url",
+    "email-addr:value": "Email-Addr",
+    "email-message:from_ref.value": "Email-Addr",
+    "file:name": "File-Name",
+    "user-account:account_login": "User-Account",
+    "software:name": "Software",
+}
+
+# `object-type:property = 'value'`.  The property class deliberately excludes
+# "!" and whitespace, so a "!=" comparison can never bridge from the property
+# to the "=" and the regex simply fails to match there -- an exclusion is not
+# something a flat indicator list can express, so it is dropped for free
+# rather than needing a special case.
+_STIX_COMPARISON = re.compile(
+    r"([a-z0-9-]+):([a-zA-Z0-9_.\-']+?)\s*=\s*'([^']*)'")
+
+
+def parse_stix_pattern(pattern):
+    """STIX pattern -> [(mapping_table_key, value), ...].
+
+    Used only when an indicator has no linked observables.  Anything that
+    cannot be represented as a flat indicator -- negations, qualifiers, object
+    types with no Zeek equivalent -- is skipped rather than approximated.
+    """
+    if not pattern:
+        return []
+
+    out = []
+    seen = set()
+    for match in _STIX_COMPARISON.finditer(str(pattern)):
+        obj_type = match.group(1)
+        prop = match.group(2).strip()
+        value = match.group(3).strip()
+        if not value:
+            continue
+
+        if prop.lower().startswith("hashes."):
+            algorithm = normalise_hash_algorithm(
+                prop[len("hashes."):].strip("'\""))
+            if obj_type == "x509-certificate":
+                value_type = "X509-%s" % algorithm
+            else:
+                value_type = algorithm
+        else:
+            value_type = STIX_PROPERTY_TO_TYPE.get(
+                "%s:%s" % (obj_type.lower(), prop))
+
+        if not value_type or value_type not in OPENCTI_TO_ZEEK:
+            continue
+        key = (value_type, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -656,14 +1298,14 @@ def apply_feed_to_params(params, feed):
 # MAPPING
 # ---------------------------------------------------------------------------
 
-def mappable_types():
-    """MISP attribute types Nexus can turn into Zeek intel."""
-    return sorted(MISP_TO_ZEEK)
+def mappable_types(table=None):
+    """Attribute types Nexus can turn into Zeek intel, for the given table."""
+    return sorted(table if table is not None else MISP_TO_ZEEK)
 
 
-def zeek_type_for(misp_type):
+def zeek_type_for(misp_type, table=None):
     """Human-readable target type(s), for the interview's annotated list."""
-    spec = MISP_TO_ZEEK.get(misp_type)
+    spec = (table if table is not None else MISP_TO_ZEEK).get(misp_type)
     if not spec:
         return None
     seen = []
@@ -673,13 +1315,16 @@ def zeek_type_for(misp_type):
     return " + ".join(seen)
 
 
-def map_attribute(record, split_composites="both", allow_subnet=True):
+def map_attribute(record, split_composites="both", allow_subnet=True, table=None):
     """Record -> [(raw_indicator, zeek_type), ...] before normalisation.
 
     `split_composites` is "both", "first" or "second" and decides which halves
     of a composite MISP value (domain|ip, filename|md5) become indicators.
+    `table` selects the source's {type: [(part_index, zeek_type)]} mapping --
+    defaults to MISP_TO_ZEEK so existing callers are unaffected.
     """
-    spec = MISP_TO_ZEEK.get(record.get("type"))
+    lookup = table if table is not None else MISP_TO_ZEEK
+    spec = lookup.get(record.get("type"))
     if not spec:
         return []
 
@@ -1066,9 +1711,13 @@ def _safe_format(template, **fields):
 
 
 def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
-                misp_base_url=None, maxlen=DEFAULT_META_MAXLEN):
-    """Build (source, desc, url) for one record."""
-    source = _safe_format(
+                base_url=None, maxlen=DEFAULT_META_MAXLEN, source="misp"):
+    """Build (source, desc, url) for one record.
+
+    `source` picks the URL shape: MISP links to an event, OpenCTI to the
+    indicator itself (record["event_id"] carries the indicator id there).
+    """
+    meta_source = _safe_format(
         source_fmt,
         org=record.get("org") or "unknown",
         event_id=record.get("event_id") or "0",
@@ -1092,10 +1741,14 @@ def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
         desc = record.get("event_info") or ""
 
     url = ""
-    if misp_base_url and record.get("event_id"):
-        url = "%s/events/view/%s" % (misp_base_url.rstrip("/"), record["event_id"])
+    if base_url and record.get("event_id"):
+        if source == "opencti":
+            url = "%s/dashboard/observations/indicators/%s" % (
+                base_url.rstrip("/"), record["event_id"])
+        else:
+            url = "%s/events/view/%s" % (base_url.rstrip("/"), record["event_id"])
 
-    return (sanitize_meta(source, maxlen),
+    return (sanitize_meta(meta_source, maxlen),
             sanitize_meta(desc, maxlen),
             sanitize_meta(url, maxlen))
 
@@ -1119,6 +1772,10 @@ class BuildStats(object):
         self.excluded = {}
         self.unmapped = {}
         self.duplicates = 0
+        self.opencti_truncated_observables = 0
+        self.opencti_pattern_fallbacks = 0
+        self.opencti_unparsed_patterns = 0
+        self.opencti_non_stix_patterns = 0
 
     def _bump(self, bucket, key):
         bucket[key] = bucket.get(key, 0) + 1
@@ -1137,32 +1794,51 @@ class BuildStats(object):
         self.emitted += 1
 
     def report(self):
-        lines = ["fetched %d attributes -> %d indicators"
+        lines = ["fetched %d records -> %d indicators"
                  % (self.fetched, self.emitted)]
         for label, bucket in (("by type", self.by_type),
                               ("rejected", self.rejected),
                               ("excluded", self.excluded),
-                              ("unmapped MISP types", self.unmapped)):
+                              ("unmapped source types", self.unmapped)):
             if bucket:
                 lines.append("  %s:" % label)
                 for key in sorted(bucket, key=lambda k: -bucket[k]):
                     lines.append("    %-24s %d" % (key, bucket[key]))
         if self.duplicates:
             lines.append("  deduplicated: %d" % self.duplicates)
+        if self.opencti_truncated_observables:
+            lines.append("  %d indicators had more than one page of linked "
+                         "observables; some values were not read"
+                         % self.opencti_truncated_observables)
+        if self.opencti_pattern_fallbacks:
+            lines.append("  %d indicators had no linked observables; their STIX "
+                         "pattern was parsed instead"
+                         % self.opencti_pattern_fallbacks)
+        if self.opencti_unparsed_patterns:
+            lines.append("  %d STIX patterns yielded no usable indicator"
+                         % self.opencti_unparsed_patterns)
+        if self.opencti_non_stix_patterns:
+            lines.append("  %d indicators skipped: their pattern is not STIX"
+                         % self.opencti_non_stix_patterns)
         return "\n".join(lines)
 
 
 def build_indicators(records, types=None, exclusions=None, stats=None,
                      split_composites="both", allow_subnet=True,
                      source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
-                     misp_base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
-                     do_notice=None):
+                     base_url=None, meta_maxlen=DEFAULT_META_MAXLEN,
+                     do_notice=None, mapping_table=None, source="misp"):
     """Records -> deduplicated intel rows.  Pure: no I/O, no network.
+
+    `mapping_table` selects the type mapping; defaults to the MISP table so
+    existing callers are unaffected.  `source` picks the meta.url shape
+    (see render_meta) and likewise defaults to "misp".
 
     Returns (rows, stats) where each row is
     (indicator, zeek_type, source, desc, url, do_notice).
     """
     stats = stats or BuildStats()
+    lookup = mapping_table if mapping_table is not None else MISP_TO_ZEEK
     allowed = set(types) if types is not None else None
     seen = {}
     rows = []
@@ -1171,16 +1847,21 @@ def build_indicators(records, types=None, exclusions=None, stats=None,
         stats.fetched += 1
         misp_type = record.get("type") or ""
 
-        if allowed is not None and misp_type not in allowed:
-            continue
-        if misp_type not in MISP_TO_ZEEK:
+        # Order matters: a type the mapping table has never heard of (an
+        # unknown hash algorithm, an unexpected observable entity) is a loss
+        # whether or not it was selected, and a loss gets counted.  Being
+        # deselected is a choice, and that one stays silent.
+        if misp_type not in lookup:
             stats.unmap(misp_type or "<empty>")
             continue
+        if allowed is not None and misp_type not in allowed:
+            continue
 
-        meta = render_meta(record, source_fmt, desc_template, misp_base_url,
-                           meta_maxlen)
+        meta = render_meta(record, source_fmt, desc_template, base_url,
+                           meta_maxlen, source=source)
 
-        for raw, zeek_type in map_attribute(record, split_composites, allow_subnet):
+        for raw, zeek_type in map_attribute(record, split_composites,
+                                            allow_subnet, table=lookup):
             try:
                 indicator = normalise(raw, zeek_type)
             except Rejected as exc:
@@ -1701,6 +2382,18 @@ SOURCE_FORMATS = (
     ("fixed string", "type your own"),
 )
 
+# meta.source ends up in intel.dat, so it has to name the platform the row
+# actually came from -- an analyst chasing an intel.log hit reads it as a
+# lookup key, and "MISP-event-6c1f0a2e-..." sends them to a MISP that has no
+# such event.  {event_id} is OpenCTI's internal id, the same one meta.url
+# links to, not the standard_id.
+OPENCTI_SOURCE_FORMATS = (
+    ("OpenCTI-{event_id}", "OpenCTI-6c1f0a2e-2b7d-4a55-..."),
+    ("OpenCTI-{org}", "OpenCTI-CIRCL"),
+    ("OpenCTI", "OpenCTI"),
+    ("fixed string", "type your own"),
+)
+
 DEFAULT_DESC_TEMPLATE = "{event_info} | {category}"
 DEFAULT_DAYS = 90
 DEFAULT_MAX_INDICATORS = None
@@ -1933,10 +2626,24 @@ def _count_label(misp_type, counts):
     return format(count, ",d") + ("" if exact else "+")
 
 
-def _type_annotation(misp_type, counts):
+def _type_annotation(misp_type, counts, table=None, off_by_default=None,
+                     source="misp"):
+    """`table` and `off_by_default` default to the MISP pair so the one
+    existing call site (pre-OpenCTI) is unaffected; _stage3_iocs passes the
+    OpenCTI pair on that path so the Zeek-type column isn't just "None".
+
+    On the OpenCTI path the type shown is a main_observable_type, which has no
+    OPENCTI_TO_ZEEK entry of its own -- a StixFile is several Zeek types at
+    once -- so the expansion table answers instead of zeek_type_for().
+    """
+    noisy_set = MISP_OFF_BY_DEFAULT if off_by_default is None else off_by_default
+    if source == "opencti":
+        zeek = " + ".join(opencti_zeek_types(misp_type)) or "None"
+    else:
+        zeek = zeek_type_for(misp_type, table)
     return "%9s  -> %s%s" % (
-        _count_label(misp_type, counts), zeek_type_for(misp_type),
-        "   (noisy)" if misp_type in MISP_OFF_BY_DEFAULT else "")
+        _count_label(misp_type, counts), zeek,
+        "   (noisy)" if misp_type in noisy_set else "")
 
 
 # -- stage 2: discovery -----------------------------------------------------
@@ -1960,12 +2667,12 @@ def discover(client, probe_limit=5000):
             ("feeds", "feeds", client.get_feeds)):
         try:
             found[key] = call()
-        except MispError as exc:
+        except SourceError as exc:
             log.warning("could not fetch %s: %s", label, exc)
 
     try:
         found["types"] = client.describe_types().get("types") or []
-    except MispError as exc:
+    except SourceError as exc:
         log.warning("could not fetch attribute types: %s", exc)
 
     known = set(found["types"])
@@ -1975,7 +2682,7 @@ def discover(client, probe_limit=5000):
         try:
             found["counts"][misp_type] = client.count_type(
                 misp_type, probe_limit=probe_limit)
-        except MispError as exc:
+        except SourceError as exc:
             log.warning("count for %s failed: %s", misp_type, exc)
 
     found["tags"] = [t.get("name") for t in found["tags"] if t.get("name")]
@@ -1985,18 +2692,84 @@ def discover(client, probe_limit=5000):
     return found
 
 
+def discover_opencti(client, probe_limit=None):
+    """Stage 2 for OpenCTI.  Names for the operator, ids for the filters.
+
+    6.x filters take entity ids, so the interview shows names and translates
+    through these maps rather than passing a name through as a guess.
+    """
+    found = {"version": {}, "types": [], "counts": {}, "labels": [],
+             "markings": [], "orgs": [], "label_ids": {}, "marking_ids": {},
+             "org_ids": {}}
+    if client is None:
+        return found
+
+    try:
+        found["version"] = client.get_version()
+    except SourceError as exc:
+        log.warning("could not fetch the OpenCTI version: %s", exc)
+
+    for label, call, name_key, names_key, ids_key in (
+            ("labels", client.get_labels, "value", "labels", "label_ids"),
+            ("marking definitions", client.get_markings, "definition",
+             "markings", "marking_ids"),
+            ("organisations", client.get_organizations, "name", "orgs",
+             "org_ids")):
+        try:
+            rows = call()
+        except SourceError as exc:
+            log.warning("could not fetch %s: %s", label, exc)
+            continue
+        for row in rows:
+            name = row.get(name_key)
+            if not name:
+                continue
+            if name not in found[names_key]:
+                found[names_key].append(name)
+            found[ids_key][name] = row.get("id")
+
+    candidates = []
+    for key in OPENCTI_IOC_CLASS_ORDER:
+        candidates.extend(OPENCTI_IOC_CLASSES[key][1])
+    for main_type in candidates:
+        try:
+            found["counts"][main_type] = client.count_type(main_type)
+        except SourceError as exc:
+            log.warning("count for %s failed: %s", main_type, exc)
+    found["types"] = [t for t in candidates if found["counts"].get(t, (0,))[0]]
+    return found
+
+
 # -- stages -----------------------------------------------------------------
 
-def _stage1_connection(config, client, input_fn, getpass_fn):
+def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
+                       host=None):
     """Stage 1.  Collects connection answers only -- main() builds the client."""
     _stage(1, "Connection")
-    config["misp_host"] = ask_required(
-        "MISP address (IP or hostname)",
-        client.host if client is not None else None, input_fn)
+
+    # No silent default: a flagless run asks which platform it is pointed at.
+    # A caller that already knows (later, --source) skips the question.
+    if source is None:
+        source = ask_choice("Threat intel platform", list(SOURCES),
+                            "misp", input_fn)
+    config["source"] = source
+    label = SOURCE_LABELS.get(source, source)
+
+    # --host seeds the default; it does not skip the question.  It is also
+    # returned verbatim, and urllib chokes on "cti.local " long before it
+    # opens a socket, hence the strip.
+    config["source_host"] = ask_required(
+        "%s address (IP or hostname)" % label,
+        host or (client.host if client is not None else None), input_fn).strip()
     config["scheme"] = ask_choice(
         "Scheme", ["https", "http"],
         client.scheme if client is not None else "https", input_fn)
-    default_port = 443 if config["scheme"] == "https" else 80
+    if config["scheme"] == "https":
+        default_port = 443
+    elif source == "opencti":
+        default_port = OPENCTI_DEFAULT_PORT_HTTP
+    else:
+        default_port = 80
     if client is not None and client.port:
         default_port = client.port
     config["port"] = ask_int("Port", default_port, 1, 65535, input_fn)
@@ -2019,7 +2792,8 @@ def _stage1_connection(config, client, input_fn, getpass_fn):
     # An existing client already holds a working token; re-prompting for it
     # would only be a chance to fat-finger it.
     config["token"] = (client.token if client is not None
-                       else ask_token(getpass_fn=getpass_fn))
+                       else ask_token("%s API token" % label,
+                                      getpass_fn=getpass_fn))
 
     config["timeout"] = ask_int(
         "Request timeout (seconds)",
@@ -2030,14 +2804,25 @@ def _stage1_connection(config, client, input_fn, getpass_fn):
     return config
 
 
-def _stage_feeds(config, discovery, input_fn):
+def _stage_feeds(config, discovery, input_fn, source="misp"):
     """Stage 2b: which MISP feeds to pull from.
 
     Runs after discovery so the list is live, and before the IOC types so the
     operator narrows by source first and by type second.
     """
-    feeds = discovery.get("feeds") or []
     config["feeds"] = []
+    if source == "opencti":
+        # OpenCTI has no post-ingest feed trace worth a selectable/blocked
+        # split -- its provenance filtering is author and label, in stage 5.
+        # Skipping silently would look like a bug to an operator who knows
+        # the MISP flow and sees stage 2b vanish.
+        print("")
+        print("-- Stage 2b: feeds")
+        print("  Not applicable to OpenCTI; provenance is filtered by author "
+              "and label in stage 5.")
+        return
+
+    feeds = discovery.get("feeds") or []
     if not feeds:
         return
 
@@ -2081,13 +2866,23 @@ def _stage_feeds(config, discovery, input_fn):
         config["source_fmt"] = "MISP-feed-{feed}"
 
 
-def _stage3_iocs(config, discovery, input_fn):
+def _stage3_iocs(config, discovery, input_fn, source="misp"):
     _stage(3, "What IOCs do you want?")
     counts = discovery.get("counts") or {}
     known = set(discovery.get("types") or ())
 
-    order = [k for k in IOC_CLASS_ORDER if k in IOC_CLASSES]
-    class_options = [(k, IOC_CLASSES[k][0]) for k in order]
+    if source == "opencti":
+        classes = OPENCTI_IOC_CLASSES
+        order = [k for k in OPENCTI_IOC_CLASS_ORDER if k in OPENCTI_IOC_CLASSES]
+        off_by_default = OPENCTI_OFF_BY_DEFAULT
+        table = OPENCTI_TO_ZEEK
+    else:
+        classes = IOC_CLASSES
+        order = [k for k in IOC_CLASS_ORDER if k in IOC_CLASSES]
+        off_by_default = MISP_OFF_BY_DEFAULT
+        table = None  # None -> zeek_type_for's own MISP_TO_ZEEK default
+
+    class_options = [(k, classes[k][0]) for k in order]
     config["ioc_classes"] = ask_multi("IOC classes", class_options,
                                       preselected=order, input_fn=input_fn)
 
@@ -2095,26 +2890,36 @@ def _stage3_iocs(config, discovery, input_fn):
     for key in order:
         if key not in config["ioc_classes"]:
             continue
-        label, types = IOC_CLASSES[key]
-        # An empty `known` means discovery was skipped, not that MISP is empty.
+        label, types = classes[key]
+        # An empty `known` means discovery was skipped, not that the source is empty.
         candidates = [t for t in types if not known or t in known]
         if not candidates:
             print("  no %s attribute types exist on this instance" % key)
             continue
-        options = [(t, _type_annotation(t, counts)) for t in candidates]
+        options = [(t, _type_annotation(t, counts, table, off_by_default,
+                                        source))
+                   for t in candidates]
         preselected = [t for t in candidates
-                       if t not in MISP_OFF_BY_DEFAULT
+                       if t not in off_by_default
                        and counts.get(t, (1, True))[0] != 0]
         selected.extend(ask_multi(label, options, preselected, input_fn))
 
-    config["split_composites"] = ask_choice(
-        "Composite types (domain|ip, filename|md5): emit which half?",
-        [("both", "domain + ip"), ("first", "domain only"),
-         ("second", "ip only")], "both", input_fn)
+    if source == "opencti":
+        # No OPENCTI_TO_ZEEK entry has more than one spec, so a first/second
+        # split answer would have nothing to act on -- don't ask.
+        config["split_composites"] = "both"
+    else:
+        config["split_composites"] = ask_choice(
+            "Composite types (domain|ip, filename|md5): emit which half?",
+            [("both", "domain + ip"), ("first", "domain only"),
+             ("second", "ip only")], "both", input_fn)
     config["hostname_as_domain"] = ask_yes_no(
         "Treat hostname as Intel::DOMAIN?", True, input_fn)
     if not config["hostname_as_domain"]:
-        selected = [t for t in selected if not t.startswith("hostname")]
+        # OpenCTI's type literal is "Hostname" (capital H); MISP's is
+        # lowercase "hostname"/"hostname|port".
+        hostname_prefix = "Hostname" if source == "opencti" else "hostname"
+        selected = [t for t in selected if not t.startswith(hostname_prefix)]
     config["allow_subnet"] = ask_yes_no(
         "Emit Intel::SUBNET for CIDR values in IP attributes?", True, input_fn)
 
@@ -2193,6 +2998,71 @@ def _stage5_scope(config, discovery, input_fn):
     return config
 
 
+def _stage4_quality_opencti(config, input_fn):
+    _stage(4, "Quality filters")
+    config["min_score"] = ask_int(
+        "Minimum x_opencti_score (0 = no filter)", 50, 0, 100, input_fn)
+    config["min_confidence"] = ask_int(
+        "Minimum confidence (0 = no filter)", 0, 0, 100, input_fn)
+    config["exclude_revoked"] = ask_yes_no(
+        "Exclude revoked indicators?", True, input_fn)
+    config["require_detection"] = ask_yes_no(
+        "Only indicators flagged for detection?", False, input_fn)
+    # An indicator past its own author's valid_until is stale by their
+    # judgement, and Zeek has no expiry of its own.
+    config["exclude_expired"] = ask_yes_no(
+        "Exclude indicators past their valid_until?", True, input_fn)
+    return config
+
+
+def _names_to_ids(names, mapping):
+    """Selected names -> OpenCTI ids, dropping anything discovery never saw."""
+    out = []
+    for name in names or []:
+        ident = mapping.get(name)
+        if not ident:
+            log.warning("no OpenCTI id for %r; it was dropped from the filter",
+                        name)
+            continue
+        out.append(ident)
+    return out
+
+
+def _stage5_scope_opencti(config, discovery, input_fn):
+    _stage(5, "Scope")
+    labels = discovery.get("labels") or []
+    markings = discovery.get("markings") or []
+    orgs = discovery.get("orgs") or []
+
+    config["include_labels"] = _ask_names("Include labels", labels,
+                                          input_fn=input_fn)
+    config["exclude_labels"] = _ask_names("Exclude labels", labels,
+                                          input_fn=input_fn)
+    config["markings"] = _ask_names("TLP markings", markings, input_fn=input_fn)
+    config["authors"] = _ask_names("Created by (organisations)", orgs,
+                                   input_fn=input_fn)
+
+    config["include_label_ids"] = _names_to_ids(
+        config["include_labels"], discovery.get("label_ids") or {})
+    config["exclude_label_ids"] = _names_to_ids(
+        config["exclude_labels"], discovery.get("label_ids") or {})
+    config["marking_ids"] = _names_to_ids(
+        config["markings"], discovery.get("marking_ids") or {})
+    config["author_ids"] = _names_to_ids(
+        config["authors"], discovery.get("org_ids") or {})
+
+    mode = ask_choice("Time window", ["all", "last", "range"], "all", input_fn)
+    config["time_mode"] = mode
+    if mode == "last":
+        config["days"] = ask_int("Days", 30, 1, 3650, input_fn)
+    elif mode == "range":
+        config["date_from"] = ask_date("From (YYYY-MM-DD)", None, input_fn)
+        config["date_to"] = ask_date("To (YYYY-MM-DD)", None, input_fn)
+    config["timestamp_field"] = ask_choice(
+        "Timestamp field", ["created_at", "valid_from"], "created_at", input_fn)
+    return config
+
+
 def _stage6_exclusions(config, input_fn):
     _stage(6, "Local exclusions")
     config["exclude_private"] = ask_yes_no(
@@ -2209,25 +3079,30 @@ def _stage6_exclusions(config, input_fn):
 
 def _stage7_metadata(config, input_fn):
     _stage(7, "Metadata")
-    choice = ask_choice("meta.source format", list(SOURCE_FORMATS),
-                        "MISP-event-{event_id}", input_fn)
+    opencti = config.get("source") == "opencti"
+    formats = OPENCTI_SOURCE_FORMATS if opencti else SOURCE_FORMATS
+    platform = "OpenCTI" if opencti else "MISP"
+    choice = ask_choice("meta.source format", list(formats),
+                        formats[0][0], input_fn)
     if choice == "fixed string":
-        choice = ask_required("Fixed meta.source value", "MISP", input_fn)
+        choice = ask_required("Fixed meta.source value", platform, input_fn)
     config["source_fmt"] = choice
 
     config["desc_template"] = ask(
         "meta.desc template ({event_info} {category} {tags} {comment} "
         "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
 
-    if ask_yes_no("Link meta.url back to the MISP event?", True, input_fn):
-        netloc = config.get("misp_host") or ""
+    link_target = "OpenCTI indicator" if opencti else "MISP event"
+    if ask_yes_no("Link meta.url back to the %s?" % link_target, True,
+                  input_fn):
+        netloc = config.get("source_host") or ""
         port = config.get("port")
         if port and port not in (80, 443):
             netloc = "%s:%d" % (netloc, port)
-        config["misp_base_url"] = "%s://%s" % (config.get("scheme", "https"),
-                                               netloc)
+        config["source_base_url"] = "%s://%s" % (config.get("scheme", "https"),
+                                                  netloc)
     else:
-        config["misp_base_url"] = None
+        config["source_base_url"] = None
 
     config["do_notice"] = ask_yes_no(
         "Emit the meta.do_notice column?", False, input_fn)
@@ -2276,29 +3151,60 @@ def _stage8_output(config, input_fn):
     return config
 
 
-def run_interview(client, input_fn=input, getpass_fn=getpass.getpass):
+def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
+                  source=None, host=None, connect=None):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
     (and testable) with no MISP in reach.
+
+    `connect` closes the chicken-and-egg: stage 1 is what collects the
+    credentials, but stages 3 and 5 need a live client for their type, tag and
+    label lists -- and OpenCTI's scope filters are entity ids, which only a
+    connection can resolve a typed name to.  Callers that want a live
+    interview pass make_client here; callers that must stay offline pass
+    nothing.
     """
     config = {}
-    _stage1_connection(config, client, input_fn, getpass_fn)
+    _stage1_connection(config, client, input_fn, getpass_fn, source=source,
+                       host=host)
 
     _stage(2, "Discovery")
-    discovery = discover(client)
-    if client is None:
-        print("  skipped -- no MISP connection, offering the full type list")
+    if client is None and connect is not None:
+        try:
+            candidate = connect(config)
+            # Fail fast on one call: discovery is dozens of requests, and on
+            # an unreachable host every one of them would retry and time out.
+            candidate.get_version()
+            client = candidate
+        except SourceError as exc:
+            print("  could not connect: %s" % REDACTOR.scrub(str(exc)))
+            print("  continuing offline -- name-based filters cannot be "
+                  "resolved and will not be applied")
+    if config["source"] == "opencti":
+        discovery = discover_opencti(client)
+        if client is not None:
+            print("  %d labels, %d markings, %d organisations"
+                  % (len(discovery["labels"]), len(discovery["markings"]),
+                     len(discovery["orgs"])))
     else:
-        print("  %d attribute types, %d tags, %d orgs, %d sharing groups"
-              % (len(discovery["types"]), len(discovery["tags"]),
-                 len(discovery["orgs"]), len(discovery["sharing_groups"])))
+        discovery = discover(client)
+        if client is None:
+            print("  skipped -- no MISP connection, offering the full type list")
+        else:
+            print("  %d attribute types, %d tags, %d orgs, %d sharing groups"
+                  % (len(discovery["types"]), len(discovery["tags"]),
+                     len(discovery["orgs"]), len(discovery["sharing_groups"])))
     config["discovery"] = discovery
 
-    _stage_feeds(config, discovery, input_fn)
-    _stage3_iocs(config, discovery, input_fn)
-    _stage4_quality(config, input_fn)
-    _stage5_scope(config, discovery, input_fn)
+    _stage_feeds(config, discovery, input_fn, source=config["source"])
+    _stage3_iocs(config, discovery, input_fn, source=config["source"])
+    if config["source"] == "opencti":
+        _stage4_quality_opencti(config, input_fn)
+        _stage5_scope_opencti(config, discovery, input_fn)
+    else:
+        _stage4_quality(config, input_fn)
+        _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
     _stage7_metadata(config, input_fn)
     _stage8_output(config, input_fn)
@@ -2376,6 +3282,102 @@ def build_search_params(config):
     return params
 
 
+def _opencti_filter(key, values, operator="eq", mode="or"):
+    return {"key": [key], "values": [str(v) for v in values],
+            "operator": operator, "mode": mode}
+
+
+def _opencti_stamp(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _opencti_iso_date(value):
+    # ask_date also accepts MISP-style relative windows ("30d"); those mean
+    # nothing to an OpenCTI filter, which compares ISO-8601 timestamps.
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def build_opencti_filters(config, now=None):
+    """Interview answers -> the OpenCTI 6.x FilterGroup.  Pure, no I/O.
+
+    `now` is injectable so valid_until comparisons stay deterministic under
+    test; production passes nothing and gets the run's own UTC clock.
+    """
+    moment = now or datetime.now(timezone.utc)
+    filters = []
+    groups = []
+
+    if config.get("types"):
+        filters.append(_opencti_filter("x_opencti_main_observable_type",
+                                       config["types"]))
+    if config.get("min_score"):
+        filters.append(_opencti_filter("x_opencti_score",
+                                       [config["min_score"]], "gte"))
+    if config.get("min_confidence"):
+        filters.append(_opencti_filter("confidence",
+                                       [config["min_confidence"]], "gte"))
+    if config.get("exclude_revoked"):
+        filters.append(_opencti_filter("revoked", ["false"]))
+    if config.get("require_detection"):
+        filters.append(_opencti_filter("x_opencti_detection", ["true"]))
+    if config.get("exclude_expired"):
+        # An indicator past its valid_until is stale by its own author's
+        # judgement; keeping it would arm Zeek on expired intel.
+        filters.append(_opencti_filter("valid_until",
+                                       [_opencti_stamp(moment)], "gt"))
+
+    field = config.get("timestamp_field") or "created_at"
+    mode = config.get("time_mode") or "all"
+    if mode == "last" and config.get("days"):
+        since = moment - timedelta(days=int(config["days"]))
+        filters.append(_opencti_filter(field, [_opencti_stamp(since)], "gte"))
+    elif mode == "range":
+        date_from = config.get("date_from")
+        if date_from and _opencti_iso_date(date_from):
+            filters.append(_opencti_filter(
+                field, ["%sT00:00:00Z" % date_from], "gte"))
+        elif date_from:
+            # A relative window like "30d" would silently build a filter
+            # that matches nothing -- skip it and say why, instead of
+            # returning a run that quietly fetches zero indicators.
+            log.warning("date_from %r is not an ISO date (YYYY-MM-DD); "
+                       "OpenCTI filters need a real timestamp -- skipping "
+                       "the lower time bound", date_from)
+        date_to = config.get("date_to")
+        if date_to and _opencti_iso_date(date_to):
+            filters.append(_opencti_filter(
+                field, ["%sT23:59:59Z" % date_to], "lte"))
+        elif date_to:
+            log.warning("date_to %r is not an ISO date (YYYY-MM-DD); "
+                       "OpenCTI filters need a real timestamp -- skipping "
+                       "the upper time bound", date_to)
+
+    if config.get("include_label_ids"):
+        filters.append(_opencti_filter("objectLabel",
+                                       config["include_label_ids"]))
+    if config.get("marking_ids"):
+        filters.append(_opencti_filter("objectMarking", config["marking_ids"]))
+    if config.get("author_ids"):
+        filters.append(_opencti_filter("createdBy", config["author_ids"]))
+
+    if config.get("exclude_label_ids"):
+        # A not_eq cannot share the objectLabel key with the include list in one
+        # group, so exclusions get a group of their own.
+        groups.append({
+            "mode": "and",
+            "filters": [_opencti_filter("objectLabel",
+                                        config["exclude_label_ids"],
+                                        "not_eq", "and")],
+            "filterGroups": [],
+        })
+
+    return {"mode": "and", "filters": filters, "filterGroups": groups}
+
+
 def _yes_no(flag):
     return "yes" if flag else "no"
 
@@ -2385,23 +3387,27 @@ def summarise_config(config):
     port = config.get("port")
     scheme = config.get("scheme", "https")
     shown_port = "" if port in (None, 80, 443) else ":%d" % port
+    source = config.get("source", "misp")
+    label = SOURCE_LABELS.get(source, source)
     lines = ["Pre-flight summary", ""]
 
-    lines.append("  MISP        : %s://%s%s (verify TLS: %s)"
-                 % (scheme, config.get("misp_host", "?"), shown_port,
+    lines.append("  source      : %s" % source)
+    lines.append("  %-12s: %s://%s%s (verify TLS: %s)"
+                 % (label, scheme, config.get("source_host", "?"), shown_port,
                     _yes_no(config.get("verify_tls"))))
     if config.get("proxy"):
         lines.append("  proxy       : %s" % config["proxy"])
 
-    feeds = config.get("feeds") or []
-    if feeds:
-        lines.append("  feeds       : %d selected (one query each)" % len(feeds))
-        for feed in feeds:
-            kind, value, _ = feed_provenance(feed)
-            lines.append("                  %-28s via %s=%s"
-                         % (feed["name"][:28], kind, value))
-    else:
-        lines.append("  feeds       : all of MISP (no feed restriction)")
+    if source != "opencti":
+        feeds = config.get("feeds") or []
+        if feeds:
+            lines.append("  feeds       : %d selected (one query each)" % len(feeds))
+            for feed in feeds:
+                kind, value, _ = feed_provenance(feed)
+                lines.append("                  %-28s via %s=%s"
+                             % (feed["name"][:28], kind, value))
+        else:
+            lines.append("  feeds       : all of MISP (no feed restriction)")
 
     types = config.get("types") or []
     lines.append("  IOC types   : %d selected%s"
@@ -2411,15 +3417,23 @@ def summarise_config(config):
                     "on" if config.get("allow_subnet") else "off",
                     "as DOMAIN" if config.get("hostname_as_domain") else "dropped"))
 
-    lines.append("  quality     : to_ids=%s published=%s warninglist=%s "
-                 "deleted=%s" % (_yes_no(config.get("to_ids")),
-                                 _yes_no(config.get("published")),
-                                 _yes_no(config.get("enforce_warninglist")),
-                                 "excluded" if config.get("exclude_deleted")
-                                 else "included"))
-    if config.get("threat_level") or config.get("analysis") is not None:
-        lines.append("  event state : threat_level<=%s analysis=%s"
-                     % (config.get("threat_level"), config.get("analysis")))
+    if source == "opencti":
+        lines.append("  quality     : min_score=%s min_confidence=%s revoked=%s "
+                     "detection=%s expired=%s"
+                     % (config.get("min_score", 0), config.get("min_confidence", 0),
+                        "excluded" if config.get("exclude_revoked") else "included",
+                        "required" if config.get("require_detection") else "any",
+                        "excluded" if config.get("exclude_expired") else "included"))
+    else:
+        lines.append("  quality     : to_ids=%s published=%s warninglist=%s "
+                     "deleted=%s" % (_yes_no(config.get("to_ids")),
+                                     _yes_no(config.get("published")),
+                                     _yes_no(config.get("enforce_warninglist")),
+                                     "excluded" if config.get("exclude_deleted")
+                                     else "included"))
+        if config.get("threat_level") or config.get("analysis") is not None:
+            lines.append("  event state : threat_level<=%s analysis=%s"
+                         % (config.get("threat_level"), config.get("analysis")))
 
     mode = config.get("time_mode") or "all"
     if mode == "last":
@@ -2432,13 +3446,32 @@ def summarise_config(config):
         window = "all time"
     lines.append("  window      : %s" % window)
 
-    for label, key in (("include tags", "include_tags"),
-                       ("exclude tags", "exclude_tags"),
-                       ("orgs", "orgs"), ("sharing groups", "sharing_groups"),
-                       ("event ids", "event_ids")):
+    if source == "opencti":
+        scope_fields = (("include labels", "include_labels",
+                         "include_label_ids"),
+                        ("exclude labels", "exclude_labels",
+                         "exclude_label_ids"),
+                        ("markings", "markings", "marking_ids"),
+                        ("authors", "authors", "author_ids"))
+    else:
+        scope_fields = (("include tags", "include_tags", None),
+                        ("exclude tags", "exclude_tags", None),
+                        ("orgs", "orgs", None),
+                        ("sharing groups", "sharing_groups", None),
+                        ("event ids", "event_ids", None))
+    for scope_label, key, id_key in scope_fields:
         values = config.get(key) or []
-        if values:
-            lines.append("  %-12s: %s" % (label, ", ".join(values)))
+        if not values:
+            continue
+        note = ""
+        if id_key is not None:
+            # OpenCTI filters on ids, not names.  Printing the names alone
+            # would let the summary claim a scope the query does not have.
+            resolved = config.get(id_key) or []
+            if len(resolved) < len(values):
+                note = "  (%d of %d resolved to an OpenCTI id; the rest are " \
+                       "not filtered)" % (len(resolved), len(values))
+        lines.append("  %-12s: %s%s" % (scope_label, ", ".join(values), note))
 
     lines.append("  exclusions  : private=%s networks=%s domains=%s allowlist=%s"
                  % (_yes_no(config.get("exclude_private")),
@@ -2448,7 +3481,7 @@ def summarise_config(config):
 
     lines.append("  meta.source : %s" % config.get("source_fmt"))
     lines.append("  meta.desc   : %s" % config.get("desc_template"))
-    lines.append("  meta.url    : %s" % (config.get("misp_base_url") or "none"))
+    lines.append("  meta.url    : %s" % (config.get("source_base_url") or "none"))
     lines.append("  do_notice   : %s  (max meta length %s)"
                  % (_yes_no(config.get("do_notice")), config.get("meta_maxlen")))
 
@@ -2463,8 +3496,12 @@ def summarise_config(config):
         lines.append("  profile     : %s" % config["profile_path"])
 
     lines.append("")
-    lines.append("  restSearch  : %s"
-                 % json.dumps(build_search_params(config), sort_keys=True))
+    if source == "opencti":
+        lines.append("  filters     : %s"
+                     % json.dumps(build_opencti_filters(config), sort_keys=True))
+    else:
+        lines.append("  restSearch  : %s"
+                     % json.dumps(build_search_params(config), sort_keys=True))
     return "\n".join(lines)
 
 
@@ -2503,6 +3540,27 @@ def save_profile(config, path):
     return path
 
 
+def migrate_profile_config(config, version):
+    """Bring an older profile's keys up to the current schema, in memory.
+
+    A systemd timer replaying a v1 profile must keep working across the
+    upgrade; silently breaking a scheduled run is worse than migration code.
+    """
+    if version == PROFILE_VERSION:
+        return config
+    if version == 1:
+        migrated = dict(config)
+        for old, new in PROFILE_V1_KEY_MAP.items():
+            if old in migrated:
+                migrated.setdefault(new, migrated.pop(old))
+        migrated.setdefault("source", "misp")
+        log.info("migrated a profile-version-1 profile forward to version %d",
+                 PROFILE_VERSION)
+        return migrated
+    raise ValueError("profile version %r is not supported by this nexus"
+                     % version)
+
+
 def load_profile(path):
     """Read a saved profile back into a config dict."""
     with open(path, "r", encoding="utf-8") as handle:
@@ -2511,11 +3569,11 @@ def load_profile(path):
     if not isinstance(payload, dict) or "config" not in payload:
         raise ValueError("%s is not a nexus profile" % path)
     version = payload.get("profile_version")
-    if version != PROFILE_VERSION:
+    if version not in (1, PROFILE_VERSION):
         raise ValueError("%s is profile version %r, this nexus writes %d"
                          % (path, version, PROFILE_VERSION))
 
-    config = dict(payload["config"])
+    config = migrate_profile_config(dict(payload["config"]), version)
     for key in PROFILE_EXCLUDED_KEYS:
         config.pop(key, None)  # a hand-edited profile does not get to inject one
     return config
@@ -2732,9 +3790,10 @@ def resolve_token(args, interactive=True):
             token = ""
         if token:
             return token
-    env = os.environ.get("NEXUS_MISP_TOKEN")
-    if env:
-        return env.strip()
+    for name in ("NEXUS_TOKEN", "NEXUS_MISP_TOKEN"):
+        env = os.environ.get(name)
+        if env:
+            return env.strip()
     cred_path = os.path.join(NEXUS_HOME, "credentials.json")
     if os.path.exists(cred_path):
         try:
@@ -2745,10 +3804,39 @@ def resolve_token(args, interactive=True):
         except (ValueError, OSError) as exc:
             log.warning("could not read %s: %s", cred_path, exc)
     if not interactive:
-        log.error("no token in --token-file, NEXUS_MISP_TOKEN or %s/"
-                  "credentials.json, and --yes cannot prompt", NEXUS_HOME)
+        log.error("no token in --token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
+                  "%s/credentials.json, and --yes cannot prompt", NEXUS_HOME)
         return ""
-    return getpass.getpass("MISP API token: ").strip()
+    # Which platform this is for is the interview's job, asked in stage 1;
+    # by the time resolve_token runs standalone (e.g. --probe) that context
+    # may not exist yet, so the prompt stays platform-neutral.
+    return getpass.getpass("API token: ").strip()
+
+
+def resolve_source_args(args):
+    """Fold the deprecated --misp alias into --host/--source."""
+    if getattr(args, "misp", None):
+        if not args.host:
+            args.host = args.misp
+            args.source = args.source or "misp"
+            print("--misp is deprecated; use --host with --source misp",
+                  file=sys.stderr)
+        else:
+            print("--misp ignored: --host was also given", file=sys.stderr)
+    return args
+
+
+def make_client(config):
+    """Build the client for whichever platform the config names."""
+    kwargs = {
+        "host": config["source_host"], "token": config["token"],
+        "scheme": config["scheme"], "port": config["port"],
+        "verify_tls": config["verify_tls"], "proxy": config.get("proxy"),
+        "timeout": config["timeout"], "retries": config["retries"],
+    }
+    if config.get("source") == "opencti":
+        return OpenctiClient(**kwargs)
+    return MispClient(**kwargs)
 
 
 def cmd_check_env(args):
@@ -2780,7 +3868,7 @@ def cmd_lint(args):
 
 
 def cmd_explain(args):
-    """Show exactly what would be asked of MISP, without asking it."""
+    """Show exactly what would be asked of the platform, without asking it."""
     if not args.profile:
         print("--explain requires --profile", file=sys.stderr)
         return 2
@@ -2791,9 +3879,15 @@ def cmd_explain(args):
         return 2
 
     print(summarise_config(config))
+    print("")
+    if config.get("source") == "opencti":
+        print("One query to POST /graphql:")
+        print("  " + json.dumps(build_opencti_filters(config), indent=2,
+                                sort_keys=True))
+        return 0
+
     base = build_search_params(config)
     feeds = config.get("feeds") or []
-    print("")
     if not feeds:
         print("One query to POST /attributes/restSearch:")
         print("  " + json.dumps(base, indent=2, sort_keys=True))
@@ -2836,18 +3930,25 @@ def cmd_probe(args):
         print("no API token supplied", file=sys.stderr)
         return 2
 
-    client = MispClient(
-        host=args.misp, token=token, scheme=args.scheme, port=args.port,
-        verify_tls=not args.insecure, proxy=args.proxy, timeout=args.timeout,
-        retries=args.retries,
-    )
+    client = make_client({
+        "source": args.source, "source_host": args.host, "token": token,
+        "scheme": args.scheme, "port": args.port,
+        "verify_tls": not args.insecure, "proxy": args.proxy,
+        "timeout": args.timeout, "retries": args.retries,
+    })
 
+    if args.source == "opencti":
+        return _cmd_probe_opencti(client, args)
+    return _cmd_probe_misp(client, args)
+
+
+def _cmd_probe_misp(client, args):
     try:
         version = client.get_version()
-    except MispAuthError as exc:
+    except SourceAuthError as exc:
         print("authentication failed: %s" % exc, file=sys.stderr)
         return 2
-    except MispError as exc:
+    except SourceError as exc:
         print("connection failed: %s" % exc, file=sys.stderr)
         return 2
 
@@ -2861,7 +3962,7 @@ def cmd_probe(args):
         described = client.describe_types()
         tags = client.get_tags()
         orgs = client.get_orgs()
-    except MispError as exc:
+    except SourceError as exc:
         print("discovery failed: %s" % exc, file=sys.stderr)
         return 2
 
@@ -2889,7 +3990,7 @@ def cmd_probe(args):
         try:
             count, exact = client.count_type(misp_type, base,
                                              probe_limit=args.probe_limit)
-        except MispError as exc:
+        except SourceError as exc:
             print("  %-24s %10s  %s" % (misp_type, "ERR", exc))
             continue
         if count == 0 and not args.show_empty:
@@ -2910,10 +4011,76 @@ def cmd_probe(args):
     return 0
 
 
+def _cmd_probe_opencti(client, args):
+    try:
+        version = client.get_version()
+    except SourceAuthError as exc:
+        print("authentication failed: %s" % exc, file=sys.stderr)
+        return 2
+    except SourceError as exc:
+        print("connection failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("Connected to %s" % client.base_url)
+    print("  OpenCTI version : %s" % version.get("version", "unknown"))
+
+    try:
+        labels = client.get_labels()
+        markings = client.get_markings()
+        orgs = client.get_organizations()
+    except SourceError as exc:
+        print("discovery failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("\nDiscovery")
+    print("  labels                              : %d" % len(labels))
+    print("  marking definitions                 : %d" % len(markings))
+    print("  organisations                       : %d" % len(orgs))
+
+    # x_opencti_main_observable_type is what count_type() and the search
+    # filter both key on -- not the OPENCTI_TO_ZEEK value-type keys, which
+    # are one level finer (a StixFile yields several value types at once).
+    candidates = []
+    for key in OPENCTI_IOC_CLASS_ORDER:
+        candidates.extend(OPENCTI_IOC_CLASSES[key][1])
+    print("\nMappable observable types")
+    print("  %-24s %10s  %s" % ("opencti type", "count", "zeek type"))
+
+    total = 0
+    approximate = False
+    for main_type in candidates:
+        try:
+            count, exact = client.count_type(main_type,
+                                             probe_limit=args.probe_limit)
+        except SourceError as exc:
+            print("  %-24s %10s  %s" % (main_type, "ERR", exc))
+            continue
+        if count == 0 and not args.show_empty:
+            continue
+        total += count
+        approximate = approximate or not exact
+        marker = "" if exact else "+"
+        flag = "" if main_type not in OPENCTI_OFF_BY_DEFAULT else "   (off by default)"
+        print("  %-24s %9d%s  %s%s"
+              % (main_type, count, marker,
+                 " + ".join(opencti_zeek_types(main_type)), flag))
+
+    # OpenCTI answers with globalCount, so unless a count actually came back
+    # capped these totals are exact and a "+" would be a lie.
+    print("\n  total indicators available: %d%s"
+          % (total, "+" if approximate else ""))
+    if OPENCTI_UNMAPPABLE:
+        print("\nPresent in OpenCTI but not mappable to Zeek:")
+        for main_type in sorted(OPENCTI_UNMAPPABLE):
+            print("  %-24s %s" % (main_type, OPENCTI_UNMAPPABLE[main_type]))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="nexus",
-        description="Build a Zeek intel.dat from MISP, for Security Onion 3.2.",
+        description="Build a Zeek intel.dat from MISP or OpenCTI, for "
+                    "Security Onion 3.2.",
     )
     parser.add_argument("--version", action="version",
                         version="nexus %s" % __version__)
@@ -2933,13 +4100,19 @@ def build_parser():
                       help="copy the Security Onion default intel files "
                            "(including __load__.Zeek) into the local dir")
     mode.add_argument("--explain", action="store_true",
-                      help="print the resolved MISP query for a profile and "
-                           "exit; contacts nothing")
+                      help="print the resolved platform query for a profile "
+                           "and exit; contacts nothing")
     mode.add_argument("--probe", action="store_true",
-                      help="connect to MISP and report available IOC counts")
+                      help="connect to the platform and report available "
+                           "IOC counts")
 
-    conn = parser.add_argument_group("MISP connection")
-    conn.add_argument("--misp", metavar="HOST", help="MISP IP or hostname")
+    conn = parser.add_argument_group("platform connection")
+    conn.add_argument("--source", choices=SOURCES, default=None,
+                      help="which platform to pull from; asked if omitted")
+    conn.add_argument("--host", metavar="HOST", default=None,
+                      help="platform IP or hostname; asked if omitted")
+    conn.add_argument("--misp", metavar="HOST", default=None,
+                      help="deprecated alias for --host --source misp")
     conn.add_argument("--scheme", default="https", choices=("https", "http"))
     conn.add_argument("--port", type=int, default=None)
     conn.add_argument("--insecure", action="store_true",
@@ -2967,7 +4140,8 @@ def build_parser():
                           "interview")
     run.add_argument("--yes", action="store_true",
                      help="never prompt; requires --profile and a token from "
-                          "--token-file, NEXUS_MISP_TOKEN or credentials.json")
+                          "--token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
+                          "credentials.json")
     run.add_argument("--dry-run", action="store_true",
                      help="build and compare, write nothing")
     run.add_argument("--diff", action="store_true",
@@ -2980,6 +4154,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args = resolve_source_args(args)
     explicit_log = args.log_file is not None
     logfile = args.log_file or os.path.join(NEXUS_HOME, "logs", "nexus.log")
     setup_logging(args.verbose, logfile, required=explicit_log)
@@ -2999,9 +4174,18 @@ def main(argv=None):
               "unattended)", file=sys.stderr)
         return 2
     if args.probe:
-        if not args.misp:
-            print("--probe requires --misp HOST", file=sys.stderr)
-            return 2
+        # Flags exist to skip questions, not to change what a flagless run
+        # means: absent --host/--source, --probe asks rather than errors.
+        try:
+            if not args.host:
+                args.host = ask_required("Platform address (IP or hostname)",
+                                         None)
+            if not args.source:
+                args.source = ask_choice("Threat intel platform",
+                                         list(SOURCES), "misp")
+        except InterviewAborted as exc:
+            print("\nAborted: %s" % exc)
+            return 130
         return cmd_probe(args)
 
     return cmd_build(args)
@@ -3050,7 +4234,10 @@ def cmd_build(args):
         # The interview needs a live client for its tag/org/type lists, but
         # stage 1 is what collects the credentials, so connect in between.
         try:
-            config = run_interview(None)
+            # --source answers its own question; --host only seeds the
+            # default, so the address is still asked.
+            config = run_interview(None, source=args.source, host=args.host,
+                                   connect=make_client)
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130
@@ -3068,12 +4255,7 @@ def cmd_build(args):
     if args.yes:
         config["apply"] = config.get("apply", False)
 
-    client = MispClient(
-        host=config["misp_host"], token=config["token"],
-        scheme=config["scheme"], port=config["port"],
-        verify_tls=config["verify_tls"], proxy=config["proxy"],
-        timeout=config["timeout"], retries=config["retries"],
-    )
+    client = make_client(config)
 
     if config.get("profile_path") and not args.profile:
         try:
@@ -3083,12 +4265,13 @@ def cmd_build(args):
             log.warning("could not save profile: %s", exc)
 
     print(summarise_config(config))
+    label = SOURCE_LABELS.get(config.get("source"), "platform")
     try:
         version = client.get_version()
-    except MispError as exc:
-        print("MISP connection failed: %s" % exc, file=sys.stderr)
+    except SourceError as exc:
+        print("%s connection failed: %s" % (label, exc), file=sys.stderr)
         return 2
-    log.info("connected to MISP %s", version.get("version", "unknown"))
+    log.info("connected to %s %s", label, version.get("version", "unknown"))
 
     exclusions = ExclusionSet(
         exclude_private=config["exclude_private"],
@@ -3097,15 +4280,30 @@ def cmd_build(args):
         allowlist=_load_allowlist(config.get("allowlist_file")),
     )
 
+    # A live BuildStats has to be reachable from _fetch_records (OpenCTI's
+    # pattern-fallback counters) as well as build_indicators (mapping
+    # counters), so both write into the same instance via config["_stats"].
+    stats = BuildStats()
+    config["_stats"] = stats
+    if config.get("source") == "opencti":
+        table = OPENCTI_TO_ZEEK
+        # config["types"] is in main_observable_type form for the server-side
+        # filter; the records build_indicators sees are one level finer.
+        wanted_types = opencti_record_types(config["types"])
+    else:
+        table = MISP_TO_ZEEK
+        wanted_types = config["types"]
     records = _fetch_records(client, config)
     rows, stats = build_indicators(
-        records, types=config["types"], exclusions=exclusions,
+        records, types=wanted_types, exclusions=exclusions,
         split_composites=config["split_composites"],
         allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
         desc_template=config["desc_template"],
-        misp_base_url=config["misp_base_url"],
+        base_url=config["source_base_url"],
         meta_maxlen=config["meta_maxlen"],
         do_notice=config["do_notice"] or None,
+        source=config.get("source", "misp"),
+        mapping_table=table, stats=stats,
     )
     print("\n" + stats.report())
 
@@ -3143,7 +4341,7 @@ def cmd_build(args):
         return 1
 
     added, removed = indicator_delta(existing, lines)
-    print("\nMISP indicator diff")
+    print("\n%s indicator diff" % label)
     print(summarise_delta(existing, lines))
     if removed:
         # This is an invariant check, not an expected operator decision.
@@ -3185,13 +4383,23 @@ def cmd_build(args):
 
 
 def _fetch_records(client, config):
-    """Yield records, one restSearch per selected feed.
+    """Yield records from whichever platform the config names.
 
-    Two feeds identified by different mechanisms -- one by fixed event, one by
-    tag -- cannot be expressed in a single restSearch body, so each gets its
-    own query and the results are merged.  build_indicators() dedupes across
-    them, so an indicator carried by two feeds is written once.
+    OpenCTI expresses its whole query as one FilterGroup, so it is a single
+    call.  MISP needs the per-feed fan-out below: two feeds identified by
+    different mechanisms -- one by fixed event, one by tag -- cannot be
+    expressed in a single restSearch body, so each gets its own query and the
+    results are merged.  build_indicators() dedupes across them, so an
+    indicator carried by two feeds is written once.
     """
+    if config.get("source") == "opencti":
+        filters = build_opencti_filters(config)
+        for record in client.search_indicators(
+                filters, max_results=config.get("max_indicators"),
+                stats=config.get("_stats")):
+            yield record
+        return
+
     base = build_search_params(config)
     feeds = config.get("feeds") or []
     if not feeds:
