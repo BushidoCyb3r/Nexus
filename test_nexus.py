@@ -6,6 +6,7 @@ a local http.server that replays canned responses.
 """
 
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -1010,6 +1011,112 @@ class FakeOpencti(object):
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+class FakeTaxiiHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.server.requests.append({
+            "path": self.path,
+            "accept": self.headers.get("Accept"),
+            "auth": self.headers.get("Authorization"),
+        })
+        status, payload = self.server.routes.get(
+            self.path, (404, {"title": "not found"}))
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+class FakeTaxii(object):
+    """A local TAXII endpoint answering scripted per-path responses."""
+
+    def __init__(self, routes=None):
+        self.server = HTTPServer(("127.0.0.1", 0), FakeTaxiiHandler)
+        self.server.routes = dict(routes or {})
+        self.server.requests = []
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    @property
+    def requests(self):
+        return self.server.requests
+
+    def client(self, **kwargs):
+        return nexus.TaxiiClient("127.0.0.1", "tok", scheme="http",
+                                 port=self.port, retries=1, **kwargs)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestTaxiiVersionDetection(unittest.TestCase):
+    """detect_version() probes 2.1 then 2.0; both a plain SourceError and a
+    SourceAuthError need distinct handling, and self.version (which ACCEPT
+    is derived from) must land in a well-defined place either way."""
+
+    def tearDown(self):
+        if getattr(self, "taxii", None):
+            self.taxii.stop()
+
+    def test_detects_2_1_when_it_answers(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (200, {"title": "S"})})
+        client = self.taxii.client()
+        self.assertEqual(client.detect_version(), "2.1")
+        self.assertEqual(client.version, "2.1")
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
+
+    def test_falls_back_to_2_0_and_the_accept_header_tracks_the_probe(self):
+        self.taxii = FakeTaxii(routes={
+            "/taxii2/": (404, {}),
+            "/taxii/": (200, {"title": "old"}),
+        })
+        client = self.taxii.client()  # constructed at the 2.1 default
+        self.assertEqual(client.detect_version(), "2.0")
+        self.assertEqual(client.version, "2.0")
+        # Each probe's Accept header must match the version being tried at
+        # that moment, not the version the client started (or ends) on.
+        self.assertEqual(self.taxii.requests[0]["path"], "/taxii2/")
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
+        self.assertEqual(self.taxii.requests[1]["path"], "/taxii/")
+        self.assertEqual(self.taxii.requests[1]["accept"],
+                         nexus.TAXII_ACCEPT["2.0"])
+
+    def test_raises_and_restores_the_original_version_when_neither_answers(self):
+        self.taxii = FakeTaxii(routes={})  # both paths 404
+        client = self.taxii.client(version="2.1")
+        self.assertRaises(nexus.TaxiiError, client.detect_version)
+        self.assertEqual(client.version, "2.1")
+
+    def test_auth_error_propagates_instead_of_trying_the_next_version(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (401, {})})
+        client = self.taxii.client()
+        self.assertRaises(nexus.SourceAuthError, client.detect_version)
+        # A wrong password must not be swallowed and retried as "try 2.0".
+        self.assertEqual(len(self.taxii.requests), 1)
+
+    def test_get_version_reads_the_negotiated_endpoint_over_the_wire(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (200, {"title": "My TAXII"})})
+        client = self.taxii.client(version="2.1")
+        self.assertEqual(client.get_version(),
+                         {"version": "2.1", "title": "My TAXII"})
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
 
 
 class TestOpenctiClient(unittest.TestCase):
@@ -3924,6 +4031,40 @@ class TestTransportHooks(unittest.TestCase):
         client = Probe(host="example.test", token="t")
         client.add_secret(None)      # must not raise
         client.add_secret("")
+
+
+class TestTaxiiAuth(unittest.TestCase):
+    def test_bearer_when_no_username(self):
+        client = nexus.TaxiiClient(host="taxii.test", token="tok")
+        self.assertEqual(client._auth_headers()["Authorization"], "Bearer tok")
+
+    def test_basic_when_username_given(self):
+        client = nexus.TaxiiClient(host="taxii.test", token="pw",
+                                   username="alice")
+        expected = "Basic " + base64.b64encode(b"alice:pw").decode("ascii")
+        self.assertEqual(client._auth_headers()["Authorization"], expected)
+
+    def test_the_username_is_registered_as_a_secret(self):
+        # 8+ chars: RedactingFilter.add_secret ignores anything shorter (see
+        # TestRedaction.test_short_strings_are_not_treated_as_secrets), so a
+        # short username here would pass even if registration were broken.
+        nexus.TaxiiClient(host="taxii.test", token="pw", username="alice-admin")
+        record = logging.LogRecord("n", logging.INFO, "p", 1,
+                                   "user alice-admin here", None, None)
+        nexus.REDACTOR.filter(record)
+        self.assertNotIn("alice-admin", record.getMessage())
+
+    def test_accept_follows_the_version(self):
+        self.assertEqual(
+            nexus.TaxiiClient(host="h", token="t", version="2.1").ACCEPT,
+            "application/taxii+json;version=2.1")
+        self.assertEqual(
+            nexus.TaxiiClient(host="h", token="t", version="2.0").ACCEPT,
+            "application/vnd.oasis.taxii+json; version=2.0")
+
+    def test_auth_errors_are_source_auth_errors(self):
+        self.assertTrue(issubclass(nexus.TaxiiAuthError, nexus.SourceAuthError))
+        self.assertTrue(issubclass(nexus.TaxiiError, nexus.SourceError))
 
 
 class TestOpenctiMapping(unittest.TestCase):

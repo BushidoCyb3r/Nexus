@@ -14,6 +14,7 @@ Standard library only.  Python 3.6+.
 """
 
 import argparse
+import base64
 import difflib
 import getpass
 import http.client
@@ -73,6 +74,14 @@ PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
 
 SOURCES = ("misp", "opencti")
 SOURCE_LABELS = {"misp": "MISP", "opencti": "OpenCTI"}
+
+TAXII_VERSIONS = ("2.1", "2.0")
+# 2.1 renamed the media type and moved discovery; 2.0 servers answer neither.
+TAXII_ACCEPT = {
+    "2.1": "application/taxii+json;version=2.1",
+    "2.0": "application/vnd.oasis.taxii+json; version=2.0",
+}
+TAXII_DISCOVERY = {"2.1": "/taxii2/", "2.0": "/taxii/"}
 
 # Zeek Intel framework.  This is the complete Intel::Type set.
 ZEEK_TYPES = (
@@ -461,6 +470,14 @@ class SourceError(Exception):
 
 class SourceAuthError(SourceError):
     """The platform rejected the API token."""
+
+
+class TaxiiError(SourceError):
+    pass
+
+
+class TaxiiAuthError(SourceAuthError):
+    pass
 
 
 # The MISP names predate OpenCTI support.  Kept so existing call sites and
@@ -1014,6 +1031,66 @@ class OpenctiClient(_HttpTransport):
                 built[0]["type"] = value_type
                 out.append(built[0])
         return out
+
+
+class TaxiiClient(_HttpTransport):
+    """TAXII 2.0 and 2.1.
+
+    Unlike OpenCTI's GraphQL -- which answers 200 even when it refuses you --
+    TAXII uses ordinary HTTP status codes, so the transport's existing 401/403
+    handling already covers authentication failure.
+    """
+
+    def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
+                 proxy=None, timeout=30, retries=3, version="2.1",
+                 username=None):
+        _HttpTransport.__init__(self, host, token, scheme=scheme, port=port,
+                                verify_tls=verify_tls, proxy=proxy,
+                                timeout=timeout, retries=retries)
+        if version not in TAXII_ACCEPT:
+            raise TaxiiError("unsupported TAXII version %r" % (version,))
+        self.version = version
+        self.username = username
+        # The username is half of a Basic credential, so it is as much a
+        # secret as the password it is paired with.
+        self.add_secret(username)
+
+    @property
+    def ACCEPT(self):
+        return TAXII_ACCEPT[self.version]
+
+    def _auth_headers(self):
+        if self.username:
+            raw = ("%s:%s" % (self.username, self.token)).encode("utf-8")
+            return {"Authorization": "Basic %s"
+                                     % base64.b64encode(raw).decode("ascii")}
+        return {"Authorization": "Bearer %s" % self.token}
+
+    def detect_version(self):
+        """Probe 2.1's discovery path, then 2.0's.
+
+        The detected value becomes the interview's default answer; it does not
+        replace the question.
+        """
+        for version in TAXII_VERSIONS:
+            saved = self.version
+            self.version = version
+            try:
+                self._request("GET", TAXII_DISCOVERY[version])
+                return version
+            except SourceAuthError:
+                raise            # credentials are wrong, not the version
+            except SourceError:
+                self.version = saved
+        raise TaxiiError(
+            "no TAXII discovery endpoint answered at %s (tried %s)"
+            % (self.base_url, " and ".join(
+                TAXII_DISCOVERY[v] for v in TAXII_VERSIONS)))
+
+    def get_version(self):
+        payload, _ = self._request("GET", TAXII_DISCOVERY[self.version])
+        title = (payload or {}).get("title") or "TAXII server"
+        return {"version": self.version, "title": title}
 
 
 def _misp_bool(value):
