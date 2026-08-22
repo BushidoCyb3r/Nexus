@@ -713,6 +713,26 @@ class TestCheckOutputTarget(unittest.TestCase):
         joined = " ".join(message for _, message in findings)
         self.assertIn("1 indicator", joined)
 
+    def test_existing_file_with_bad_encoding_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        with open(path, "wb") as handle:
+            handle.write(b"\xff")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_existing_file_with_no_permissions_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        nexus.write_atomic(path, [nexus.header_line(False),
+                                  "evil.example\tIntel::DOMAIN\tt\td\t-"])
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file permissions")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
 
 # ---------------------------------------------------------------------------
 # MISP CLIENT (against a local fake)

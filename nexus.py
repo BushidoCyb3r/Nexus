@@ -2214,14 +2214,14 @@ def check_output_target(path, do_notice=False):
         findings.append(("info", "%s will be created" % path))
         return True, findings
 
-    _, rows = read_existing(path)
-    findings.append(("info", "existing file: %d indicator(s) in %s"
-                             % (len(rows), path)))
     try:
+        _, rows = read_existing(path)
         problems = lint_file(path, do_notice)
     except (OSError, UnicodeDecodeError) as exc:
         findings.append(("error", "existing file is unreadable: %s" % exc))
         return False, findings
+    findings.append(("info", "existing file: %d indicator(s) in %s"
+                             % (len(rows), path)))
     if problems:
         findings.append(("error", "existing file has %d lint problem(s); "
                                   "refusing to merge into it" % len(problems)))
