@@ -4208,6 +4208,10 @@ def build_parser():
     mode.add_argument("--probe", action="store_true",
                       help="connect to the platform and report available "
                            "IOC counts")
+    mode.add_argument("--import", dest="import_file", metavar="PATH",
+                      default=None,
+                      help="merge an intel.dat built on another host into "
+                           "this manager's file, append-only")
 
     conn = parser.add_argument_group("platform connection")
     conn.add_argument("--source", choices=SOURCES, default=None,
@@ -4276,6 +4280,11 @@ def main(argv=None):
         return cmd_apply(args)
     if args.explain:
         return cmd_explain(args)
+    # Above the --yes gate deliberately: an import runs no interview, so
+    # --import --yes is a legitimate unattended invocation and the gate below
+    # exists only to catch an unattended run with nothing to answer with.
+    if args.import_file:
+        return cmd_import(args)
     if args.yes and not args.profile:
         print("--yes requires --profile (there is nothing to answer "
               "unattended)", file=sys.stderr)
@@ -4296,6 +4305,41 @@ def main(argv=None):
         return cmd_probe(args)
 
     return cmd_build(args)
+
+
+def ensure_intel_env(assume_yes):
+    """Stage 0 on a manager: check_env(), seeding __load__.Zeek if it can.
+
+    True when this host is fit to be written to.  Shared by cmd_build and
+    cmd_import; cmd_build skips it entirely when the build is offline, which
+    is why the caller decides rather than a flag here.
+    """
+    ok, findings = check_env()
+    if ok:
+        return True
+    for level, message in findings:
+        if level in ("error", "fix"):
+            print(LEVEL_PREFIX.get(level, "  ") + message)
+    # The one failure Nexus can fix itself, and the one most likely to be
+    # hit on a fresh manager.
+    missing_load = not os.path.exists(
+        os.path.join(SO_INTEL_DIR, SO_LOAD_FILE))
+    # assume_yes seeds without asking; the alternative is an unattended run
+    # that writes a file Zeek will never load.
+    if missing_load and os.path.isdir(SO_INTEL_DIR) and (
+            assume_yes or ask_yes_no(
+                "Seed the intel directory from the Security Onion "
+                "defaults?", True)):
+        try:
+            for path in seed_load_file():
+                print("  copied %s" % path)
+        except OSError as exc:
+            print("  could not seed: %s" % exc)
+            return False
+        ok, _ = check_env()
+    if not ok:
+        print("Environment is not ready -- run --check-env for detail.")
+    return ok
 
 
 def cmd_build(args):
@@ -4321,31 +4365,8 @@ def cmd_build(args):
 
     # Off-box there is no Security Onion to check; check_output_target() below
     # takes its place once the output path is known.
-    ok, findings = (True, []) if offline else check_env()
-    if not ok:
-        for level, message in findings:
-            if level in ("error", "fix"):
-                print(LEVEL_PREFIX.get(level, "  ") + message)
-        # The one failure Nexus can fix itself, and the one most likely to be
-        # hit on a fresh manager.
-        missing_load = not os.path.exists(
-            os.path.join(SO_INTEL_DIR, SO_LOAD_FILE))
-        # --yes seeds without asking; the alternative is an unattended run
-        # that writes a file Zeek will never load.
-        if missing_load and os.path.isdir(SO_INTEL_DIR) and (
-                args.yes or ask_yes_no(
-                    "Seed the intel directory from the Security Onion "
-                    "defaults?", True)):
-            try:
-                for path in seed_load_file():
-                    print("  copied %s" % path)
-            except OSError as exc:
-                print("  could not seed: %s" % exc)
-                return 1
-            ok, _ = check_env()
-        if not ok:
-            print("Environment is not ready -- run --check-env for detail.")
-            return 1
+    if not offline and not ensure_intel_env(args.yes):
+        return 1
 
     if config is not None:
         config["token"] = resolve_token(args, interactive=not args.yes)
@@ -4595,6 +4616,121 @@ def _load_allowlist(path):
     except (OSError, UnicodeDecodeError) as exc:
         log.warning("could not read allowlist %s: %s", path, exc)
         return []
+
+
+def cmd_import(args):
+    """Merge an intel.dat built on another host into this manager's file.
+
+    Everything here already exists for cmd_build; the only new thing is where
+    the rows come from.  The append-only invariant is enforced identically --
+    an import that would remove an indicator is a bug, not a decision, so it
+    blocks the write rather than asking.
+    """
+    incoming = args.import_file
+    if not os.path.exists(incoming):
+        print("no such file: %s" % incoming, file=sys.stderr)
+        return 2
+    try:
+        incoming_header, incoming_rows = read_existing(incoming)
+        # The incoming file's own header settles the schema; a disagreement
+        # with the manager's file is caught below, not papered over.
+        do_notice = bool(incoming_header
+                         and incoming_header == header_line(True))
+        problems = lint_file(incoming, do_notice)
+    except (OSError, UnicodeDecodeError) as exc:
+        # The file arrived from another machine: it is a trust boundary, and
+        # the wrong file scp'd here should read as an error, not a traceback.
+        print("could not read %s: %s" % (incoming, exc), file=sys.stderr)
+        return 2
+
+    if not incoming_rows:
+        print("%s contains no indicators" % incoming, file=sys.stderr)
+        return 2
+    if problems:
+        print("Refusing to import, %s fails lint:" % incoming)
+        for problem in problems[:10]:
+            print("  " + problem)
+        return 1
+    print("importing %d indicator(s) from %s" % (len(incoming_rows), incoming))
+
+    if not ensure_intel_env(args.yes):
+        return 1
+
+    path = SO_INTEL_FILE
+    existing_header, existing = read_existing(path)
+    wanted_header = header_line(do_notice)
+    if existing_header and existing_header != wanted_header:
+        print("\nBlocked. %s was built with a different meta.do_notice "
+              "setting than %s; append-only mode will not rewrite existing "
+              "rows." % (incoming, path))
+        return 1
+
+    combined = merge_additive(existing, incoming_rows)
+    lines = [wanted_header] + combined
+
+    # lint_file has already proved every incoming row has the right column
+    # count, and INTEL_FIELDS puts the indicator and the Intel::Type in the
+    # first two, which is all check_broad_indicators reads.  Import is the
+    # caller that check exists for: rows normalised on another machine, by a
+    # copy of Nexus this one cannot inspect.
+    verdicts = run_guardrails([line.split("\t") for line in incoming_rows],
+                              len(existing), intel_dir=SO_INTEL_DIR,
+                              append_only=True)
+    print("\nGuardrails")
+    blocked = False
+    for verdict in verdicts:
+        print("  %-7s %s" % (verdict.level, verdict.message))
+        blocked = blocked or not verdict.ok
+    if blocked:
+        print("\nBlocked. Nothing written.")
+        return 1
+
+    problems = lint_lines(lines, do_notice)
+    if problems:
+        print("\nRefusing to write, the merged file fails lint:")
+        for problem in problems[:10]:
+            print("  " + problem)
+        return 1
+
+    added, removed = indicator_delta(existing, lines)
+    print("\nIndicator diff")
+    print(summarise_delta(existing, lines))
+    if removed:
+        # An invariant failure, not an operator decision: merge_additive
+        # cannot drop a row, so a removal here means something upstream is
+        # wrong and the file a sensor reads must not be rewritten on it.
+        print("\nBlocked. Import unexpectedly removed indicators.")
+        return 1
+
+    if args.dry_run:
+        print("\nDry run -- nothing written to %s" % path)
+        return 0
+
+    saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
+    if saved:
+        print("\nbacked up to %s" % saved)
+    write_atomic(path, lines)
+    print("added %d new indicators; %d total in %s"
+          % (len(added), len(combined), path))
+
+    try:
+        apply_now = args.yes or ask_yes_no("Apply to the grid now?", False)
+    except InterviewAborted:
+        # The merge is already on disk.  A traceback here would read as a
+        # failed write and invite a hand-copy, which is the one route that
+        # drops the manager's own indicators.
+        apply_now = False
+    if not apply_now:
+        print("\nNot applied. To push it:")
+        print("  %s" % SO_APPLY_CMD)
+        print("Then check: %s" % SO_INTEL_LOG)
+        return 0
+    print("\nApplying: %s" % SO_APPLY_CMD)
+    applied, steps = apply_to_grid(intel_dir=SO_INTEL_DIR,
+                                   expected=len(combined))
+    for level, message in steps:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    return 0 if applied else 1
 
 
 if __name__ == "__main__":

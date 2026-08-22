@@ -4839,5 +4839,262 @@ class TestOfflineFlagParsing(unittest.TestCase):
         self.assertTrue(args.offline)
 
 
+# ---------------------------------------------------------------------------
+# IMPORT
+# ---------------------------------------------------------------------------
+
+class TestImportMode(Quiet):
+    """--import merges a file built elsewhere into this manager's intel.dat.
+
+    The whole point of the mode is that the manager's own indicators survive,
+    so the first test asserts byte-identity of an existing row rather than
+    mere presence.
+    """
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.intel_dir = os.path.join(self.tmp, "intel")
+        os.makedirs(self.intel_dir)
+        open(os.path.join(self.intel_dir, nexus.SO_LOAD_FILE), "w").close()
+        self.live = os.path.join(self.intel_dir, "intel.dat")
+        self.incoming = os.path.join(self.tmp, "incoming.dat")
+        self.applied = []
+        for name in ("SO_INTEL_DIR", "SO_INTEL_FILE", "NEXUS_HOME",
+                     "check_env", "apply_to_grid"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.SO_INTEL_DIR = self.intel_dir
+        nexus.SO_INTEL_FILE = self.live
+        nexus.NEXUS_HOME = self.tmp
+        nexus.check_env = lambda: (True, [])
+        nexus.apply_to_grid = self.fake_apply
+
+    def fake_apply(self, **kwargs):
+        self.applied.append(kwargs)
+        return True, [("info", "applied")]
+
+    def _write(self, path, rows, do_notice=False):
+        nexus.write_atomic(path, [nexus.header_line(do_notice)] + rows)
+
+    def _import(self, **kwargs):
+        args = argparse.Namespace(
+            import_file=kwargs.get("import_file", self.incoming),
+            yes=kwargs.get("yes", True),
+            dry_run=kwargs.get("dry_run", False))
+        return nexus.cmd_import(args)
+
+    def _raw(self):
+        with open(self.live, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_existing_rows_survive_byte_for_byte(self):
+        old = "old.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        new = "new.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.live, [old])
+        self._write(self.incoming, [new])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(rows[0], old)      # byte-identical, still first
+        self.assertEqual(rows, [old, new])
+        # The raw bytes, not just the parse: no re-rendering of the old row.
+        self.assertIn("\n" + old + "\n", self._raw())
+
+    def test_import_creates_the_file_on_a_manager_with_none(self):
+        new = "new.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.incoming, [new])
+        self.assertEqual(self._import(), 0)
+        self.assertEqual(nexus.read_existing(self.live),
+                         (nexus.header_line(False), [new]))
+
+    def test_duplicate_key_does_not_duplicate_the_row(self):
+        row = "dup.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.live, [row])
+        self._write(self.incoming,
+                    ["dup.example\tIntel::DOMAIN\tOTHER\tother\t-"])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(rows, [row])       # existing wins, no second row
+
+    def test_header_mismatch_blocks_and_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"], False)
+        before = self._raw()
+        self._write(self.incoming,
+                    ["b.example\tIntel::DOMAIN\tMISP\td\tT"], True)
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+
+    def test_malformed_incoming_file_blocks_and_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        with open(self.incoming, "w", encoding="utf-8") as handle:
+            handle.write(nexus.header_line(False) + "\n")
+            handle.write("garbage-with-no-tabs\n")
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+        self.assertIn("fails lint", self.printed)
+
+    def test_missing_incoming_file_is_an_error(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self.assertEqual(
+            self._import(import_file=os.path.join(self.tmp, "nope")), 2)
+        self.assertEqual(self._raw(), before)
+
+    def test_incoming_file_with_no_indicators_is_an_error(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, [])
+        self.assertEqual(self._import(), 2)
+        self.assertEqual(self._raw(), before)
+
+    def test_unreadable_incoming_file_is_an_error_not_a_traceback(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        with open(self.incoming, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        self.assertEqual(self._import(), 2)
+
+    def test_broad_incoming_subnet_is_flagged(self):
+        """The guardrail's own reason to exist: rows built somewhere else.
+
+        norm_subnet would have rejected a /8 on the way in, but these rows
+        were normalised on another host by a copy of Nexus this one cannot
+        inspect, so they get looked at again here.
+        """
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["10.0.0.0/8\tIntel::SUBNET\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        # The exact verdict, not just the words: "no overly broad indicators"
+        # is what an unparsed row list would have printed here.
+        self.assertIn("warn    1 overly broad indicator(s): 10.0.0.0/8 "
+                      "(subnet at or broader than /16)", self.printed)
+
+    def test_dry_run_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(dry_run=True), 0)
+        self.assertEqual(self._raw(), before)
+        self.assertEqual(self.applied, [])
+
+    def test_backs_up_the_live_file_before_writing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        backups = os.listdir(os.path.join(self.tmp, "backups"))
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(self.tmp, "backups", backups[0]),
+                  encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_yes_applies_to_the_grid(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        self.assertEqual(self.applied,
+                         [{"intel_dir": self.intel_dir, "expected": 2}])
+
+    def test_ctrl_c_at_the_apply_prompt_keeps_the_written_merge(self):
+        """The write already happened; aborting only skips the apply."""
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.addCleanup(setattr, nexus, "ask_yes_no", nexus.ask_yes_no)
+
+        def abort(*args, **kwargs):
+            raise nexus.InterviewAborted("end of input")
+
+        nexus.ask_yes_no = abort
+        self.assertEqual(self._import(yes=False), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(self.applied, [])
+        self.assertIn("Not applied", self.printed)
+
+    def test_an_unfit_environment_blocks_the_write(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        nexus.check_env = lambda: (False, [("error", "no intel dir")])
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+
+    def test_a_removal_blocks_the_write(self):
+        """The invariant, forced.  merge_additive cannot drop a row, so this
+        stubs it to prove the check downstream is real and not decorative."""
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.addCleanup(setattr, nexus, "merge_additive", nexus.merge_additive)
+        nexus.merge_additive = lambda existing, new: list(new)
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+        self.assertIn("removed indicators", self.printed)
+
+
+class TestImportCli(Quiet):
+
+    def test_import_parses_into_import_file(self):
+        args = nexus.build_parser().parse_args(["--import", "/tmp/x.dat"])
+        self.assertEqual(args.import_file, "/tmp/x.dat")
+
+    def test_import_defaults_to_none(self):
+        self.assertIsNone(nexus.build_parser().parse_args([]).import_file)
+
+    def test_import_with_yes_does_not_need_a_profile(self):
+        """--import runs no interview, so the --yes gate must not reject it."""
+        seen = []
+        for name in ("cmd_import", "setup_logging"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.cmd_import = lambda args: seen.append(args.import_file) or 0
+        # main() otherwise rewires the process-wide logger and reaches for
+        # /opt/nexus, which outlives this test and pollutes the ones after it.
+        nexus.setup_logging = lambda *a, **k: None
+        rc = nexus.main(["--import", "/tmp/x.dat", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["/tmp/x.dat"])
+
+
+class TestEnsureIntelEnv(Quiet):
+    """The block cmd_build and cmd_import share."""
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for name in ("SO_INTEL_DIR", "check_env", "seed_load_file"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.SO_INTEL_DIR = self.tmp
+
+    def test_a_healthy_environment_seeds_nothing(self):
+        nexus.check_env = lambda: (True, [])
+        nexus.seed_load_file = lambda: self.fail("nothing to seed")
+        self.assertTrue(nexus.ensure_intel_env(True))
+
+    def test_a_missing_load_file_is_seeded_without_asking_under_yes(self):
+        self.calls = []
+
+        def check():
+            self.calls.append(1)
+            return len(self.calls) > 1, [("error", "__load__.Zeek missing")]
+
+        def seed():
+            path = os.path.join(self.tmp, nexus.SO_LOAD_FILE)
+            open(path, "w").close()
+            return [path]
+
+        nexus.check_env = check
+        nexus.seed_load_file = seed
+        self.assertTrue(nexus.ensure_intel_env(True))
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp, nexus.SO_LOAD_FILE)))
+
+    def test_an_unfixable_environment_is_false(self):
+        nexus.check_env = lambda: (False, [("error", "intel dir missing")])
+        open(os.path.join(self.tmp, nexus.SO_LOAD_FILE), "w").close()
+        self.assertFalse(nexus.ensure_intel_env(True))
+        self.assertIn("Environment is not ready", self.printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
