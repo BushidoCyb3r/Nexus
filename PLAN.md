@@ -1,17 +1,17 @@
 # Nexus — MISP / OpenCTI → Zeek `intel.dat` Builder for Security Onion
 
-**Status:** phases 0–6 and 8 built and tested — two IOC sources (MISP, OpenCTI), one per run, plus feed selection; phase 7 (systemd timer, install docs) is all that remains
-**Target host:** Security Onion 3.2 manager node
+**Status:** phases 0–6, 8 and 9 built and tested — two IOC sources (MISP, OpenCTI), one per run, plus feed selection, plus offline build and airgapped import; phase 7 (systemd timer, install docs) is all that remains
+**Target host:** Security Onion 3.2 manager node, or — for an offline build — any host with Python 3.6+ and nothing else installed
 **Form:** a single Python 3 script, `nexus.py`, stdlib only — no pip, no venv, no packaging
 
 ```
 nexus.py        the tool          python3 nexus.py
-test_nexus.py   449 tests         python3 -m unittest test_nexus
+test_nexus.py   525 tests         python3 -m unittest test_nexus
 ```
 
 **New assistant picking this up: read `HANDOFF.md` first.**
 
-Working today: the full interview end-to-end against either platform, including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run --diff`. `--source {misp,opencti}` and `--host` select the platform; `--misp` remains as a deprecated alias for `--host --source misp`.
+Working today: the full interview end-to-end against either platform, including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run --diff`, `--offline`, `--import PATH`. `--source {misp,opencti}` and `--host` select the platform; `--misp` remains as a deprecated alias for `--host --source misp`.
 
 ---
 
@@ -517,9 +517,10 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 | 5 ✅ | Local exclusions + all §8 guardrails | a test per refusal path |
 | 6 ✅ | Apply — `__load__.Zeek` seeding, salt apply, reporter check | lab grid: apply → hit in `intel.log` |
 | 7 | systemd timer, install steps, operator README | fresh-manager install works |
-| 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (449 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
+| 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (525 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
+| 9 ✅ | Offline build (`--offline`) — build a transfer-ready `intel.dat` on a host with no Security Onion installed, plus `--import PATH` to merge one back into a manager's live file, append-only | offline test suite (525 tests, includes a poison-path assertion that an offline build never touches the real `SO_*` paths, and a byte-identity assertion that import never rewrites an existing row) |
 
-Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phase 8 was taken out of numeric order — it landed after phase 6 while phase 7 (systemd timer, install docs) was still outstanding, since it is source-neutral to the deployment mechanics phase 7 covers.
+Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phases 8 and 9 were both taken out of numeric order — they landed after phase 6 while phase 7 (systemd timer, install docs) was still outstanding, since both are source-neutral/deployment-neutral to what phase 7 covers.
 
 ---
 
@@ -532,6 +533,7 @@ Phases 1–2 are independently useful and fully testable without a Security Onio
 - MISP **event**-level pull (`/events/restSearch`) for richer `meta.desc` context.
 - PyMISP as an optional backend where it's already installed.
 - Specific to OpenCTI (spec §13): querying MISP and OpenCTI in the same run; OpenCTI Observables as a source (Indicators only, per the decision in `HANDOFF.md` §5); OpenCTI 5.x flat-filter syntax; writing anything back to OpenCTI (no sightings, no hit feedback — Nexus stays read-only against both platforms); OpenCTI connectors, streams and the live-stream API (this is a polled pull, the same shape as the MISP path); relationship traversal (indicator → intrusion set → campaign) for richer `meta.desc`.
+- Specific to offline build / import (`docs/superpowers/specs/2026-08-21-offline-build-design.md` §3, §8): a checksum or signature sidecar for the transferred file, and a second file format or archive/package wrapping `intel.dat` for the trip across the airgap. Both were considered and rejected — exactly one file crosses the airgap, `intel.dat` itself, no new dependency and no new format to keep in sync. The reasoning for the checksum specifically: import is additive and lints what arrives, so a truncated copy can only contribute fewer rows, never remove one, and a corrupt line fails lint before anything is written. A checksum would detect a condition the existing checks already render harmless.
 
 ---
 

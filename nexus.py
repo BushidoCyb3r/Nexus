@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
 
-Phases 0-6 and 8: environment check, source client (MISP or OpenCTI), the
+Phases 0-6, 8 and 9: environment check, source client (MISP or OpenCTI), the
 mapping/normalise/write core, the interactive interview, profiles and the
-unattended modes, the safety guardrails, apply-to-grid, and OpenCTI as a
-second source.  Phase 7 (systemd timer, install docs) is outstanding.
-One source per run, selected in the interview or via --source.
+unattended modes, the safety guardrails, apply-to-grid, OpenCTI as a second
+source, and offline build plus airgapped import.  Phase 7 (systemd timer,
+install docs) is outstanding.
+One source per run, selected in the interview or via --source.  --offline
+builds a transfer-ready intel.dat on a host with no Security Onion installed;
+--import PATH merges one back into a manager's live file, append-only.
 
 Standard library only.  Python 3.6+.
 """
@@ -30,7 +33,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.3.0-dev"
+__version__ = "0.4.0-dev"
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
