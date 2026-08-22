@@ -4411,9 +4411,6 @@ def cmd_build(args):
             print("\nAborted: %s" % exc)
             return 130
 
-    # One source of truth for the rest of the run: a --offline flag overrides
-    # what an older profile recorded, and an older profile has no key at all.
-    config["offline"] = offline
     # Profiles written before topology became explicit remain compatible.
     config.setdefault("deployment", "distributed")
     config.setdefault("max_indicators", None)

@@ -4849,7 +4849,7 @@ class TestTransferInstructions(Quiet):
         self.assertNotIn("misp-2026-08-22.dat", copies[0].split()[-1])
 
 
-class TestResolveBuildTarget(unittest.TestCase):
+class TestResolveBuildTarget(Quiet):
     def _args(self, **kw):
         return argparse.Namespace(offline=kw.get("offline", False))
 
