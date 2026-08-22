@@ -4949,6 +4949,17 @@ class TestBuildAppendOnlyGuards(Quiet):
         self.assertIn("schema differs", self.printed)
         self.assertEqual(self._raw(), before)
 
+    def test_a_bad_row_in_the_existing_file_blocks_the_write(self):
+        # The live file is not ours and not trusted; the merged result is
+        # linted before anything is written over it.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "a.example\tIntel::NOPE\tMISP\td\t-"])
+        before = self._raw()
+        self.assertEqual(self.build(self.config()), 1)
+        self.assertIn("the rendered file fails lint", self.printed)
+        self.assertEqual(self._raw(), before)
+
     def test_a_computed_removal_blocks_and_writes_nothing(self):
         # The invariant, forced.  merge_additive cannot drop a row, so this
         # stubs it to prove the check downstream is real and not decorative.

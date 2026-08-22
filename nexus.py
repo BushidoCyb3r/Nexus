@@ -4367,6 +4367,45 @@ def ensure_intel_env(assume_yes):
     return ok
 
 
+def _report_guardrails(verdicts):
+    """Print every verdict and say whether one of them blocks the write."""
+    print("\nGuardrails")
+    blocked = False
+    for verdict in verdicts:
+        print("  %-7s %s" % (verdict.level, verdict.message))
+        blocked = blocked or not verdict.ok
+    if blocked:
+        print("\nBlocked. Nothing written.")
+    return blocked
+
+
+def _report_lint(problems, context):
+    """Print the first ten lint problems; True means do not write.
+
+    `context` names the file the operator is looking at -- "rendered" for a
+    build, "merged" for an import.  Kept as an argument because the two
+    messages drifted apart while they were copies of each other.
+    """
+    if not problems:
+        return False
+    print("\nRefusing to write, the %s file fails lint:" % context)
+    for problem in problems[:10]:
+        print("  " + problem)
+    return True
+
+
+def _report_dry_run(dry_run, show_diff, existing, lines, path):
+    """Say what a real run would have written; True means nothing was."""
+    if not dry_run:
+        return False
+    print("\nDry run -- nothing written to %s" % path)
+    if show_diff:
+        diff = unified_intel_diff(existing, lines, path)
+        print("")
+        print("\n".join(diff) if diff else "(no line-level changes)")
+    return True
+
+
 def cmd_build(args):
     """The default mode: interview, fetch, build, check, write."""
     # Where the file is going decides whether this host has to be a manager at
@@ -4510,22 +4549,12 @@ def cmd_build(args):
                               else os.path.dirname(path),
                               append_only=True, total_count=len(combined),
                               cap=config.get("max_indicators"))
-    print("\nGuardrails")
-    blocked = False
-    for verdict in verdicts:
-        print("  %-7s %s" % (verdict.level, verdict.message))
-        blocked = blocked or not verdict.ok
-    if blocked:
-        print("\nBlocked. Nothing written.")
+    if _report_guardrails(verdicts):
         return 1
 
     lines = [wanted_header] + combined
 
-    problems = lint_lines(lines, config["do_notice"])
-    if problems:
-        print("\nRefusing to write, the rendered file fails lint:")
-        for problem in problems[:10]:
-            print("  " + problem)
+    if _report_lint(lint_lines(lines, config["do_notice"]), "rendered"):
         return 1
 
     added, removed = indicator_delta(existing, lines)
@@ -4536,12 +4565,8 @@ def cmd_build(args):
         print("\nBlocked. Append-only update unexpectedly removed indicators.")
         return 1
 
-    if config.get("dry_run"):
-        print("\nDry run -- nothing written to %s" % path)
-        if args.diff:
-            diff = unified_intel_diff(existing, lines, path)
-            print("")
-            print("\n".join(diff) if diff else "(no line-level changes)")
+    if _report_dry_run(config.get("dry_run"), args.diff, existing, lines,
+                       path):
         return 0
 
     if config["backup"]:
@@ -4706,20 +4731,10 @@ def cmd_import(args):
     verdicts = run_guardrails([line.split("\t") for line in incoming_rows],
                               len(existing), intel_dir=SO_INTEL_DIR,
                               append_only=True, total_count=len(combined))
-    print("\nGuardrails")
-    blocked = False
-    for verdict in verdicts:
-        print("  %-7s %s" % (verdict.level, verdict.message))
-        blocked = blocked or not verdict.ok
-    if blocked:
-        print("\nBlocked. Nothing written.")
+    if _report_guardrails(verdicts):
         return 1
 
-    problems = lint_lines(lines, do_notice)
-    if problems:
-        print("\nRefusing to write, the merged file fails lint:")
-        for problem in problems[:10]:
-            print("  " + problem)
+    if _report_lint(lint_lines(lines, do_notice), "merged"):
         return 1
 
     added, removed = indicator_delta(existing, lines)
@@ -4732,12 +4747,7 @@ def cmd_import(args):
         print("\nBlocked. Import unexpectedly removed indicators.")
         return 1
 
-    if args.dry_run:
-        print("\nDry run -- nothing written to %s" % path)
-        if args.diff:
-            diff = unified_intel_diff(existing, lines, path)
-            print("")
-            print("\n".join(diff) if diff else "(no line-level changes)")
+    if _report_dry_run(args.dry_run, args.diff, existing, lines, path):
         return 0
 
     saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
