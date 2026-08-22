@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
 
-Phases 0-6 and 8: environment check, source client (MISP or OpenCTI), the
+Phases 0-6, 8 and 9: environment check, source client (MISP or OpenCTI), the
 mapping/normalise/write core, the interactive interview, profiles and the
-unattended modes, the safety guardrails, apply-to-grid, and OpenCTI as a
-second source.  Phase 7 (systemd timer, install docs) is outstanding.
-One source per run, selected in the interview or via --source.
+unattended modes, the safety guardrails, apply-to-grid, OpenCTI as a second
+source, and offline build plus airgapped import.  Phase 7 (systemd timer,
+install docs) is outstanding.
+One source per run, selected in the interview or via --source.  --offline
+builds a transfer-ready intel.dat on a host with no Security Onion installed;
+--import PATH merges one back into a manager's live file, append-only.
 
 Standard library only.  Python 3.6+.
 """
@@ -30,7 +33,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.3.0-dev"
+__version__ = "0.4.0-dev"
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -2164,16 +2167,23 @@ def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
     intel_path = os.path.join(intel_dir, "intel.dat")
     if os.path.exists(intel_path):
         st = os.stat(intel_path)
-        _, rows = read_existing(intel_path)
-        findings.append(("info", "intel.dat present: %d indicators, mode %o, %d bytes"
-                                 % (len(rows), st.st_mode & 0o777, st.st_size)))
         try:
+            _, rows = read_existing(intel_path)
             problems = lint_file(intel_path)
         except (OSError, UnicodeDecodeError) as exc:
-            problems = ["unreadable: %s" % exc]
-        if problems:
-            findings.append(("warn", "existing intel.dat has %d lint problem(s); "
-                                     "run --lint for detail" % len(problems)))
+            # Every build merges into this file.  Unreadable here is a hard
+            # stop, not a warning: the alternative is a traceback out of
+            # cmd_build once it opens the same file for itself.
+            ok = False
+            findings.append(("error", "existing intel.dat is unreadable: %s "
+                                      "-- append-only mode cannot merge into "
+                                      "it" % exc))
+        else:
+            findings.append(("info", "intel.dat present: %d indicators, mode %o, %d bytes"
+                                     % (len(rows), st.st_mode & 0o777, st.st_size)))
+            if problems:
+                findings.append(("warn", "existing intel.dat has %d lint problem(s); "
+                                         "run --lint for detail" % len(problems)))
     else:
         findings.append(("warn", "intel.dat does not exist yet at %s" % intel_path))
 
@@ -2185,6 +2195,49 @@ def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
 
     findings.append(("info", "apply command: %s" % SO_APPLY_CMD))
     return ok, findings
+
+
+def check_output_target(path, do_notice=False):
+    """Stage 0 for an offline build.  Returns (ok, findings).
+
+    check_env() asks whether this machine is a working Security Onion manager.
+    Off-box there is no such question to ask -- the only thing that matters is
+    whether the file we are about to write can be written, and whether
+    anything already sitting at that path is something we can safely merge
+    with.  Same return shape as check_env() so callers print both alike.
+    """
+    findings = []
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+
+    if not os.path.isdir(directory):
+        findings.append(("error", "output directory does not exist: %s"
+                                  % directory))
+        findings.append(("fix", "mkdir -p %s" % directory))
+        return False, findings
+    if not os.access(directory, os.W_OK):
+        findings.append(("error", "output directory is not writable: %s"
+                                  % directory))
+        return False, findings
+    findings.append(("info", "output directory: %s" % directory))
+
+    if not os.path.exists(path):
+        findings.append(("info", "%s will be created" % path))
+        return True, findings
+
+    try:
+        _, rows = read_existing(path)
+        problems = lint_file(path, do_notice)
+    except (OSError, UnicodeDecodeError) as exc:
+        findings.append(("error", "existing file is unreadable: %s" % exc))
+        return False, findings
+    findings.append(("info", "existing file: %d indicator(s) in %s"
+                             % (len(rows), path)))
+    if problems:
+        findings.append(("error", "existing file has %d lint problem(s); "
+                                  "refusing to merge into it" % len(problems)))
+        findings.append(("fix", "run --lint %s for detail" % path))
+        return False, findings
+    return True, findings
 
 
 # ---------------------------------------------------------------------------
@@ -2332,15 +2385,23 @@ _LEVEL_ORDER = {"block": 0, "warn": 1, "ok": 2}
 
 
 def run_guardrails(rows, existing_count, intel_dir=None, append_only=False,
-                   **thresholds):
+                   total_count=None, **thresholds):
     """Run every guardrail, worst verdict first.
 
     A flat ordered list rather than a dict -- the pre-write confirmation
     prompt wants to lead with whatever is most likely to make an operator
     stop and look.  `check_load_file` is skipped when intel_dir is None
     (e.g. a --dry-run against a scratch path with no real SO layout).
+
+    `total_count` is the post-merge indicator count.  Append-only callers
+    pass it because len(rows) + existing_count double-counts every key that
+    is in both sets -- which, on a re-import of a refreshed build, is nearly
+    all of them.
     """
-    new_count = len(rows) + (existing_count or 0) if append_only else len(rows)
+    if total_count is None:
+        total_count = (len(rows) + (existing_count or 0) if append_only
+                       else len(rows))
+    new_count = total_count
     verdicts = [check_size(new_count, thresholds.get("warn_at", 100000),
                            thresholds.get("cap")),
                 check_broad_indicators(rows)]
@@ -2499,6 +2560,30 @@ def ask_choice(prompt, options, default=None, input_fn=input):
         if answer.isdigit() and 1 <= int(answer) <= len(values):
             return values[int(answer) - 1]
         print("  not a valid choice: %r" % answer)
+
+
+def resolve_build_target(args, input_fn=input, intel_dir=SO_INTEL_DIR):
+    """True for an offline build, False for a build on this manager.
+
+    Asked before check_env(), because check_env() is what refuses to run on a
+    host with no Security Onion.  The presented default is derived, but the
+    question is always asked when the flag is absent -- flags skip questions
+    for unattended replay, they do not change what a flagless run means.
+
+    A missing Security Onion means "not a manager".  A *broken* Security Onion
+    is a different thing and stays a hard error in check_env(); offline mode
+    must never become a way to paper over a damaged manager.
+    """
+    if getattr(args, "offline", False):
+        return True
+    on_manager = detect_so_version() is not None or os.path.isdir(intel_dir)
+    default = "manager" if on_manager else "offline"
+    choice = ask_choice(
+        "Where is this intel.dat going?",
+        [("manager", "this machine's Security Onion"),
+         ("offline", "another host -- write it here and transfer it")],
+        default, input_fn)
+    return choice == "offline"
 
 
 def parse_selection(answer, count):
@@ -3077,7 +3162,7 @@ def _stage6_exclusions(config, input_fn):
     return config
 
 
-def _stage7_metadata(config, input_fn):
+def _stage7_metadata(config, input_fn, offline=False):
     _stage(7, "Metadata")
     opencti = config.get("source") == "opencti"
     formats = OPENCTI_SOURCE_FORMATS if opencti else SOURCE_FORMATS
@@ -3106,7 +3191,9 @@ def _stage7_metadata(config, input_fn):
 
     config["do_notice"] = ask_yes_no(
         "Emit the meta.do_notice column?", False, input_fn)
-    if config["do_notice"]:
+    # Offline, the local policy tree says nothing about the manager this
+    # file is going to, so neither message would be true of it.
+    if config["do_notice"] and not offline:
         if notice_policy_loaded():
             print("  detected: policy/frameworks/intel/do_notice.zeek is loaded")
         else:
@@ -3117,14 +3204,23 @@ def _stage7_metadata(config, input_fn):
     return config
 
 
-def _stage8_output(config, input_fn):
+def _stage8_output(config, input_fn, offline=False):
     _stage(8, "Output and apply")
-    config["deployment"] = ask_choice(
-        "Security Onion deployment",
-        [("distributed", "manager plus sensor grid"),
-         ("standalone", "one standalone node")],
-        "distributed", input_fn)
-    config["output_path"] = ask_required("Output path", SO_INTEL_FILE, input_fn)
+    config["offline"] = bool(offline)
+    if offline:
+        # Neither question means anything off-box: there is no grid to pick a
+        # topology for, and nothing to apply to.
+        config["deployment"] = "offline"
+        config["output_path"] = ask_required("Output path", "./intel.dat",
+                                             input_fn)
+    else:
+        config["deployment"] = ask_choice(
+            "Security Onion deployment",
+            [("distributed", "manager plus sensor grid"),
+             ("standalone", "one standalone node")],
+            "distributed", input_fn)
+        config["output_path"] = ask_required("Output path", SO_INTEL_FILE,
+                                             input_fn)
     config["merge_mode"] = "append-only"
     config["backup"] = ask_yes_no("Back up the existing file first?", True,
                                   input_fn)
@@ -3143,16 +3239,25 @@ def _stage8_output(config, input_fn):
         name = ask_required("Profile name", "nexus", input_fn)
         if not name.endswith(".json"):
             name += ".json"
-        config["profile_path"] = os.path.join(PROFILE_DIR, name)
+        # Off-box there is no writable /opt/nexus, and the output directory is
+        # the one place check_output_target proves we can write -- same reason
+        # the offline backups live there.
+        directory = (os.path.dirname(os.path.abspath(config["output_path"]))
+                     if offline else PROFILE_DIR)
+        config["profile_path"] = os.path.join(directory, name)
 
-    target = "standalone node" if config["deployment"] == "standalone" else "grid"
-    config["apply"] = ask_yes_no(
-        "Apply to the %s after writing?" % target, False, input_fn)
+    if offline:
+        config["apply"] = False
+    else:
+        target = ("standalone node" if config["deployment"] == "standalone"
+                  else "grid")
+        config["apply"] = ask_yes_no(
+            "Apply to the %s after writing?" % target, False, input_fn)
     return config
 
 
 def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
-                  source=None, host=None, connect=None):
+                  source=None, host=None, connect=None, offline=False):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
@@ -3206,8 +3311,8 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
         _stage4_quality(config, input_fn)
         _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
-    _stage7_metadata(config, input_fn)
-    _stage8_output(config, input_fn)
+    _stage7_metadata(config, input_fn, offline=offline)
+    _stage8_output(config, input_fn, offline=offline)
 
     if config.get("feeds") and "{feed}" not in (config.get("source_fmt") or ""):
         log.info("feeds selected but meta.source has no {feed} placeholder; "
@@ -3767,6 +3872,27 @@ def apply_to_grid(intel_dir=SO_INTEL_DIR, runtime_dir=SO_INTEL_RUNTIME_DIR,
     return ok, steps
 
 
+def print_transfer_instructions(path):
+    """Both manager-side routes, and the difference between them.
+
+    An operator who copies the file into place by hand gets no guardrails and
+    no merge -- that route is supported, but it silently replaces whatever the
+    manager had accumulated.  Saying so here is the only protection it gets.
+    """
+    print("\nBuilt for transfer: %s" % path)
+    print("\nOn the Security Onion manager, either:")
+    print("  1. Merge it (keeps the indicators already there):")
+    print("       python3 nexus.py --import %s" % os.path.basename(path))
+    print("  2. Or put it in place by hand:")
+    print("       sudo cp %s %s" % (os.path.basename(path), SO_INTEL_FILE))
+    print("     This REPLACES the manager's intel.dat. Safe on a fresh")
+    print("     install; on a manager that has been running, it drops every")
+    print("     indicator not in this file.")
+    print("     It also needs %s already present -- check with:" % SO_LOAD_FILE)
+    print("       python3 nexus.py --check-env    (and --seed if it is missing)")
+    print("\nThen apply: %s" % SO_APPLY_CMD)
+
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
@@ -4105,6 +4231,11 @@ def build_parser():
     mode.add_argument("--probe", action="store_true",
                       help="connect to the platform and report available "
                            "IOC counts")
+    mode.add_argument("--import", dest="import_file", metavar="PATH",
+                      default=None,
+                      help="merge an intel.dat built on another host into "
+                           "this manager's file, append-only; with --yes, "
+                           "also applies to the grid")
 
     conn = parser.add_argument_group("platform connection")
     conn.add_argument("--source", choices=SOURCES, default=None,
@@ -4138,10 +4269,15 @@ def build_parser():
     run.add_argument("--profile", metavar="NAME_OR_PATH",
                      help="replay saved answers instead of running the "
                           "interview")
+    run.add_argument("--offline", action="store_true",
+                     help="build for transfer to another host; skips the "
+                          "Security Onion checks and the apply step. Asked "
+                          "if omitted.")
     run.add_argument("--yes", action="store_true",
-                     help="never prompt; requires --profile and a token from "
-                          "--token-file, NEXUS_TOKEN/NEXUS_MISP_TOKEN or "
-                          "credentials.json")
+                     help="never prompt; a build requires --profile and a "
+                          "token from --token-file, NEXUS_TOKEN/"
+                          "NEXUS_MISP_TOKEN or credentials.json (--import "
+                          "needs neither)")
     run.add_argument("--dry-run", action="store_true",
                      help="build and compare, write nothing")
     run.add_argument("--diff", action="store_true",
@@ -4169,6 +4305,11 @@ def main(argv=None):
         return cmd_apply(args)
     if args.explain:
         return cmd_explain(args)
+    # Above the --yes gate deliberately: an import runs no interview, so
+    # --import --yes is a legitimate unattended invocation and the gate below
+    # exists only to catch an unattended run with nothing to answer with.
+    if args.import_file:
+        return cmd_import(args)
     if args.yes and not args.profile:
         print("--yes requires --profile (there is nothing to answer "
               "unattended)", file=sys.stderr)
@@ -4191,40 +4332,107 @@ def main(argv=None):
     return cmd_build(args)
 
 
+def ensure_intel_env(assume_yes):
+    """Stage 0 on a manager: check_env(), seeding __load__.Zeek if it can.
+
+    True when this host is fit to be written to.  Shared by cmd_build and
+    cmd_import; cmd_build skips it entirely when the build is offline, which
+    is why the caller decides rather than a flag here.
+    """
+    ok, findings = check_env()
+    if ok:
+        return True
+    for level, message in findings:
+        if level in ("error", "fix"):
+            print(LEVEL_PREFIX.get(level, "  ") + message)
+    # The one failure Nexus can fix itself, and the one most likely to be
+    # hit on a fresh manager.
+    missing_load = not os.path.exists(
+        os.path.join(SO_INTEL_DIR, SO_LOAD_FILE))
+    # assume_yes seeds without asking; the alternative is an unattended run
+    # that writes a file Zeek will never load.
+    if missing_load and os.path.isdir(SO_INTEL_DIR) and (
+            assume_yes or ask_yes_no(
+                "Seed the intel directory from the Security Onion "
+                "defaults?", True)):
+        try:
+            for path in seed_load_file():
+                print("  copied %s" % path)
+        except OSError as exc:
+            print("  could not seed: %s" % exc)
+            return False
+        ok, _ = check_env()
+    if not ok:
+        print("Environment is not ready -- run --check-env for detail.")
+    return ok
+
+
+def _report_guardrails(verdicts):
+    """Print every verdict and say whether one of them blocks the write."""
+    print("\nGuardrails")
+    blocked = False
+    for verdict in verdicts:
+        print("  %-7s %s" % (verdict.level, verdict.message))
+        blocked = blocked or not verdict.ok
+    if blocked:
+        print("\nBlocked. Nothing written.")
+    return blocked
+
+
+def _report_lint(problems, context):
+    """Print the first ten lint problems; True means do not write.
+
+    `context` names the file the operator is looking at -- "rendered" for a
+    build, "merged" for an import.  Kept as an argument because the two
+    messages drifted apart while they were copies of each other.
+    """
+    if not problems:
+        return False
+    print("\nRefusing to write, the %s file fails lint:" % context)
+    for problem in problems[:10]:
+        print("  " + problem)
+    return True
+
+
+def _report_dry_run(dry_run, show_diff, existing, lines, path):
+    """Say what a real run would have written; True means nothing was."""
+    if not dry_run:
+        return False
+    print("\nDry run -- nothing written to %s" % path)
+    if show_diff:
+        diff = unified_intel_diff(existing, lines, path)
+        print("")
+        print("\n".join(diff) if diff else "(no line-level changes)")
+    return True
+
+
 def cmd_build(args):
     """The default mode: interview, fetch, build, check, write."""
-    ok, findings = check_env()
-    if not ok:
-        for level, message in findings:
-            if level in ("error", "fix"):
-                print(LEVEL_PREFIX.get(level, "  ") + message)
-        # The one failure Nexus can fix itself, and the one most likely to be
-        # hit on a fresh manager.
-        missing_load = not os.path.exists(
-            os.path.join(SO_INTEL_DIR, SO_LOAD_FILE))
-        # --yes seeds without asking; the alternative is an unattended run
-        # that writes a file Zeek will never load.
-        if missing_load and os.path.isdir(SO_INTEL_DIR) and (
-                args.yes or ask_yes_no(
-                    "Seed the intel directory from the Security Onion "
-                    "defaults?", True)):
-            try:
-                for path in seed_load_file():
-                    print("  copied %s" % path)
-            except OSError as exc:
-                print("  could not seed: %s" % exc)
-                return 1
-            ok, _ = check_env()
-        if not ok:
-            print("Environment is not ready -- run --check-env for detail.")
-            return 1
-
+    # Where the file is going decides whether this host has to be a manager at
+    # all, so it is settled before check_env() -- and a profile is loaded first
+    # because it already recorded the answer.  Re-asking it would break the one
+    # unattended path (--profile --yes) that must never prompt.
+    config = None
     if args.profile:
         try:
             config = load_profile(profile_path(args.profile))
         except (OSError, ValueError, UnicodeDecodeError) as exc:
             print("could not load profile: %s" % exc, file=sys.stderr)
             return 2
+        offline = bool(args.offline or config.get("offline"))
+    else:
+        try:
+            offline = resolve_build_target(args)
+        except InterviewAborted as exc:
+            print("\nAborted: %s" % exc)
+            return 130
+
+    # Off-box there is no Security Onion to check; check_output_target() below
+    # takes its place once the output path is known.
+    if not offline and not ensure_intel_env(args.yes):
+        return 1
+
+    if config is not None:
         config["token"] = resolve_token(args, interactive=not args.yes)
         if not config["token"]:
             print("no API token available", file=sys.stderr)
@@ -4237,7 +4445,7 @@ def cmd_build(args):
             # --source answers its own question; --host only seeds the
             # default, so the address is still asked.
             config = run_interview(None, source=args.source, host=args.host,
-                                   connect=make_client)
+                                   connect=make_client, offline=offline)
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130
@@ -4245,7 +4453,9 @@ def cmd_build(args):
     # Profiles written before topology became explicit remain compatible.
     config.setdefault("deployment", "distributed")
     config.setdefault("max_indicators", None)
-    if config.get("do_notice") and not notice_policy_loaded():
+    # Off-box this would report on the build host, which is not where the
+    # file runs; the manager's own --check-env is what answers it.
+    if not offline and config.get("do_notice") and not notice_policy_loaded():
         print("WARNING: policy/frameworks/intel/do_notice.zeek is not loaded; "
               "meta.do_notice will have no effect.")
 
@@ -4254,6 +4464,19 @@ def cmd_build(args):
         config["dry_run"] = True
     if args.yes:
         config["apply"] = config.get("apply", False)
+
+    path = config["output_path"]
+    if offline:
+        # Stage 0 for an offline run: it needs the output path, and that is the
+        # last thing the config settles.  Before the fetch, so a typo'd
+        # directory costs nothing.  Every finding prints, not just the
+        # failures -- "output directory: X" is the operator's only
+        # confirmation of where the file is landing.
+        ok, findings = check_output_target(path, config["do_notice"])
+        for level, message in findings:
+            print(LEVEL_PREFIX.get(level, "  ") + message)
+        if not ok:
+            return 1
 
     client = make_client(config)
 
@@ -4307,8 +4530,11 @@ def cmd_build(args):
     )
     print("\n" + stats.report())
 
-    path = config["output_path"]
-    existing_header, existing = read_existing(path)
+    try:
+        existing_header, existing = read_existing(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        print("\nBlocked. %s is unreadable: %s" % (path, exc), file=sys.stderr)
+        return 1
     wanted_header = header_line(config["do_notice"])
     if existing_header and existing_header != wanted_header:
         print("\nBlocked. Existing intel.dat schema differs from the requested "
@@ -4319,25 +4545,16 @@ def cmd_build(args):
     fresh_lines = rows_to_lines(rows, config["do_notice"])
     combined = merge_additive(existing, fresh_lines)
     verdicts = run_guardrails(rows, len(existing),
-                              intel_dir=os.path.dirname(path),
-                              append_only=True,
+                              intel_dir=None if offline
+                              else os.path.dirname(path),
+                              append_only=True, total_count=len(combined),
                               cap=config.get("max_indicators"))
-    print("\nGuardrails")
-    blocked = False
-    for verdict in verdicts:
-        print("  %-7s %s" % (verdict.level, verdict.message))
-        blocked = blocked or not verdict.ok
-    if blocked:
-        print("\nBlocked. Nothing written.")
+    if _report_guardrails(verdicts):
         return 1
 
     lines = [wanted_header] + combined
 
-    problems = lint_lines(lines, config["do_notice"])
-    if problems:
-        print("\nRefusing to write, the rendered file fails lint:")
-        for problem in problems[:10]:
-            print("  " + problem)
+    if _report_lint(lint_lines(lines, config["do_notice"]), "rendered"):
         return 1
 
     added, removed = indicator_delta(existing, lines)
@@ -4348,21 +4565,31 @@ def cmd_build(args):
         print("\nBlocked. Append-only update unexpectedly removed indicators.")
         return 1
 
-    if config.get("dry_run"):
-        print("\nDry run -- nothing written to %s" % path)
-        if args.diff:
-            diff = unified_intel_diff(existing, lines, path)
-            print("")
-            print("\n".join(diff) if diff else "(no line-level changes)")
+    if _report_dry_run(config.get("dry_run"), args.diff, existing, lines,
+                       path):
         return 0
 
     if config["backup"]:
-        saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
+        # Off-box there is no writable /opt/nexus to back up into -- and the
+        # output directory is the one place check_output_target proved we can
+        # write.  Without this the second offline build over the same file
+        # dies in os.makedirs.
+        if offline:
+            backup_dir = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                      "nexus-backups")
+        else:
+            backup_dir = os.path.join(NEXUS_HOME, "backups")
+        saved = backup_file(path, backup_dir)
         if saved:
             print("\nbacked up to %s" % saved)
     write_atomic(path, lines)
     print("added %d new indicators; %d total in %s"
           % (len(added), len(combined), path))
+
+    if offline:
+        # Nothing here to apply to; the manager-side steps are the operator's.
+        print_transfer_instructions(path)
+        return 0
 
     if not config.get("apply"):
         target = ("standalone node" if config.get("deployment") == "standalone"
@@ -4440,6 +4667,114 @@ def _load_allowlist(path):
     except (OSError, UnicodeDecodeError) as exc:
         log.warning("could not read allowlist %s: %s", path, exc)
         return []
+
+
+def cmd_import(args):
+    """Merge an intel.dat built on another host into this manager's file.
+
+    Everything here already exists for cmd_build; the only new thing is where
+    the rows come from.  The append-only invariant is enforced identically --
+    an import that would remove an indicator is a bug, not a decision, so it
+    blocks the write rather than asking.
+    """
+    incoming = args.import_file
+    if not os.path.exists(incoming):
+        print("no such file: %s" % incoming, file=sys.stderr)
+        return 2
+    try:
+        incoming_header, incoming_rows = read_existing(incoming)
+        # The incoming file's own header settles the schema; a disagreement
+        # with the manager's file is caught below, not papered over.
+        do_notice = bool(incoming_header
+                         and incoming_header == header_line(True))
+        problems = lint_file(incoming, do_notice)
+    except (OSError, UnicodeDecodeError) as exc:
+        # The file arrived from another machine: it is a trust boundary, and
+        # the wrong file scp'd here should read as an error, not a traceback.
+        print("could not read %s: %s" % (incoming, exc), file=sys.stderr)
+        return 2
+
+    if not incoming_rows:
+        print("%s contains no indicators" % incoming, file=sys.stderr)
+        return 2
+    if problems:
+        print("Refusing to import, %s fails lint:" % incoming)
+        for problem in problems[:10]:
+            print("  " + problem)
+        return 1
+    print("importing %d indicator(s) from %s" % (len(incoming_rows), incoming))
+
+    if not ensure_intel_env(args.yes):
+        return 1
+
+    path = SO_INTEL_FILE
+    try:
+        existing_header, existing = read_existing(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        print("\nBlocked. %s is unreadable: %s" % (path, exc), file=sys.stderr)
+        return 1
+    wanted_header = header_line(do_notice)
+    if existing_header and existing_header != wanted_header:
+        print("\nBlocked. %s was built with a different meta.do_notice "
+              "setting than %s; append-only mode will not rewrite existing "
+              "rows." % (incoming, path))
+        return 1
+
+    combined = merge_additive(existing, incoming_rows)
+    lines = [wanted_header] + combined
+
+    # lint_file has already proved every incoming row has the right column
+    # count, and INTEL_FIELDS puts the indicator and the Intel::Type in the
+    # first two, which is all check_broad_indicators reads.  Import is the
+    # caller that check exists for: rows normalised on another machine, by a
+    # copy of Nexus this one cannot inspect.
+    verdicts = run_guardrails([line.split("\t") for line in incoming_rows],
+                              len(existing), intel_dir=SO_INTEL_DIR,
+                              append_only=True, total_count=len(combined))
+    if _report_guardrails(verdicts):
+        return 1
+
+    if _report_lint(lint_lines(lines, do_notice), "merged"):
+        return 1
+
+    added, removed = indicator_delta(existing, lines)
+    print("\nIndicator diff")
+    print(summarise_delta(existing, lines))
+    if removed:
+        # An invariant failure, not an operator decision: merge_additive
+        # cannot drop a row, so a removal here means something upstream is
+        # wrong and the file a sensor reads must not be rewritten on it.
+        print("\nBlocked. Import unexpectedly removed indicators.")
+        return 1
+
+    if _report_dry_run(args.dry_run, args.diff, existing, lines, path):
+        return 0
+
+    saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
+    if saved:
+        print("\nbacked up to %s" % saved)
+    write_atomic(path, lines)
+    print("added %d new indicators; %d total in %s"
+          % (len(added), len(combined), path))
+
+    try:
+        apply_now = args.yes or ask_yes_no("Apply to the grid now?", False)
+    except InterviewAborted:
+        # The merge is already on disk.  A traceback here would read as a
+        # failed write and invite a hand-copy, which is the one route that
+        # drops the manager's own indicators.
+        apply_now = False
+    if not apply_now:
+        print("\nNot applied. To push it:")
+        print("  %s" % SO_APPLY_CMD)
+        print("Then check: %s" % SO_INTEL_LOG)
+        return 0
+    print("\nApplying: %s" % SO_APPLY_CMD)
+    applied, steps = apply_to_grid(intel_dir=SO_INTEL_DIR,
+                                   expected=len(combined))
+    for level, message in steps:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    return 0 if applied else 1
 
 
 if __name__ == "__main__":

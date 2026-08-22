@@ -2,8 +2,8 @@
 
 Written for a fresh assistant with no prior context. Read this, then `PLAN.md` for the full design.
 
-**Last updated:** 2026-08-17
-**State:** phases 0–6 and 8 complete, phase 7 remaining. 449 offline tests passing.
+**Last updated:** 2026-08-22
+**State:** phases 0–6, 8 and 9 complete, phase 7 remaining. 537 offline tests passing.
 **Never yet run against a real MISP, a real OpenCTI, or a real Security Onion box.** Everything below was verified against fakes.
 
 ---
@@ -17,20 +17,20 @@ Not a library. Not a package. **One script**, standard library only, so it drops
 ### Files
 
 ```
-nexus.py        4328 lines   the tool
-test_nexus.py   4094 lines   449 tests, no MISP, OpenCTI or SO required
-PLAN.md          553 lines   full design doc, section numbers referenced below
-HANDOFF.md       287 lines   this file
+nexus.py        4781 lines   the tool
+test_nexus.py   5302 lines   537 tests, no MISP, OpenCTI or SO required
+PLAN.md          555 lines   full design doc, section numbers referenced below
+HANDOFF.md       ~350 lines   this file (self-referential count omitted -- drifts every time this file is edited)
 ```
 
-A git repository, currently on branch `opencti-source`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
+A git repository, currently on branch `offline-build`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
 
 ---
 
 ## 2. Run it
 
 ```bash
-python3 -m unittest test_nexus        # 449 tests, ~20s, needs nothing external
+python3 -m unittest test_nexus        # 537 tests, ~20s, needs nothing external
 python3 nexus.py --help
 
 python3 nexus.py                      # default: full interview -> writes intel.dat
@@ -43,13 +43,16 @@ python3 nexus.py --apply              # push existing intel.dat to the grid
 python3 nexus.py --explain --profile daily          # show the resolved platform query
 python3 nexus.py --profile daily --yes              # unattended
 python3 nexus.py --profile daily --dry-run --diff   # build and compare, write nothing
+python3 nexus.py --offline --profile ./laptop.json --yes  # build for transfer, on a host with no SO installed
+python3 nexus.py --import /media/usb/intel.dat      # merge a transferred file into this manager's intel.dat
+python3 nexus.py --import /media/usb/intel.dat --yes  # merge unattended; also applies to the grid
 ```
 
 `--source {misp,opencti}` picks the platform; if omitted, the interview asks (stage 1). `--host` is the source-neutral form of the old `--misp` flag, which still works as a **deprecated alias for `--host --source misp`** — existing MISP-only invocations and profiles keep working unchanged.
 
 `--probe` is the cheapest way to test credentials — it needs a token but skips the interview.
 
-**On a workstation, the default mode exits early.** `cmd_build` calls `check_env()` first and bails when `/opt/so/saltstack/local/salt/zeek/policy/intel` is absent. That is correct behaviour, not a bug. Use `--probe` or `--lint` off-box.
+**On a workstation, a flagless build now asks instead of bailing.** `cmd_build` first decides offline-vs-manager through `resolve_build_target()` (or a profile's saved `offline` answer) before it looks at the filesystem at all. Only a manager build then calls `ensure_intel_env()` / `check_env()`, which is what bails when `/opt/so/saltstack/local/salt/zeek/policy/intel` is absent. On a machine with no Security Onion, `resolve_build_target()`'s derived default is "offline", so the question can just be answered with Enter; `--offline` skips the question outright and always means "offline" regardless of what's detected. Use `--probe` or `--lint` for something that touches neither the interview nor the filesystem.
 
 ---
 
@@ -117,36 +120,52 @@ Counts come from `pageInfo.globalCount`, which — unlike MISP's bounded probe �
 
 ## 4. Architecture
 
-One file, banner-delimited sections in dependency order:
+One file, banner-delimited sections in dependency order (line numbers omitted
+-- they drift every time a section above them grows; regenerate on demand
+with `grep -n '^# [A-Z]' nexus.py`):
 
 ```
-CONSTANTS   35  SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
-LOGGING    283  RedactingFilter + RedactingFormatter (token scrubbing)
-CLIENT     373  _HttpTransport (shared base), MispClient, OpenctiClient,
-                NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
-                MispAuthError are aliases), flatten_attribute, flatten_indicator,
-                parse_stix_pattern
-FEEDS     1186  feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
-                no feed concept)
-MAPPING   1246  map_attribute — source type -> Zeek type, composite splitting;
-                table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
-NORMALISE 1306  norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
-FILTERS   1554  ExclusionSet — private IPs, own networks/domains, allowlist
-INTEL     1632  build/render/lint/read/merge_additive/backup/write_atomic
-CHECKENV  2021  check_env + notice_policy_loaded — stage 0
-GUARDRAILS 2135 check_size/not_empty/delta/load_file/broad, run_guardrails
-INTERVIEW 2306  ask* primitives, discover (MISP) / discover_opencti,
-                build_search_params (MISP) / build_opencti_filters (OpenCTI),
-                _stage1_connection, _stage_feeds, _stage3_iocs shared across
-                sources; _stage4_quality/_stage5_scope have an `_opencti`
-                sibling each and run_interview picks the pair by source;
-                run_interview ties the stages together
-PROFILES 3389   save_profile, load_profile (JSON, 0600, profile v2 with a v1
-                reader that migrates the old MISP-only keys forward in memory)
-DIFF     3464   indicator_delta, summarise_delta, unified_intel_diff
-APPLY    3508   seed_load_file, salt_apply, log_errors_since, apply_to_grid
-MAIN     3652   argparse, cmd_* dispatch (client factory picks Misp/OpenctiClient
-                from config["source"]), cmd_build orchestration
+CONSTANTS   SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
+LOGGING     RedactingFilter + RedactingFormatter (token scrubbing)
+CLIENT      _HttpTransport (shared base), MispClient, OpenctiClient,
+            NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
+            MispAuthError are aliases), flatten_attribute, flatten_indicator,
+            parse_stix_pattern
+FEEDS       feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
+            no feed concept)
+MAPPING     map_attribute — source type -> Zeek type, composite splitting;
+            table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
+NORMALISE   norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
+FILTERS     ExclusionSet — private IPs, own networks/domains, allowlist
+INTEL       build/render/lint/read/merge_additive/backup/write_atomic
+CHECKENV    check_env + notice_policy_loaded — stage 0 on a manager;
+            check_output_target — the off-box counterpart for an offline
+            build, same (ok, findings) shape, no Security Onion question
+GUARDRAILS  check_size/not_empty/delta/load_file/broad, run_guardrails
+INTERVIEW   ask* primitives, discover (MISP) / discover_opencti,
+            build_search_params (MISP) / build_opencti_filters (OpenCTI),
+            _stage1_connection, _stage_feeds, _stage3_iocs shared across
+            sources; _stage4_quality/_stage5_scope have an `_opencti`
+            sibling each and run_interview picks the pair by source;
+            run_interview ties the stages together; resolve_build_target
+            decides offline-vs-manager, asked before check_env() so it
+            also governs whether check_env() runs at all
+PROFILES    save_profile, load_profile (JSON, 0600, profile v2 with a v1
+            reader that migrates the old MISP-only keys forward in memory)
+DIFF        indicator_delta, summarise_delta, unified_intel_diff
+APPLY       seed_load_file, salt_apply, log_errors_since, apply_to_grid,
+            print_transfer_instructions — the two manager-side routes
+            (--import vs. hand-placing the file) for an offline build
+MAIN        argparse (--import's dest is "import_file", since import is a
+            Python keyword), cmd_* dispatch (client factory picks Misp/
+            OpenctiClient from config["source"]), ensure_intel_env — the
+            check_env()-plus-seed shared by cmd_build and cmd_import,
+            _report_guardrails/_report_lint/_report_dry_run — the
+            print-and-block ceremonies extracted out of cmd_build and
+            cmd_import once they'd copy-pasted them (the lint message had
+            already drifted between the two, "rendered" vs "merged" file),
+            cmd_build orchestration, cmd_import (merge into a manager's
+            live intel.dat, append-only)
 ```
 
 The `CLIENT` section holds both clients and both flatteners; its banner was renamed from `# MISP CLIENT` when `OpenctiClient` landed.
@@ -155,7 +174,7 @@ The `CLIENT` section holds both clients and both flatteners; its banner was rena
 
 - **Stdlib only.** No pip, no venv, no new dependencies. Ever.
 - **Python 3.6+ syntax.** No f-strings, no type hints, no dataclasses, no walrus. `%`-formatting throughout. The manager's Python version is unconfirmed, so the floor stays low.
-- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 449 tests runnable with nothing installed. Do not put I/O in them.
+- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 537 tests runnable with nothing installed. Do not put I/O in them.
 - **Every prompt takes `input_fn`** (and `getpass_fn` for the token), defaulting to the real thing. No test may block on a TTY.
 - **Only `write_atomic` writes the intel file.** Same-directory temp, fsync, `os.replace`.
 - **Updates are append-only by indicator key.** Every existing `(indicator,
@@ -213,6 +232,14 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 - `intel.dat` is append-only by `(indicator, Intel::Type)`. Existing rows and
   metadata win, only new keys are added, and any computed removal is a hard
   invariant failure. There is no replace mode.
+- **`--import --yes` applies to the grid; a default build's `--yes` does not**,
+  unless the replayed profile itself set `apply`. This is deliberate, not an
+  inconsistency: an import has no profile to consult, so `--yes` alone is the
+  only signal available, and an operator running it unattended from a USB
+  stick wants the merged file live. `cmd_build`'s `--yes` only replays what
+  the profile already decided (`config["apply"] = config.get("apply", False)`).
+  No `--no-apply` flag was added to make the two symmetrical; the asymmetry
+  is documented in `--help` on `--import` instead.
 
 ---
 
@@ -230,6 +257,31 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
   remove or rewrite existing indicator rows.
 - Changing the `meta.do_notice` schema of an existing file would require
   rewriting old rows. Nexus blocks that mismatch to preserve append-only behavior.
+- **Hand-placing an offline-built file replaces rather than merges.** Copying
+  an offline-built `intel.dat` into place by hand (`sudo cp ... /opt/so/.../intel/`)
+  is a deliberately supported route, with no guardrails and no merge: on a
+  manager that has been running, it drops every indicator not in the
+  transferred file. `--import` merges; `cp` does not. Both routes are printed
+  by `print_transfer_instructions`, and the hand-copy route says so at the
+  point of use. It stays supported anyway, because an operator who cannot run
+  Python on the manager has no other route in.
+- **Offline builds keep their backups and their profile beside the output
+  file, not under `/opt/nexus`.** `/opt/nexus` is a manager-only directory; it
+  does not exist and is not writable on an arbitrary offline host. Under
+  `--offline` the interview defaults the profile to the output directory and
+  `cmd_build` backs up to `nexus-backups/` next to the output file, same
+  retention count. Without this, a second offline build over the same output
+  path used to crash in `os.makedirs` and the default profile save died the
+  same way. Because an offline profile is a path rather than a bare name,
+  replay it as `--profile ./laptop.json`, not `--profile laptop` (a bare name
+  always resolves under `/opt/nexus/profiles`). `cmd_import` (which only ever
+  runs on a manager) still uses `/opt/nexus/backups`.
+- **"Append-only" does not currently cover operator comment lines.** `read_existing`
+  filters out any line in the live `intel.dat` that starts with `#` (other than
+  the `#fields` header), so a hand-written `#` comment does not survive a
+  merge in `cmd_build` or `cmd_import`. This is pre-existing behavior, not
+  something offline build or `--import` introduced, but it is a real limit on
+  the append-only guarantee stated elsewhere in this document.
 - **GraphQL answers HTTP 200 on auth failure.** A rejected OpenCTI token arrives as a 200 with an `errors` array, not a 401/403. Unhandled, that is indistinguishable from an empty result set, and a scheduled run would report "0 new indicators" forever instead of failing loudly. `_check_errors` runs before any caller reads `data`.
 - **`strptime`'s `%z` didn't accept a colon in the UTC offset until Python 3.7.** This project's floor is 3.6, so OpenCTI's `...Z` timestamps are normalised to `+0000` (colon-free) before parsing. Without this, every OpenCTI timestamp would silently parse to `""` on 3.6 while a 3.9-or-later test run stayed green and never caught it.
 - **OpenCTI 6.x filters take entity ids, not names.** Discovery builds `name -> id` maps for labels, marking definitions and organisations; a name with no discovered id is dropped with a warning, never guessed at or passed through as text.
@@ -265,7 +317,7 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 > **Status: live validation deferred.** As of 2026-08-21 the operator has no OpenCTI
 > instance available to test against, and has deliberately postponed this. The OpenCTI
-> code path is complete, unit-tested (449 tests, all sources) and reviewed, but **no part
+> code path is complete, unit-tested (537 tests, all sources) and reviewed, but **no part
 > of it has ever exchanged a packet with a real OpenCTI server.** Treat it as untested in
 > production until the checklist below has been run. This is a known, accepted gap — not
 > an oversight to re-flag.
@@ -300,8 +352,8 @@ writes an `intel.dat`. Nothing here needs a Security Onion box.
    `pattern unparseable` count means real-world patterns differ from the STIX shapes
    `parse_stix_pattern` handles; capture a few offending patterns verbatim before changing
    anything.
-6. Only then do a real build, against a scratch output path first (`--offline` once that
-   ships, or an explicit output path), and diff it by hand before it goes near a manager.
+6. Only then do a real build, against a scratch output path first (`--offline` with an
+   explicit output path), and diff it by hand before it goes near a manager.
 
 Record what each step actually returned. Several items above become moot the moment real
 responses are observed, and the list should shrink rather than be carried forward intact.

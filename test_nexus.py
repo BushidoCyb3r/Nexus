@@ -5,6 +5,7 @@ No MISP and no Security Onion required -- the MISP client is exercised against
 a local http.server that replays canned responses.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -658,11 +659,92 @@ class TestCheckEnv(unittest.TestCase):
         self.assertTrue(any("intel directory missing" in m
                             for m in self.messages(findings, "error")))
 
+    def test_an_unreadable_intel_dat_is_an_error_not_a_traceback(self):
+        # check_env is the first thing to open the live file, so an
+        # undecodable byte in it came out as a traceback from --check-env and
+        # from every build that ran the check.
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        with open(os.path.join(self.intel, "intel.dat"), "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        ok, findings = nexus.check_env(self.intel, self.default)
+        self.assertFalse(ok)
+        self.assertTrue(any("unreadable" in m
+                            for m in self.messages(findings, "error")))
+
     def test_apply_command_is_the_3x_form(self):
         _, findings = nexus.check_env(self.intel, self.default)
         apply_msgs = [m for m in self.messages(findings) if "state.apply" in m]
         self.assertTrue(apply_msgs)
         self.assertIn("I@zeek:enabled:true", apply_msgs[0])
+
+
+class TestCheckOutputTarget(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_writable_empty_target_is_ok(self):
+        ok, findings = nexus.check_output_target(
+            os.path.join(self.tmp, "intel.dat"))
+        self.assertTrue(ok)
+        levels = [level for level, _ in findings]
+        self.assertNotIn("error", levels)
+
+    def test_missing_parent_directory_is_an_error(self):
+        ok, findings = nexus.check_output_target(
+            os.path.join(self.tmp, "nope", "intel.dat"))
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_unwritable_parent_directory_is_an_error(self):
+        locked = os.path.join(self.tmp, "locked")
+        os.mkdir(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        ok, findings = nexus.check_output_target(
+            os.path.join(locked, "intel.dat"))
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_existing_file_that_fails_lint_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        with open(path, "w") as handle:
+            handle.write(nexus.header_line(False) + "\n")
+            handle.write("this-is-not-a-valid-row\n")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        joined = " ".join(message for _, message in findings)
+        self.assertIn("lint", joined)
+
+    def test_existing_clean_file_is_reported_but_ok(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        nexus.write_atomic(path, [nexus.header_line(False),
+                                  "evil.example\tIntel::DOMAIN\tt\td\t-"])
+        ok, findings = nexus.check_output_target(path)
+        self.assertTrue(ok)
+        joined = " ".join(message for _, message in findings)
+        self.assertIn("1 indicator", joined)
+
+    def test_existing_file_with_bad_encoding_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        with open(path, "wb") as handle:
+            handle.write(b"\xff")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_existing_file_with_no_permissions_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        nexus.write_atomic(path, [nexus.header_line(False),
+                                  "evil.example\tIntel::DOMAIN\tt\td\t-"])
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file permissions")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
 
 
 # ---------------------------------------------------------------------------
@@ -2248,6 +2330,60 @@ class TestRunInterview(Quiet):
                          list(nexus.SUGGESTED_EXCLUDE_TAGS))
 
 
+class TestOfflineInterview(Quiet):
+
+    def run_it(self, offline):
+        return nexus.run_interview(
+            None, input_fn=scripted(["misp.example"], fill=""),
+            getpass_fn=lambda prompt: "tok", source="misp", offline=offline)
+
+    def test_offline_defaults_output_to_the_working_directory(self):
+        config = self.run_it(offline=True)
+        self.assertEqual(config["output_path"], "./intel.dat")
+
+    def test_offline_never_applies(self):
+        feed = scripted(["misp.example"], fill="")
+        config = nexus.run_interview(
+            None, input_fn=feed, getpass_fn=lambda prompt: "tok",
+            source="misp", offline=True)
+        self.assertIs(config["apply"], False)
+        self.assertEqual(config["deployment"], "offline")
+        # Not just "the answer came back False" -- the question must never
+        # be asked at all off-box.
+        self.assertFalse(any("Apply to" in p for p in feed.state["prompts"]))
+
+    def test_offline_flag_is_recorded_in_the_config(self):
+        self.assertIs(self.run_it(offline=True)["offline"], True)
+        self.assertIs(self.run_it(offline=False)["offline"], False)
+
+    def test_manager_mode_still_defaults_to_the_security_onion_path(self):
+        config = self.run_it(offline=False)
+        self.assertEqual(config["output_path"], nexus.SO_INTEL_FILE)
+        self.assertEqual(config["deployment"], "distributed")
+
+    def test_offline_saves_the_profile_beside_the_output_file(self):
+        # "Save these answers as a profile?" defaults to yes, and /opt/nexus
+        # is not writable on a workstation -- same reason the offline backups
+        # moved.  Left in PROFILE_DIR the save dies in os.makedirs, so
+        # --offline --profile ... could never be bootstrapped on its own host.
+        config = self.run_it(offline=True)
+        self.assertEqual(
+            config["profile_path"],
+            os.path.join(os.path.dirname(os.path.abspath(
+                config["output_path"])), "nexus.json"))
+
+    def test_manager_mode_still_saves_the_profile_under_nexus_home(self):
+        self.assertEqual(self.run_it(offline=False)["profile_path"],
+                         os.path.join(nexus.PROFILE_DIR, "nexus.json"))
+
+    def test_offline_is_not_dropped_by_a_profile_round_trip(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "p.json")
+        nexus.save_profile(self.run_it(offline=True), path)
+        self.assertIs(nexus.load_profile(path)["offline"], True)
+
+
 # ---------------------------------------------------------------------------
 # STAGE 1 -- source selection
 # ---------------------------------------------------------------------------
@@ -2521,6 +2657,18 @@ class TestStage7SourceFormats(Quiet):
         config, _ = self.stage7(
             "opencti", by_prompt([("meta.source format", "4")], fill=""))
         self.assertEqual(config["source_fmt"], "OpenCTI")
+
+    def test_offline_says_nothing_about_this_host_s_policy_tree(self):
+        # Both the "detected" and the "not detected" line describe the build
+        # host's Zeek policy; offline, the file runs on a manager this host
+        # cannot see, so neither is a true statement about it.
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        nexus._stage7_metadata(
+            config, by_prompt([("meta.do_notice", "y")], fill=""),
+            offline=True)
+        self.assertTrue(config["do_notice"])
+        self.assertNotIn("do_notice.zeek", self.printed)
 
     def test_misp_stage7_is_byte_identical(self):
         config = {"source": "misp", "source_host": "h.local",
@@ -4231,14 +4379,18 @@ class TestBuildHonoursSourceAndHostFlags(Quiet):
             seen.update(kwargs)
             return interview(kwargs)
 
-        real = (nexus.run_interview, nexus.check_env)
+        real = (nexus.run_interview, nexus.check_env,
+                nexus.resolve_build_target)
         nexus.run_interview = fake_interview
         nexus.check_env = lambda: (True, [])
+        # A build on this manager: the target question is Task 2's to test.
+        nexus.resolve_build_target = lambda args: False
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 nexus.cmd_build(args)
         finally:
-            nexus.run_interview, nexus.check_env = real
+            (nexus.run_interview, nexus.check_env,
+             nexus.resolve_build_target) = real
         return seen
 
     def test_flags_reach_the_interview(self):
@@ -4342,15 +4494,18 @@ class TestBuildTranslatesTheTypeVocabulary(Quiet):
                 return iter(records)
 
         config = self.config()
-        real = (nexus.check_env, nexus.run_interview, nexus.make_client)
+        real = (nexus.check_env, nexus.run_interview, nexus.make_client,
+                nexus.resolve_build_target)
         nexus.check_env = lambda: (True, [])
         nexus.run_interview = lambda client, **kwargs: config
         nexus.make_client = lambda cfg: Client()
+        nexus.resolve_build_target = lambda args: False
         try:
             args = nexus.resolve_source_args(nexus.build_parser().parse_args([]))
             rc = nexus.cmd_build(args)
         finally:
-            nexus.check_env, nexus.run_interview, nexus.make_client = real
+            (nexus.check_env, nexus.run_interview, nexus.make_client,
+             nexus.resolve_build_target) = real
 
         self.assertEqual(rc, 0)
         with io.open(config["output_path"], encoding="utf-8") as handle:
@@ -4358,6 +4513,169 @@ class TestBuildTranslatesTheTypeVocabulary(Quiet):
         self.assertIn("d" * 32, body)
         self.assertIn("e" * 64, body)
         self.assertIn("bad.exe", body)
+
+
+class TestOfflineBuild(Quiet):
+    """A build on a host with no Security Onion, end to end.
+
+    Every SO_* constant points at a path that does not exist, so any code that
+    reaches for the local install fails here rather than quietly finding the
+    real one on a developer's manager.
+    """
+
+    POISON = "/nonexistent/security-onion"
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.out = os.path.join(self.dir, "intel.dat")
+        for name in ("SO_INTEL_DIR", "SO_INTEL_DEFAULT_DIR",
+                     "SO_INTEL_RUNTIME_DIR", "SO_INTEL_FILE"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+            setattr(nexus, name, os.path.join(self.POISON, name.lower()))
+
+    def config(self, **overrides):
+        config = {
+            "offline": True, "deployment": "offline", "output_path": self.out,
+            "apply": False, "backup": False, "dry_run": False,
+            "do_notice": False, "source": "misp", "source_host": "misp.local",
+            "types": ["ip-dst"], "exclude_private": True, "own_networks": [],
+            "own_domains": [], "allowlist_file": None,
+            "split_composites": "both", "allow_subnet": True,
+            "source_fmt": "MISP", "desc_template": "{category}",
+            "source_base_url": None, "meta_maxlen": 200,
+            "max_indicators": None, "token": "t", "profile_path": None,
+            "merge_mode": "append-only",
+        }
+        config.update(overrides)
+        return config
+
+    def records(self):
+        return [{"type": "ip-dst", "value": "45.33.32.1",
+                 "category": "Network activity", "event_id": "7",
+                 "event_info": "phishing infrastructure"}]
+
+    def build(self, config, argv=None):
+        """Run cmd_build with the platform stubbed out; returns the exit code.
+
+        check_env() is stubbed to fail the test outright: an offline run must
+        not call it at all.  Poisoning the SO_* constants would not catch that
+        on a real manager -- check_env() binds them as argument defaults at
+        import, so a later setattr never reaches it.
+        """
+        class Client(object):
+            host = "misp.local"
+
+            def get_version(self):
+                return {"version": "2.4.190"}
+
+        self.interview_kwargs = None
+
+        def fake_interview(client, **kwargs):
+            self.interview_kwargs = kwargs
+            return config
+
+        real = (nexus.make_client, nexus.run_interview, nexus._fetch_records,
+                nexus.check_env)
+        self.client_factory = lambda cfg: Client()
+        nexus.make_client = self.client_factory
+        nexus.run_interview = fake_interview
+        nexus._fetch_records = lambda client, cfg: iter(self.records())
+        nexus.check_env = lambda: self.fail(
+            "an offline build must not check this host's environment")
+        try:
+            args = nexus.resolve_source_args(
+                nexus.build_parser().parse_args(
+                    ["--offline"] if argv is None else argv))
+            return nexus.cmd_build(args)
+        finally:
+            (nexus.make_client, nexus.run_interview, nexus._fetch_records,
+             nexus.check_env) = real
+
+    def test_offline_build_writes_without_any_security_onion(self):
+        self.assertEqual(self.build(self.config()), 0)
+        self.assertTrue(os.path.exists(self.out))
+        header, rows = nexus.read_existing(self.out)
+        self.assertEqual(header, nexus.header_line(False))
+        self.assertEqual([row.split("\t")[0] for row in rows], ["45.33.32.1"])
+
+    def test_offline_build_prints_both_transfer_routes(self):
+        self.build(self.config())
+        self.assertIn("--import", self.printed)
+        self.assertIn("REPLACES", self.printed)
+        # ...and never the on-box apply, which has nothing to apply to.
+        self.assertNotIn(nexus.SO_APPLY_CMD + "\nThen check", self.printed)
+
+    def test_the_output_directory_is_checked_and_a_bad_one_blocks(self):
+        config = self.config(
+            output_path=os.path.join(self.dir, "no-such-dir", "intel.dat"))
+        self.assertEqual(self.build(config), 1)
+        self.assertIn("output directory does not exist", self.printed)
+        self.assertFalse(os.path.exists(config["output_path"]))
+
+    def test_the_offline_answer_reaches_the_interview_with_the_others(self):
+        # source/host/connect were dropped from this call once already; a
+        # missing `connect` leaves the OpenCTI scope filters unresolvable.
+        self.build(self.config(), argv=["--offline", "--source", "opencti",
+                                        "--host", "cti.local"])
+        self.assertEqual(self.interview_kwargs["offline"], True)
+        self.assertEqual(self.interview_kwargs["source"], "opencti")
+        self.assertEqual(self.interview_kwargs["host"], "cti.local")
+        self.assertIs(self.interview_kwargs["connect"], self.client_factory)
+
+    def test_no_do_notice_warning_about_a_policy_tree_on_the_wrong_host(self):
+        # The warning describes the *build* host's Zeek policy, which says
+        # nothing about the manager the file is going to.  Off-box the policy
+        # dirs never exist, so it fired on every --do-notice offline build.
+        self.assertEqual(self.build(self.config(do_notice=True)), 0)
+        self.assertNotIn("do_notice.zeek is not loaded", self.printed)
+
+    def test_the_guardrail_count_is_the_merged_total_not_the_sum(self):
+        # Same double-count on the build path: the fetched row is already in
+        # the file being merged into, so the total is 1, not 2.
+        nexus.write_atomic(self.out, [nexus.header_line(False),
+                                      "45.33.32.1\tIntel::ADDR\tMISP\td\t-"])
+        self.assertEqual(self.build(self.config()), 0)
+        self.assertIn("1 indicators", self.printed)
+        self.assertNotIn("2 indicators", self.printed)
+
+    def test_the_backup_lands_beside_the_output_not_in_opt_nexus(self):
+        # The interview defaults "back up first" to yes, so the *second*
+        # offline build is the common case: /opt/nexus is not writable on a
+        # workstation and backup_file() would die in os.makedirs.
+        self.assertEqual(self.build(self.config(backup=True)), 0)
+        self.assertEqual(self.build(self.config(backup=True)), 0)
+        saved = os.listdir(os.path.join(self.dir, "nexus-backups"))
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0].startswith("intel.dat."))
+
+    def test_the_offline_profile_is_written_where_the_interview_put_it(self):
+        # The end-to-end half of the same point: no /opt/nexus anywhere on
+        # this host, and the save still happens rather than warning past it.
+        profile = os.path.join(self.dir, "laptop.json")
+        self.assertEqual(self.build(self.config(profile_path=profile)), 0)
+        self.assertTrue(os.path.exists(profile))
+        self.assertIn(profile, self.printed)
+
+    def test_a_profile_replay_honours_its_recorded_answer_without_asking(self):
+        profile = os.path.join(self.dir, "offline.json")
+        nexus.save_profile(self.config(), profile)
+        token_file = os.path.join(self.dir, "token")
+        with io.open(token_file, "w", encoding="utf-8") as handle:
+            handle.write(u"t\n")
+
+        real = nexus.ask_choice
+        nexus.ask_choice = lambda *a, **k: self.fail(
+            "an unattended replay must not be asked where the file is going")
+        try:
+            rc = self.build(None, argv=["--profile", profile, "--yes",
+                                        "--token-file", token_file])
+        finally:
+            nexus.ask_choice = real
+        self.assertEqual(rc, 0)
+        self.assertIn("--import", self.printed)
+        self.assertTrue(os.path.exists(self.out))
 
 
 class TestOpenctiEndToEnd(unittest.TestCase):
@@ -4513,6 +4831,471 @@ class TestOpenctiEndToEnd(unittest.TestCase):
         self.assertEqual(combined[0], "evil.com\tIntel::DOMAIN\tMISP\told desc\t-")
         added, removed = nexus.indicator_delta(existing_rows, combined)
         self.assertEqual(removed, [])
+
+
+class TestTransferInstructions(Quiet):
+    """The hand-copy route printed after an offline build."""
+
+    def test_the_hand_copy_names_the_destination_file(self):
+        # The output path is free-form and dating an export is natural for a
+        # sneakernet workflow.  Copying by source name drops a file Zeek never
+        # loads beside the real intel.dat, with no error to notice.
+        nexus.print_transfer_instructions(
+            "/home/op/exports/misp-2026-08-22.dat")
+        copies = [l.strip() for l in self.printed.splitlines()
+                  if l.strip().startswith("sudo cp")]
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0].endswith(nexus.SO_INTEL_FILE), copies[0])
+        self.assertNotIn("misp-2026-08-22.dat", copies[0].split()[-1])
+
+
+class TestResolveBuildTarget(Quiet):
+    def _args(self, **kw):
+        return argparse.Namespace(offline=kw.get("offline", False))
+
+    def test_offline_flag_skips_the_question(self):
+        def refuse(_prompt):
+            raise AssertionError("must not ask when --offline is given")
+        self.assertTrue(nexus.resolve_build_target(
+            self._args(offline=True), input_fn=refuse))
+
+    def test_flagless_run_asks(self):
+        asked = []
+
+        def record(prompt):
+            asked.append(prompt)
+            return ""
+        nexus.resolve_build_target(self._args(), input_fn=record,
+                                   intel_dir="/nonexistent/so/intel")
+        self.assertTrue(asked, "a flagless run must ask which target")
+
+    def test_flagless_run_honours_a_non_default_answer(self):
+        # No Security Onion here, so the default is offline.  ask_choice is
+        # numbered single-select, so "1" picks "manager" -- the non-default
+        # option.  That must be obeyed; a silent default would return True.
+        self.assertFalse(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "1",
+            intel_dir="/nonexistent/so/intel"))
+
+    def test_default_is_offline_when_no_security_onion_present(self):
+        self.assertTrue(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "",
+            intel_dir="/nonexistent/so/intel"))
+
+    def test_default_is_manager_when_intel_dir_exists(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertFalse(nexus.resolve_build_target(
+            self._args(), input_fn=lambda _p: "", intel_dir=tmp))
+
+
+class TestBuildAppendOnlyGuards(Quiet):
+    """cmd_build's append-only guards, on the manager path.
+
+    cmd_import grew tests for the identical checks; these older copies had
+    none, so stubbing either condition out left the whole suite green.
+    """
+
+    class Client(object):
+        host = "misp.local"
+
+        def get_version(self):
+            return {"version": "2.4.190"}
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        open(os.path.join(self.dir, nexus.SO_LOAD_FILE), "w").close()
+        self.out = os.path.join(self.dir, "intel.dat")
+        for name in ("check_env", "run_interview", "make_client",
+                     "_fetch_records", "resolve_build_target",
+                     "merge_additive"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.check_env = lambda: (True, [])
+        nexus.make_client = lambda cfg: self.Client()
+        nexus._fetch_records = lambda client, cfg: iter(
+            [{"type": "ip-dst", "value": "45.33.32.1",
+              "category": "Network activity", "event_id": "7",
+              "event_info": "phishing infrastructure"}])
+        nexus.resolve_build_target = lambda args: False
+
+    def config(self, **overrides):
+        config = nexus.run_interview(
+            None, input_fn=scripted(["misp.local"], fill=""),
+            getpass_fn=lambda prompt: "tok", source="misp")
+        config.update({"output_path": self.out, "profile_path": None,
+                       "backup": False, "dry_run": False, "apply": False})
+        config.update(overrides)
+        return config
+
+    def build(self, config):
+        nexus.run_interview = lambda client, **kwargs: config
+        return nexus.cmd_build(nexus.resolve_source_args(
+            nexus.build_parser().parse_args([])))
+
+    def _raw(self):
+        with io.open(self.out, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_header_mismatch_blocks_and_writes_nothing(self):
+        # A do_notice file under a no-notice run: append-only mode will not
+        # rewrite the existing rows into the other schema, so it stops.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(True),
+            "a.example\tIntel::DOMAIN\tMISP\td\t-\tT"])
+        before = self._raw()
+        self.assertEqual(self.build(self.config(do_notice=False)), 1)
+        self.assertIn("schema differs", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_a_bad_row_in_the_existing_file_blocks_the_write(self):
+        # The live file is not ours and not trusted; the merged result is
+        # linted before anything is written over it.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "a.example\tIntel::NOPE\tMISP\td\t-"])
+        before = self._raw()
+        self.assertEqual(self.build(self.config()), 1)
+        self.assertIn("the rendered file fails lint", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_a_computed_removal_blocks_and_writes_nothing(self):
+        # The invariant, forced.  merge_additive cannot drop a row, so this
+        # stubs it to prove the check downstream is real and not decorative.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        nexus.merge_additive = lambda existing, new: list(new)
+        self.assertEqual(self.build(self.config()), 1)
+        self.assertIn("removed indicators", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_an_unreadable_existing_file_is_an_error_not_a_traceback(self):
+        with open(self.out, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        self.assertEqual(self.build(self.config()), 1)
+        with open(self.out, "rb") as handle:
+            self.assertEqual(handle.read(), b"\xff\xfe not utf-8 at all\n")
+
+
+class TestOfflineFlagParsing(unittest.TestCase):
+    def test_offline_defaults_to_false(self):
+        args = nexus.build_parser().parse_args([])
+        self.assertFalse(args.offline)
+
+    def test_offline_flag_sets_true(self):
+        args = nexus.build_parser().parse_args(["--offline"])
+        self.assertTrue(args.offline)
+
+
+# ---------------------------------------------------------------------------
+# IMPORT
+# ---------------------------------------------------------------------------
+
+class TestImportMode(Quiet):
+    """--import merges a file built elsewhere into this manager's intel.dat.
+
+    The whole point of the mode is that the manager's own indicators survive,
+    so the first test asserts byte-identity of an existing row rather than
+    mere presence.
+    """
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.intel_dir = os.path.join(self.tmp, "intel")
+        os.makedirs(self.intel_dir)
+        open(os.path.join(self.intel_dir, nexus.SO_LOAD_FILE), "w").close()
+        self.live = os.path.join(self.intel_dir, "intel.dat")
+        self.incoming = os.path.join(self.tmp, "incoming.dat")
+        self.applied = []
+        for name in ("SO_INTEL_DIR", "SO_INTEL_FILE", "NEXUS_HOME",
+                     "check_env", "apply_to_grid"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.SO_INTEL_DIR = self.intel_dir
+        nexus.SO_INTEL_FILE = self.live
+        nexus.NEXUS_HOME = self.tmp
+        nexus.check_env = lambda: (True, [])
+        nexus.apply_to_grid = self.fake_apply
+
+    def fake_apply(self, **kwargs):
+        self.applied.append(kwargs)
+        return True, [("info", "applied")]
+
+    def _write(self, path, rows, do_notice=False):
+        nexus.write_atomic(path, [nexus.header_line(do_notice)] + rows)
+
+    def _import(self, **kwargs):
+        args = argparse.Namespace(
+            import_file=kwargs.get("import_file", self.incoming),
+            yes=kwargs.get("yes", True),
+            dry_run=kwargs.get("dry_run", False),
+            diff=kwargs.get("diff", False))
+        return nexus.cmd_import(args)
+
+    def _raw(self):
+        with open(self.live, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_existing_rows_survive_byte_for_byte(self):
+        old = "old.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        new = "new.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.live, [old])
+        self._write(self.incoming, [new])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(rows[0], old)      # byte-identical, still first
+        self.assertEqual(rows, [old, new])
+        # The raw bytes, not just the parse: no re-rendering of the old row.
+        self.assertIn("\n" + old + "\n", self._raw())
+
+    def test_import_creates_the_file_on_a_manager_with_none(self):
+        new = "new.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.incoming, [new])
+        self.assertEqual(self._import(), 0)
+        self.assertEqual(nexus.read_existing(self.live),
+                         (nexus.header_line(False), [new]))
+
+    def test_duplicate_key_does_not_duplicate_the_row(self):
+        row = "dup.example\tIntel::DOMAIN\tMISP\tdesc\t-"
+        self._write(self.live, [row])
+        self._write(self.incoming,
+                    ["dup.example\tIntel::DOMAIN\tOTHER\tother\t-"])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(rows, [row])       # existing wins, no second row
+
+    def test_header_mismatch_blocks_and_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"], False)
+        before = self._raw()
+        # Six fields: valid for do_notice, so it clears the incoming lint and
+        # the header comparison is what does the blocking.
+        self._write(self.incoming,
+                    ["b.example\tIntel::DOMAIN\tMISP\td\t-\tT"], True)
+        self.assertEqual(self._import(), 1)
+        self.assertIn("different meta.do_notice", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_malformed_incoming_file_blocks_and_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        with open(self.incoming, "w", encoding="utf-8") as handle:
+            handle.write(nexus.header_line(False) + "\n")
+            handle.write("garbage-with-no-tabs\n")
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+        self.assertIn("fails lint", self.printed)
+
+    def test_missing_incoming_file_is_an_error(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(
+                self._import(import_file=os.path.join(self.tmp, "nope")), 2)
+        self.assertIn("no such file", errors.getvalue())
+        self.assertEqual(self._raw(), before)
+
+    def test_incoming_file_with_no_indicators_is_an_error(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, [])
+        self.assertEqual(self._import(), 2)
+        self.assertEqual(self._raw(), before)
+
+    def test_unreadable_incoming_file_is_an_error_not_a_traceback(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        with open(self.incoming, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        self.assertEqual(self._import(), 2)
+
+    def test_an_unreadable_live_file_is_an_error_not_a_traceback(self):
+        # The manager's own intel.dat, not the transferred one: on a real
+        # manager check_env traps this first, but nothing guarantees that
+        # ordering and the raise here escaped as a traceback.
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        with open(self.live, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(self._import(), 1)
+        self.assertIn("unreadable", errors.getvalue())
+        with open(self.live, "rb") as handle:
+            self.assertEqual(handle.read(), b"\xff\xfe not utf-8 at all\n")
+
+    def test_broad_incoming_subnet_is_flagged(self):
+        """The guardrail's own reason to exist: rows built somewhere else.
+
+        norm_subnet would have rejected a /8 on the way in, but these rows
+        were normalised on another host by a copy of Nexus this one cannot
+        inspect, so they get looked at again here.
+        """
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["10.0.0.0/8\tIntel::SUBNET\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        # The exact verdict, not just the words: "no overly broad indicators"
+        # is what an unparsed row list would have printed here.
+        self.assertIn("warn    1 overly broad indicator(s): 10.0.0.0/8 "
+                      "(subnet at or broader than /16)", self.printed)
+
+    def test_the_guardrail_count_is_the_merged_total_not_the_sum(self):
+        # Re-importing a refreshed offline build is near-total overlap, so
+        # len(incoming) + len(existing) roughly doubles the true count and the
+        # 100k warn threshold would fire at about half the real number.
+        shared = "shared.example\tIntel::DOMAIN\tMISP\td\t-"
+        self._write(self.live,
+                    [shared, "only-live.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming,
+                    [shared, "only-new.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(len(rows), 3)
+        self.assertIn("3 indicators", self.printed)
+        self.assertNotIn("4 indicators", self.printed)
+
+    def test_a_bad_row_in_the_live_file_blocks_the_write(self):
+        """The merged-file lint: the live file is not ours and not trusted."""
+        self._write(self.live, ["a.example\tIntel::NOPE\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 1)
+        self.assertIn("the merged file fails lint", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_dry_run_writes_nothing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(dry_run=True), 0)
+        self.assertEqual(self._raw(), before)
+        self.assertEqual(self.applied, [])
+
+    def test_dry_run_with_diff_shows_the_line_diff(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(dry_run=True, diff=True), 0)
+        self.assertIn("+b.example\tIntel::DOMAIN\tMISP\td\t-", self.printed)
+
+    def test_backs_up_the_live_file_before_writing(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        backups = os.listdir(os.path.join(self.tmp, "backups"))
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(self.tmp, "backups", backups[0]),
+                  encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_yes_applies_to_the_grid(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        self.assertEqual(self.applied,
+                         [{"intel_dir": self.intel_dir, "expected": 2}])
+
+    def test_ctrl_c_at_the_apply_prompt_keeps_the_written_merge(self):
+        """The write already happened; aborting only skips the apply."""
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.addCleanup(setattr, nexus, "ask_yes_no", nexus.ask_yes_no)
+
+        def abort(*args, **kwargs):
+            raise nexus.InterviewAborted("end of input")
+
+        nexus.ask_yes_no = abort
+        self.assertEqual(self._import(yes=False), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(self.applied, [])
+        self.assertIn("Not applied", self.printed)
+
+    def test_an_unfit_environment_blocks_the_write(self):
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        nexus.check_env = lambda: (False, [("error", "no intel dir")])
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+
+    def test_a_removal_blocks_the_write(self):
+        """The invariant, forced.  merge_additive cannot drop a row, so this
+        stubs it to prove the check downstream is real and not decorative."""
+        self._write(self.live, ["a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.addCleanup(setattr, nexus, "merge_additive", nexus.merge_additive)
+        nexus.merge_additive = lambda existing, new: list(new)
+        self.assertEqual(self._import(), 1)
+        self.assertEqual(self._raw(), before)
+        self.assertIn("removed indicators", self.printed)
+
+
+class TestImportCli(Quiet):
+
+    def test_import_parses_into_import_file(self):
+        args = nexus.build_parser().parse_args(["--import", "/tmp/x.dat"])
+        self.assertEqual(args.import_file, "/tmp/x.dat")
+
+    def test_import_defaults_to_none(self):
+        self.assertIsNone(nexus.build_parser().parse_args([]).import_file)
+
+    def test_import_with_yes_does_not_need_a_profile(self):
+        """--import runs no interview, so the --yes gate must not reject it."""
+        seen = []
+        for name in ("cmd_import", "setup_logging"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.cmd_import = lambda args: seen.append(args.import_file) or 0
+        # main() otherwise rewires the process-wide logger and reaches for
+        # /opt/nexus, which outlives this test and pollutes the ones after it.
+        nexus.setup_logging = lambda *a, **k: None
+        rc = nexus.main(["--import", "/tmp/x.dat", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["/tmp/x.dat"])
+
+
+class TestEnsureIntelEnv(Quiet):
+    """The block cmd_build and cmd_import share."""
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for name in ("SO_INTEL_DIR", "check_env", "seed_load_file"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.SO_INTEL_DIR = self.tmp
+
+    def test_a_healthy_environment_seeds_nothing(self):
+        nexus.check_env = lambda: (True, [])
+        nexus.seed_load_file = lambda: self.fail("nothing to seed")
+        self.assertTrue(nexus.ensure_intel_env(True))
+
+    def test_a_missing_load_file_is_seeded_without_asking_under_yes(self):
+        self.calls = []
+
+        def check():
+            self.calls.append(1)
+            return len(self.calls) > 1, [("error", "__load__.Zeek missing")]
+
+        def seed():
+            path = os.path.join(self.tmp, nexus.SO_LOAD_FILE)
+            open(path, "w").close()
+            return [path]
+
+        nexus.check_env = check
+        nexus.seed_load_file = seed
+        self.assertTrue(nexus.ensure_intel_env(True))
+        self.assertTrue(
+            os.path.exists(os.path.join(self.tmp, nexus.SO_LOAD_FILE)))
+
+    def test_an_unfixable_environment_is_false(self):
+        nexus.check_env = lambda: (False, [("error", "intel dir missing")])
+        open(os.path.join(self.tmp, nexus.SO_LOAD_FILE), "w").close()
+        self.assertFalse(nexus.ensure_intel_env(True))
+        self.assertIn("Environment is not ready", self.printed)
 
 
 if __name__ == "__main__":
