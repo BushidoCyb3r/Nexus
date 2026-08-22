@@ -1120,6 +1120,57 @@ class TaxiiClient(_HttpTransport):
                               "api_root": path})
         return found
 
+    def fetch_objects(self, collection, added_after=None, max_results=None,
+                      page_size=100):
+        """Yield raw STIX objects from one collection.
+
+        `match[type]=indicator` and `added_after` are the only filters TAXII
+        defines that are useful here; everything else the operator asked for
+        is applied after download, in taxii_object_allowed().
+        """
+        if self.version == "2.0":
+            for obj in self._fetch_objects_20(collection, added_after,
+                                              max_results, page_size):
+                yield obj
+            return
+
+        path = "%scollections/%s/objects/" % (collection["api_root"],
+                                              collection["id"])
+        params = {"match[type]": "indicator", "limit": page_size}
+        if added_after:
+            params["added_after"] = added_after
+
+        sent = 0
+        cursor = None
+        previous_cursor = None
+        while True:
+            query = dict(params)
+            if cursor:
+                query["next"] = cursor
+            body, _ = self._request(
+                "GET", path + "?" + urllib.parse.urlencode(query))
+            objects = (body or {}).get("objects") or []
+            for obj in objects:
+                yield obj
+                sent += 1
+                if max_results is not None and sent >= max_results:
+                    return
+            if not (body or {}).get("more"):
+                return
+            cursor = (body or {}).get("next")
+            # A server that repeats or omits `next` would otherwise be
+            # pulled forever; OpenctiClient.search_indicators carries the
+            # same single-cursor guard.
+            if not cursor or cursor == previous_cursor:
+                log.warning("stopped because TAXII did not advance the "
+                            "cursor -- does this server honour `next`?")
+                return
+            previous_cursor = cursor
+
+    def _fetch_objects_20(self, collection, added_after, max_results,
+                          page_size):
+        raise TaxiiError("TAXII 2.0 fetching lands in the next commit")
+
 
 def _misp_bool(value):
     """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""

@@ -1045,6 +1045,16 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
         })
         if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
             status, payload = 404, {"title": "not found"}
+        elif "/collections/" in parsed.path and parsed.path.endswith("/objects/"):
+            # Envelope pagination: each hit serves the next scripted page and
+            # advances the cursor; once pages run out, an empty closed page.
+            pages = self.server.pages
+            idx = self.server.objects_index
+            if idx < len(pages):
+                status, payload = 200, pages[idx]
+                self.server.objects_index += 1
+            else:
+                status, payload = 200, {"objects": [], "more": False}
         else:
             status, payload = self.server.routes.get(
                 parsed.path, (404, {"title": "not found"}))
@@ -1071,6 +1081,10 @@ class FakeTaxii(object):
                               else dict(DEFAULT_TAXII_ROUTES))
         self.server.serve_discovery = True
         self.server.requests = []
+        # Scripted 2.1 object envelopes for TestTaxii21Fetch; each request
+        # to a .../objects/ path serves the next one and advances the index.
+        self.server.pages = [{"objects": [], "more": False}]
+        self.server.objects_index = 0
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
         self.thread.start()
@@ -1209,6 +1223,57 @@ class TestTaxiiDiscovery(unittest.TestCase):
                                    port=self.server.port, retries=1)
         with self.assertRaises(nexus.SourceAuthError):
             client.get_collections()
+
+
+class TestTaxii21Fetch(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.start()
+        self.client = nexus.TaxiiClient(host="127.0.0.1", token="t",
+                                        scheme="http", port=self.server.port,
+                                        version="2.1")
+
+    def test_pages_until_more_is_false(self):
+        self.server.server.pages = [
+            {"objects": [{"id": "indicator--1"}], "more": True, "next": "n1"},
+            {"objects": [{"id": "indicator--2"}], "more": False},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual([o["id"] for o in got],
+                         ["indicator--1", "indicator--2"])
+
+    def test_it_asks_the_server_for_indicators_only(self):
+        list(self.client.fetch_objects({"id": "c1", "api_root": "/api1/"}))
+        params = self.server.requests[-1]["query"]
+        self.assertEqual(params["match[type]"], ["indicator"])
+
+    def test_added_after_is_sent_when_given(self):
+        list(self.client.fetch_objects({"id": "c1", "api_root": "/api1/"},
+                                       added_after="2026-08-01T00:00:00Z"))
+        params = self.server.requests[-1]["query"]
+        self.assertEqual(params["added_after"], ["2026-08-01T00:00:00Z"])
+
+    def test_max_results_stops_early(self):
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "more": True,
+             "next": "n1"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}, max_results=2))
+        self.assertEqual(len(got), 2)
+
+    def test_a_repeated_cursor_stops_the_loop(self):
+        # A server that keeps handing back the same next value would spin
+        # forever; OpenctiClient carries the same guard.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True, "next": "same"},
+            {"objects": [{"id": "b"}], "more": True, "next": "same"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertLessEqual(len(got), 2)
 
 
 class TestOpenctiClient(unittest.TestCase):
