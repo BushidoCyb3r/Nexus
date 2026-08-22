@@ -665,6 +665,55 @@ class TestCheckEnv(unittest.TestCase):
         self.assertIn("I@zeek:enabled:true", apply_msgs[0])
 
 
+class TestCheckOutputTarget(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_writable_empty_target_is_ok(self):
+        ok, findings = nexus.check_output_target(
+            os.path.join(self.tmp, "intel.dat"))
+        self.assertTrue(ok)
+        levels = [level for level, _ in findings]
+        self.assertNotIn("error", levels)
+
+    def test_missing_parent_directory_is_an_error(self):
+        ok, findings = nexus.check_output_target(
+            os.path.join(self.tmp, "nope", "intel.dat"))
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_unwritable_parent_directory_is_an_error(self):
+        locked = os.path.join(self.tmp, "locked")
+        os.mkdir(locked, 0o500)
+        self.addCleanup(os.chmod, locked, 0o700)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        ok, findings = nexus.check_output_target(
+            os.path.join(locked, "intel.dat"))
+        self.assertFalse(ok)
+        self.assertIn("error", [level for level, _ in findings])
+
+    def test_existing_file_that_fails_lint_is_an_error(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        with open(path, "w") as handle:
+            handle.write(nexus.header_line(False) + "\n")
+            handle.write("this-is-not-a-valid-row\n")
+        ok, findings = nexus.check_output_target(path)
+        self.assertFalse(ok)
+        joined = " ".join(message for _, message in findings)
+        self.assertIn("lint", joined)
+
+    def test_existing_clean_file_is_reported_but_ok(self):
+        path = os.path.join(self.tmp, "intel.dat")
+        nexus.write_atomic(path, [nexus.header_line(False),
+                                  "evil.example\tIntel::DOMAIN\tt\td\t-"])
+        ok, findings = nexus.check_output_target(path)
+        self.assertTrue(ok)
+        joined = " ".join(message for _, message in findings)
+        self.assertIn("1 indicator", joined)
+
+
 # ---------------------------------------------------------------------------
 # MISP CLIENT (against a local fake)
 # ---------------------------------------------------------------------------

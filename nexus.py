@@ -2187,6 +2187,49 @@ def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
     return ok, findings
 
 
+def check_output_target(path, do_notice=False):
+    """Stage 0 for an offline build.  Returns (ok, findings).
+
+    check_env() asks whether this machine is a working Security Onion manager.
+    Off-box there is no such question to ask -- the only thing that matters is
+    whether the file we are about to write can be written, and whether
+    anything already sitting at that path is something we can safely merge
+    with.  Same return shape as check_env() so callers print both alike.
+    """
+    findings = []
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+
+    if not os.path.isdir(directory):
+        findings.append(("error", "output directory does not exist: %s"
+                                  % directory))
+        findings.append(("fix", "mkdir -p %s" % directory))
+        return False, findings
+    if not os.access(directory, os.W_OK):
+        findings.append(("error", "output directory is not writable: %s"
+                                  % directory))
+        return False, findings
+    findings.append(("info", "output directory: %s" % directory))
+
+    if not os.path.exists(path):
+        findings.append(("info", "%s will be created" % path))
+        return True, findings
+
+    _, rows = read_existing(path)
+    findings.append(("info", "existing file: %d indicator(s) in %s"
+                             % (len(rows), path)))
+    try:
+        problems = lint_file(path, do_notice)
+    except (OSError, UnicodeDecodeError) as exc:
+        findings.append(("error", "existing file is unreadable: %s" % exc))
+        return False, findings
+    if problems:
+        findings.append(("error", "existing file has %d lint problem(s); "
+                                  "refusing to merge into it" % len(problems)))
+        findings.append(("fix", "run --lint %s for detail" % path))
+        return False, findings
+    return True, findings
+
+
 # ---------------------------------------------------------------------------
 # GUARDRAILS
 # ---------------------------------------------------------------------------
