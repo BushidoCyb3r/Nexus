@@ -546,8 +546,13 @@ class _HttpTransport(object):
         if value:
             REDACTOR.add_secret(value)
 
-    def _request(self, method, path, body=None):
-        """Return (parsed_json, headers).  Retries on transient failures."""
+    def _request(self, method, path, body=None, extra_headers=None):
+        """Return (parsed_json, headers).  Retries on transient failures.
+
+        extra_headers is merged last, for the one-off headers a single call
+        needs (TAXII 2.0's Range); leaving it out sends exactly what every
+        other caller has always sent.
+        """
         url = urllib.parse.urljoin(self.base_url, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {
@@ -556,6 +561,8 @@ class _HttpTransport(object):
             "User-Agent": "nexus/%s" % __version__,
         }
         headers.update(self._auth_headers())
+        if extra_headers:
+            headers.update(extra_headers)
 
         last_exc = None
         for attempt in range(1, self.retries + 1):
@@ -1167,9 +1174,57 @@ class TaxiiClient(_HttpTransport):
                 return
             previous_cursor = cursor
 
+    _CONTENT_RANGE = re.compile(r"items\s+(\d+)\s*-\s*(\d+)\s*/\s*(\d+|\*)")
+
     def _fetch_objects_20(self, collection, added_after, max_results,
                           page_size):
-        raise TaxiiError("TAXII 2.0 fetching lands in the next commit")
+        """TAXII 2.0: a STIX bundle per page, paged by Range headers.
+
+        2.1 replaced this with an envelope carrying `more`/`next`.  Every
+        exit below is load-bearing: a 2.0 server that omits Content-Range,
+        reports an unknown total, sends an empty page or repeats the same
+        window gets one more request and no more -- a short pull beats an
+        endless one.  Unverified against a real 2.0 server.
+        """
+        path = "%scollections/%s/objects/" % (collection["api_root"],
+                                              collection["id"])
+        params = {"match[type]": "indicator"}
+        if added_after:
+            params["added_after"] = added_after
+        query = path + "?" + urllib.parse.urlencode(params)
+
+        sent = 0
+        start = 0
+        while True:
+            body, headers = self._request(
+                "GET", query,
+                extra_headers={"Range": "items %d-%d"
+                                        % (start, start + page_size - 1)})
+            objects = (body or {}).get("objects") or []
+            for obj in objects:
+                yield obj
+                sent += 1
+                if max_results is not None and sent >= max_results:
+                    return
+            match = self._CONTENT_RANGE.search(
+                (headers.get("Content-Range") if headers else None) or "")
+            if not match:
+                return           # no header, or one we cannot read
+            last, total = match.group(2), match.group(3)
+            if total == "*":
+                return           # unknown total; do not guess
+            if int(last) + 1 >= int(total):
+                return
+            if not objects:
+                return           # no progress; stop rather than spin
+            if int(last) + 1 <= start:
+                # The window did not move, so asking again would fetch the
+                # same items forever; 2.1's repeated-cursor guard, in Range
+                # clothing.
+                log.warning("stopped because TAXII did not advance the "
+                            "range -- does this server honour Range?")
+                return
+            start = int(last) + 1
 
 
 def _misp_bool(value):

@@ -972,6 +972,7 @@ class FakeOpenctiHandler(BaseHTTPRequestHandler):
             "path": self.path,
             "auth": self.headers.get("Authorization"),
             "accept": self.headers.get("Accept"),
+            "headers": dict(self.headers),
             "body": json.loads(raw.decode("utf-8")) if raw else {},
         })
         if self.server.script:
@@ -1043,19 +1044,34 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
             "accept": self.headers.get("Accept"),
             "auth": self.headers.get("Authorization"),
         })
+        extra_headers = []
         if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
             status, payload = 404, {"title": "not found"}
         elif "/collections/" in parsed.path and parsed.path.endswith("/objects/"):
-            # Envelope pagination: each hit serves the next scripted page.
-            # Once the script runs out, replay the last page forever rather
-            # than fall back to a closed one -- a fake that can end the loop
-            # on its own would let a test pass with the client's cursor
-            # guard removed, which is exactly the bug this fake exists to
-            # catch. Only the client's own guard (or a scripted page's own
-            # more: False) may stop the pull.
-            pages = self.server.pages
-            idx = self.server.objects_index
-            status, payload = 200, pages[min(idx, len(pages) - 1)]
+            if self.server.taxii_version == "2.0":
+                # 2.0 has no envelope: a STIX bundle plus a Content-Range
+                # header.  Kept a separate branch from 2.1 so neither
+                # version's pagination shape can quietly change the other's.
+                # It replays its last scripted page forever for the same
+                # reason the 2.1 branch does (see below).
+                self.server.ranges.append(self.headers.get("Range") or "")
+                bundles = self.server.bundles
+                idx = min(self.server.objects_index, len(bundles) - 1)
+                payload, content_range = bundles[idx]
+                status = 200
+                if content_range is not None:
+                    extra_headers.append(("Content-Range", content_range))
+            else:
+                # Envelope pagination: each hit serves the next scripted page.
+                # Once the script runs out, replay the last page forever rather
+                # than fall back to a closed one -- a fake that can end the loop
+                # on its own would let a test pass with the client's cursor
+                # guard removed, which is exactly the bug this fake exists to
+                # catch. Only the client's own guard (or a scripted page's own
+                # more: False) may stop the pull.
+                pages = self.server.pages
+                status, payload = 200, pages[min(self.server.objects_index,
+                                                 len(pages) - 1)]
             self.server.objects_index += 1
         else:
             status, payload = self.server.routes.get(
@@ -1064,6 +1080,8 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers:
+            self.send_header(name, value)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -1077,8 +1095,9 @@ class FakeTaxii(object):
     routes= to script something narrower, as the version-detection tests do.
     """
 
-    def __init__(self, routes=None):
+    def __init__(self, routes=None, version="2.1"):
         self.server = HTTPServer(("127.0.0.1", 0), FakeTaxiiHandler)
+        self.server.taxii_version = version
         self.server.routes = (dict(routes) if routes is not None
                               else dict(DEFAULT_TAXII_ROUTES))
         self.server.serve_discovery = True
@@ -1086,6 +1105,10 @@ class FakeTaxii(object):
         # Scripted 2.1 object envelopes for TestTaxii21Fetch; each request
         # to a .../objects/ path serves the next one and advances the index.
         self.server.pages = [{"objects": [], "more": False}]
+        # Scripted 2.0 pages for TestTaxii20Fetch: (bundle, Content-Range),
+        # where a Content-Range of None means the server sent none at all.
+        self.server.bundles = [({"type": "bundle", "objects": []}, None)]
+        self.server.ranges = []
         self.server.objects_index = 0
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
@@ -1105,6 +1128,19 @@ class FakeTaxii(object):
     @property
     def accepts(self):
         return [r["accept"] for r in self.server.requests]
+
+    @property
+    def bundles(self):
+        return self.server.bundles
+
+    @bundles.setter
+    def bundles(self, value):
+        self.server.bundles = list(value)
+
+    @property
+    def ranges(self):
+        """The Range header of every 2.0 objects request, in order."""
+        return self.server.ranges
 
     @property
     def serve_discovery(self):
@@ -1290,6 +1326,126 @@ class TestTaxii21Fetch(unittest.TestCase):
         got = list(self.client.fetch_objects(
             {"id": "c1", "api_root": "/api1/"}))
         self.assertEqual(len(got), 1)
+        self.assertEqual(len(self.server.requests), 1)
+
+
+class TestTaxii20Fetch(unittest.TestCase):
+    """2.0 has no envelope: a STIX bundle per page, paged with Range /
+    Content-Range.  Every one of these tests exists because the loop that
+    reads those headers has more ways to never end than to end."""
+
+    def setUp(self):
+        self.server = FakeTaxii(version="2.0")
+        self.addCleanup(self.server.stop)
+        self.server.start()
+        self.client = nexus.TaxiiClient(host="127.0.0.1", token="t",
+                                        scheme="http", port=self.server.port,
+                                        version="2.0")
+
+    def _fetch(self, **kwargs):
+        return list(self.client.fetch_objects({"id": "c1",
+                                               "api_root": "/api1/"}, **kwargs))
+
+    def test_reads_objects_out_of_a_bundle(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "indicator--1"}]},
+             "items 0-0/1"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["indicator--1"])
+
+    def test_it_pages_with_range_until_the_total_is_reached(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/2"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-1/2"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.ranges), 2)
+        self.assertTrue(all(r.startswith("items ") for r in self.server.ranges))
+
+    def test_the_range_header_asks_for_a_page_size_window(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/9"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-8/9"),
+        ]
+        self._fetch(page_size=5)
+        # First window starts at 0 and is page_size wide; the second resumes
+        # one past the last item the server actually served, not one past
+        # what we asked for.
+        self.assertEqual(self.server.ranges, ["items 0-4", "items 1-5"])
+
+    def test_it_asks_the_server_for_indicators_only(self):
+        self._fetch()
+        self.assertEqual(self.server.requests[-1]["query"]["match[type]"],
+                         ["indicator"])
+
+    def test_added_after_is_sent_when_given(self):
+        self._fetch(added_after="2026-08-01T00:00:00Z")
+        self.assertEqual(self.server.requests[-1]["query"]["added_after"],
+                         ["2026-08-01T00:00:00Z"])
+
+    def test_max_results_stops_early(self):
+        self.server.bundles = [
+            ({"type": "bundle",
+              "objects": [{"id": "a"}, {"id": "b"}, {"id": "c"}]},
+             "items 0-2/9"),
+        ]
+        self.assertEqual(len(self._fetch(max_results=2)), 2)
+
+    # -- the four ways this loop has to end ------------------------------
+    # The fake replays its last scripted page forever (see FakeTaxiiHandler),
+    # so each of these hangs the suite rather than failing if its guard in
+    # _fetch_objects_20 is removed.  That is deliberate.
+
+    def test_a_missing_content_range_ends_the_pull(self):
+        # Not every 2.0 server sends it; one page is better than a loop.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "only"}]}, None),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["only"])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_an_unknown_total_ends_the_pull(self):
+        # "items 0-0/*" means the server will not say how many there are;
+        # guessing a total is how a client pages forever.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/*"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a"])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_reaching_the_total_ends_the_pull(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}, {"id": "b"}]},
+             "items 0-1/2"),
+        ]
+        self.assertEqual(len(self._fetch()), 2)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_an_empty_page_ends_the_pull(self):
+        # The arithmetic says there are three more, but the server just sent
+        # nothing -- asking again forever is the wrong reading.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": []}, "items 0-0/4"),
+        ]
+        self.assertEqual(self._fetch(), [])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_a_content_range_that_does_not_advance_ends_the_pull(self):
+        # A server stuck on "items 0-0" would otherwise be re-asked for the
+        # same window forever; this is 2.1's repeated-cursor guard in
+        # Range clothing.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/4"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 0-0/4"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_an_unparsable_content_range_ends_the_pull(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "pages 1 of 7"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a"])
         self.assertEqual(len(self.server.requests), 1)
 
 
@@ -4141,6 +4297,14 @@ class TestTransportHooks(unittest.TestCase):
     """TAXII needs a version-specific Accept header and a second secret --
     both are shared transport hooks so later sources don't monkey-patch."""
 
+    @staticmethod
+    def _probe(fake):
+        class Probe(nexus._HttpTransport):
+            def _auth_headers(self):
+                return {"Authorization": "tok"}
+        return Probe(host="127.0.0.1", token="tok", scheme="http",
+                     port=fake.port, retries=1)
+
     def test_accept_defaults_to_json(self):
         self.assertEqual(nexus._HttpTransport.ACCEPT, "application/json")
 
@@ -4184,6 +4348,31 @@ class TestTransportHooks(unittest.TestCase):
                           port=fake.port, retries=1)
             client._request("POST", "/")
             self.assertEqual(fake.requests[0]["accept"], "application/json")
+        finally:
+            fake.stop()
+
+    def test_extra_headers_reach_the_server(self):
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            client = self._probe(fake)
+            client._request("POST", "/", extra_headers={"Range": "items 0-9"})
+            self.assertEqual(fake.requests[0]["headers"]["Range"],
+                            "items 0-9")
+        finally:
+            fake.stop()
+
+    def test_without_extra_headers_a_request_is_unchanged(self):
+        # _request is shared by MISP, OpenCTI and TAXII; the extra_headers
+        # default must leave the other two sending byte-identical headers.
+        # An exact set, not a subset: a stray header is the regression.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            client = self._probe(fake)
+            client._request("POST", "/")
+            self.assertEqual(
+                sorted(k.lower() for k in fake.requests[0]["headers"]),
+                ["accept", "accept-encoding", "authorization", "connection",
+                 "content-length", "content-type", "host", "user-agent"])
         finally:
             fake.stop()
 
