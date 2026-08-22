@@ -2907,11 +2907,16 @@ class TestTaxiiStage1(Quiet):
     secret (getpass), timeout, retries."""
 
     def test_basic_auth_collects_both_secrets(self):
+        # Version answer is "2" (2.0), deliberately not "1" -- "1" also
+        # happens to be the client=None default (TAXII_VERSIONS[0], "2.1"),
+        # so scripting it would not distinguish "asked and honoured" from
+        # "asked for show and the default silently kept".
         fake = scripted(["taxii.test", "1", "443", "y", "none",
-                         "1", "2", "alice", "30", "3"])
+                         "2", "2", "alice", "30", "3"])
         config = {}
         nexus._stage1_connection(
             config, None, fake, lambda _p: "s3cret", source="taxii")
+        self.assertEqual(config["taxii_version"], "2.0")
         self.assertEqual(config["taxii_auth"], "basic")
         self.assertEqual(config["taxii_username"], "alice")
         self.assertEqual(config["token"], "s3cret")
