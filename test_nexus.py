@@ -4619,6 +4619,15 @@ class TestOfflineBuild(Quiet):
         self.assertEqual(self.build(self.config(do_notice=True)), 0)
         self.assertNotIn("do_notice.zeek is not loaded", self.printed)
 
+    def test_the_guardrail_count_is_the_merged_total_not_the_sum(self):
+        # Same double-count on the build path: the fetched row is already in
+        # the file being merged into, so the total is 1, not 2.
+        nexus.write_atomic(self.out, [nexus.header_line(False),
+                                      "45.33.32.1\tIntel::ADDR\tMISP\td\t-"])
+        self.assertEqual(self.build(self.config()), 0)
+        self.assertIn("1 indicators", self.printed)
+        self.assertNotIn("2 indicators", self.printed)
+
     def test_the_backup_lands_beside_the_output_not_in_opt_nexus(self):
         # The interview defaults "back up first" to yes, so the *second*
         # offline build is the common case: /opt/nexus is not writable on a
@@ -5014,6 +5023,21 @@ class TestImportMode(Quiet):
         # is what an unparsed row list would have printed here.
         self.assertIn("warn    1 overly broad indicator(s): 10.0.0.0/8 "
                       "(subnet at or broader than /16)", self.printed)
+
+    def test_the_guardrail_count_is_the_merged_total_not_the_sum(self):
+        # Re-importing a refreshed offline build is near-total overlap, so
+        # len(incoming) + len(existing) roughly doubles the true count and the
+        # 100k warn threshold would fire at about half the real number.
+        shared = "shared.example\tIntel::DOMAIN\tMISP\td\t-"
+        self._write(self.live,
+                    [shared, "only-live.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self._write(self.incoming,
+                    [shared, "only-new.example\tIntel::DOMAIN\tMISP\td\t-"])
+        self.assertEqual(self._import(), 0)
+        _, rows = nexus.read_existing(self.live)
+        self.assertEqual(len(rows), 3)
+        self.assertIn("3 indicators", self.printed)
+        self.assertNotIn("4 indicators", self.printed)
 
     def test_a_bad_row_in_the_live_file_blocks_the_write(self):
         """The merged-file lint: the live file is not ours and not trusted."""

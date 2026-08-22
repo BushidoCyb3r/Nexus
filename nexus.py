@@ -2378,15 +2378,23 @@ _LEVEL_ORDER = {"block": 0, "warn": 1, "ok": 2}
 
 
 def run_guardrails(rows, existing_count, intel_dir=None, append_only=False,
-                   **thresholds):
+                   total_count=None, **thresholds):
     """Run every guardrail, worst verdict first.
 
     A flat ordered list rather than a dict -- the pre-write confirmation
     prompt wants to lead with whatever is most likely to make an operator
     stop and look.  `check_load_file` is skipped when intel_dir is None
     (e.g. a --dry-run against a scratch path with no real SO layout).
+
+    `total_count` is the post-merge indicator count.  Append-only callers
+    pass it because len(rows) + existing_count double-counts every key that
+    is in both sets -- which, on a re-import of a refreshed build, is nearly
+    all of them.
     """
-    new_count = len(rows) + (existing_count or 0) if append_only else len(rows)
+    if total_count is None:
+        total_count = (len(rows) + (existing_count or 0) if append_only
+                       else len(rows))
+    new_count = total_count
     verdicts = [check_size(new_count, thresholds.get("warn_at", 100000),
                            thresholds.get("cap")),
                 check_broad_indicators(rows)]
@@ -4492,7 +4500,7 @@ def cmd_build(args):
     verdicts = run_guardrails(rows, len(existing),
                               intel_dir=None if offline
                               else os.path.dirname(path),
-                              append_only=True,
+                              append_only=True, total_count=len(combined),
                               cap=config.get("max_indicators"))
     print("\nGuardrails")
     blocked = False
@@ -4685,7 +4693,7 @@ def cmd_import(args):
     # copy of Nexus this one cannot inspect.
     verdicts = run_guardrails([line.split("\t") for line in incoming_rows],
                               len(existing), intel_dir=SO_INTEL_DIR,
-                              append_only=True)
+                              append_only=True, total_count=len(combined))
     print("\nGuardrails")
     blocked = False
     for verdict in verdicts:
