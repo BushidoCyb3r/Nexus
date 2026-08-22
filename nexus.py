@@ -4572,6 +4572,26 @@ def resolve_token(args, interactive=True):
     return getpass.getpass("API token: ").strip()
 
 
+def resolve_taxii_username(interactive=True, input_fn=input):
+    """The Basic username a profile deliberately did not store.
+
+    It is half a credential, so PROFILE_EXCLUDED_KEYS keeps it off disk
+    alongside the password -- which leaves a replayed Basic profile with
+    nowhere to read it from but the environment or the operator.  "" is a hard
+    failure at the call site: a client built without it authenticates Bearer,
+    and the 401 that follows blames the token.
+    """
+    env = (os.environ.get("NEXUS_TAXII_USERNAME") or "").strip()
+    if env:
+        return env
+    if not interactive:
+        log.error("this profile authenticates to TAXII with Basic auth, and "
+                  "the username is never stored -- set NEXUS_TAXII_USERNAME, "
+                  "or drop --yes so it can be asked for")
+        return ""
+    return ask_required("TAXII Basic username", None, input_fn)
+
+
 def resolve_source_args(args):
     """Fold the deprecated --misp alias into --host/--source."""
     if getattr(args, "misp", None):
@@ -5146,6 +5166,17 @@ def cmd_build(args):
         if not config["token"]:
             print("no API token available", file=sys.stderr)
             return 2
+        if (config.get("source") == "taxii"
+                and config.get("taxii_auth") == "basic"
+                and not config.get("taxii_username")):
+            # Falling through would build a Bearer client out of a Basic
+            # profile and report the resulting 401 as a bad token.
+            config["taxii_username"] = resolve_taxii_username(
+                interactive=not args.yes)
+            if not config["taxii_username"]:
+                print("no TAXII Basic username available; set "
+                      "NEXUS_TAXII_USERNAME", file=sys.stderr)
+                return 2
         print("Replaying profile %s" % profile_path(args.profile))
     else:
         # The interview needs a live client for its tag/org/type lists, but

@@ -5585,6 +5585,42 @@ class TestTaxiiBuild(Quiet):
                     if l and not l.startswith("#")]
         self.assertEqual(len(rows), 3)
 
+    def _basic_profile(self):
+        return self.profile(taxii_auth="basic")
+
+    def test_a_basic_profile_replays_as_basic_not_bearer(self):
+        # taxii_username is excluded from profiles on purpose -- it is half a
+        # credential -- so a replayed Basic profile has to find it somewhere.
+        # Without that, make_client silently builds a Bearer client and the
+        # server answers 401 with a message blaming the token.
+        os.environ["NEXUS_TAXII_USERNAME"] = "alice-admin"
+        self.addCleanup(os.environ.pop, "NEXUS_TAXII_USERNAME", None)
+        self.server.server.pages = [{"more": False, "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self._basic_profile()), 0)
+        expected = "Basic " + base64.b64encode(
+            b"alice-admin:tok").decode("ascii")
+        self.assertEqual(sorted(set(r["auth"] for r in self.server.requests)),
+                         [expected])
+
+    def test_a_basic_profile_with_no_username_fails_instead_of_downgrading(self):
+        # --yes cannot prompt, so this is the unattended path failing loudly
+        # rather than sending the password as a Bearer token.
+        os.environ.pop("NEXUS_TAXII_USERNAME", None)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            with self.assertLogs(nexus.log, level="ERROR"):
+                code = self.run_build(self._basic_profile())
+        self.assertEqual(code, 2)
+        self.assertIn("NEXUS_TAXII_USERNAME", errors.getvalue() + self.printed)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_bearer_profile_is_untouched(self):
+        os.environ.pop("NEXUS_TAXII_USERNAME", None)
+        self.server.server.pages = [{"more": False, "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self.profile()), 0)
+        self.assertEqual(sorted(set(r["auth"] for r in self.server.requests)),
+                         ["Bearer tok"])
+
     def test_a_dropped_object_is_still_counted_as_fetched(self):
         # The summary promises the post-download filters "thin what is kept,
         # not what is fetched"; a stats line reading "fetched 1" when two
