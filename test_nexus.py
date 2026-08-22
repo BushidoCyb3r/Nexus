@@ -4340,14 +4340,18 @@ class TestBuildHonoursSourceAndHostFlags(Quiet):
             seen.update(kwargs)
             return interview(kwargs)
 
-        real = (nexus.run_interview, nexus.check_env)
+        real = (nexus.run_interview, nexus.check_env,
+                nexus.resolve_build_target)
         nexus.run_interview = fake_interview
         nexus.check_env = lambda: (True, [])
+        # A build on this manager: the target question is Task 2's to test.
+        nexus.resolve_build_target = lambda args: False
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 nexus.cmd_build(args)
         finally:
-            nexus.run_interview, nexus.check_env = real
+            (nexus.run_interview, nexus.check_env,
+             nexus.resolve_build_target) = real
         return seen
 
     def test_flags_reach_the_interview(self):
@@ -4451,15 +4455,18 @@ class TestBuildTranslatesTheTypeVocabulary(Quiet):
                 return iter(records)
 
         config = self.config()
-        real = (nexus.check_env, nexus.run_interview, nexus.make_client)
+        real = (nexus.check_env, nexus.run_interview, nexus.make_client,
+                nexus.resolve_build_target)
         nexus.check_env = lambda: (True, [])
         nexus.run_interview = lambda client, **kwargs: config
         nexus.make_client = lambda cfg: Client()
+        nexus.resolve_build_target = lambda args: False
         try:
             args = nexus.resolve_source_args(nexus.build_parser().parse_args([]))
             rc = nexus.cmd_build(args)
         finally:
-            nexus.check_env, nexus.run_interview, nexus.make_client = real
+            (nexus.check_env, nexus.run_interview, nexus.make_client,
+             nexus.resolve_build_target) = real
 
         self.assertEqual(rc, 0)
         with io.open(config["output_path"], encoding="utf-8") as handle:
@@ -4467,6 +4474,140 @@ class TestBuildTranslatesTheTypeVocabulary(Quiet):
         self.assertIn("d" * 32, body)
         self.assertIn("e" * 64, body)
         self.assertIn("bad.exe", body)
+
+
+class TestOfflineBuild(Quiet):
+    """A build on a host with no Security Onion, end to end.
+
+    Every SO_* constant points at a path that does not exist, so any code that
+    reaches for the local install fails here rather than quietly finding the
+    real one on a developer's manager.
+    """
+
+    POISON = "/nonexistent/security-onion"
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.out = os.path.join(self.dir, "intel.dat")
+        for name in ("SO_INTEL_DIR", "SO_INTEL_DEFAULT_DIR",
+                     "SO_INTEL_RUNTIME_DIR", "SO_INTEL_FILE"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+            setattr(nexus, name, os.path.join(self.POISON, name.lower()))
+
+    def config(self, **overrides):
+        config = {
+            "offline": True, "deployment": "offline", "output_path": self.out,
+            "apply": False, "backup": False, "dry_run": False,
+            "do_notice": False, "source": "misp", "source_host": "misp.local",
+            "types": ["ip-dst"], "exclude_private": True, "own_networks": [],
+            "own_domains": [], "allowlist_file": None,
+            "split_composites": "both", "allow_subnet": True,
+            "source_fmt": "MISP", "desc_template": "{category}",
+            "source_base_url": None, "meta_maxlen": 200,
+            "max_indicators": None, "token": "t", "profile_path": None,
+            "merge_mode": "append-only",
+        }
+        config.update(overrides)
+        return config
+
+    def records(self):
+        return [{"type": "ip-dst", "value": "45.33.32.1",
+                 "category": "Network activity", "event_id": "7",
+                 "event_info": "phishing infrastructure"}]
+
+    def build(self, config, argv=None):
+        """Run cmd_build with the platform stubbed out; returns the exit code.
+
+        check_env() is deliberately *not* stubbed -- an offline run must not
+        call it at all, and against the poisoned paths it would fail if it did.
+        """
+        class Client(object):
+            host = "misp.local"
+
+            def get_version(self):
+                return {"version": "2.4.190"}
+
+        self.interview_kwargs = None
+
+        def fake_interview(client, **kwargs):
+            self.interview_kwargs = kwargs
+            return config
+
+        real = (nexus.make_client, nexus.run_interview, nexus._fetch_records)
+        self.client_factory = lambda cfg: Client()
+        nexus.make_client = self.client_factory
+        nexus.run_interview = fake_interview
+        nexus._fetch_records = lambda client, cfg: iter(self.records())
+        try:
+            args = nexus.resolve_source_args(
+                nexus.build_parser().parse_args(
+                    ["--offline"] if argv is None else argv))
+            return nexus.cmd_build(args)
+        finally:
+            (nexus.make_client, nexus.run_interview,
+             nexus._fetch_records) = real
+
+    def test_offline_build_writes_without_any_security_onion(self):
+        self.assertEqual(self.build(self.config()), 0)
+        self.assertTrue(os.path.exists(self.out))
+        header, rows = nexus.read_existing(self.out)
+        self.assertEqual(header, nexus.header_line(False))
+        self.assertEqual([row.split("\t")[0] for row in rows], ["45.33.32.1"])
+
+    def test_offline_build_prints_both_transfer_routes(self):
+        self.build(self.config())
+        self.assertIn("--import", self.printed)
+        self.assertIn("REPLACES", self.printed)
+        # ...and never the on-box apply, which has nothing to apply to.
+        self.assertNotIn(nexus.SO_APPLY_CMD + "\nThen check", self.printed)
+
+    def test_the_output_directory_is_checked_and_a_bad_one_blocks(self):
+        config = self.config(
+            output_path=os.path.join(self.dir, "no-such-dir", "intel.dat"))
+        self.assertEqual(self.build(config), 1)
+        self.assertIn("output directory does not exist", self.printed)
+        self.assertFalse(os.path.exists(config["output_path"]))
+
+    def test_the_offline_answer_reaches_the_interview_with_the_others(self):
+        # source/host/connect were dropped from this call once already; a
+        # missing `connect` leaves the OpenCTI scope filters unresolvable.
+        self.build(self.config(), argv=["--offline", "--source", "opencti",
+                                        "--host", "cti.local"])
+        self.assertEqual(self.interview_kwargs["offline"], True)
+        self.assertEqual(self.interview_kwargs["source"], "opencti")
+        self.assertEqual(self.interview_kwargs["host"], "cti.local")
+        self.assertIs(self.interview_kwargs["connect"], self.client_factory)
+
+    def test_the_backup_lands_beside_the_output_not_in_opt_nexus(self):
+        # The interview defaults "back up first" to yes, so the *second*
+        # offline build is the common case: /opt/nexus is not writable on a
+        # workstation and backup_file() would die in os.makedirs.
+        self.assertEqual(self.build(self.config(backup=True)), 0)
+        self.assertEqual(self.build(self.config(backup=True)), 0)
+        saved = os.listdir(os.path.join(self.dir, "nexus-backups"))
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0].startswith("intel.dat."))
+
+    def test_a_profile_replay_honours_its_recorded_answer_without_asking(self):
+        profile = os.path.join(self.dir, "offline.json")
+        nexus.save_profile(self.config(), profile)
+        token_file = os.path.join(self.dir, "token")
+        with io.open(token_file, "w", encoding="utf-8") as handle:
+            handle.write(u"t\n")
+
+        real = nexus.ask_choice
+        nexus.ask_choice = lambda *a, **k: self.fail(
+            "an unattended replay must not be asked where the file is going")
+        try:
+            rc = self.build(None, argv=["--profile", profile, "--yes",
+                                        "--token-file", token_file])
+        finally:
+            nexus.ask_choice = real
+        self.assertEqual(rc, 0)
+        self.assertIn("--import", self.printed)
+        self.assertTrue(os.path.exists(self.out))
 
 
 class TestOpenctiEndToEnd(unittest.TestCase):

@@ -3847,6 +3847,27 @@ def apply_to_grid(intel_dir=SO_INTEL_DIR, runtime_dir=SO_INTEL_RUNTIME_DIR,
     return ok, steps
 
 
+def print_transfer_instructions(path, do_notice=False):
+    """Both manager-side routes, and the difference between them.
+
+    An operator who copies the file into place by hand gets no guardrails and
+    no merge -- that route is supported, but it silently replaces whatever the
+    manager had accumulated.  Saying so here is the only protection it gets.
+    """
+    print("\nBuilt for transfer: %s" % path)
+    print("\nOn the Security Onion manager, either:")
+    print("  1. Merge it (keeps the indicators already there):")
+    print("       python3 nexus.py --import %s" % os.path.basename(path))
+    print("  2. Or put it in place by hand:")
+    print("       sudo cp %s %s/" % (os.path.basename(path), SO_INTEL_DIR))
+    print("     This REPLACES the manager's intel.dat. Safe on a fresh")
+    print("     install; on a manager that has been running, it drops every")
+    print("     indicator not in this file.")
+    print("     It also needs %s already present -- check with:" % SO_LOAD_FILE)
+    print("       python3 nexus.py --check-env    (and --seed if it is missing)")
+    print("\nThen apply: %s" % SO_APPLY_CMD)
+
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
@@ -4277,7 +4298,28 @@ def main(argv=None):
 
 def cmd_build(args):
     """The default mode: interview, fetch, build, check, write."""
-    ok, findings = check_env()
+    # Where the file is going decides whether this host has to be a manager at
+    # all, so it is settled before check_env() -- and a profile is loaded first
+    # because it already recorded the answer.  Re-asking it would break the one
+    # unattended path (--profile --yes) that must never prompt.
+    config = None
+    if args.profile:
+        try:
+            config = load_profile(profile_path(args.profile))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            print("could not load profile: %s" % exc, file=sys.stderr)
+            return 2
+        offline = bool(args.offline or config.get("offline"))
+    else:
+        try:
+            offline = resolve_build_target(args)
+        except InterviewAborted as exc:
+            print("\nAborted: %s" % exc)
+            return 130
+
+    # Off-box there is no Security Onion to check; check_output_target() below
+    # takes its place once the output path is known.
+    ok, findings = (True, []) if offline else check_env()
     if not ok:
         for level, message in findings:
             if level in ("error", "fix"):
@@ -4303,12 +4345,7 @@ def cmd_build(args):
             print("Environment is not ready -- run --check-env for detail.")
             return 1
 
-    if args.profile:
-        try:
-            config = load_profile(profile_path(args.profile))
-        except (OSError, ValueError, UnicodeDecodeError) as exc:
-            print("could not load profile: %s" % exc, file=sys.stderr)
-            return 2
+    if config is not None:
         config["token"] = resolve_token(args, interactive=not args.yes)
         if not config["token"]:
             print("no API token available", file=sys.stderr)
@@ -4321,11 +4358,14 @@ def cmd_build(args):
             # --source answers its own question; --host only seeds the
             # default, so the address is still asked.
             config = run_interview(None, source=args.source, host=args.host,
-                                   connect=make_client)
+                                   connect=make_client, offline=offline)
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130
 
+    # One source of truth for the rest of the run: a --offline flag overrides
+    # what an older profile recorded, and an older profile has no key at all.
+    config["offline"] = offline
     # Profiles written before topology became explicit remain compatible.
     config.setdefault("deployment", "distributed")
     config.setdefault("max_indicators", None)
@@ -4392,6 +4432,15 @@ def cmd_build(args):
     print("\n" + stats.report())
 
     path = config["output_path"]
+    if offline:
+        # Stage 0 for an offline run, deferred until the path is known.  Every
+        # finding prints, not just the failures: "output directory: X" is the
+        # only confirmation an operator gets of where the file is landing.
+        ok, findings = check_output_target(path, config["do_notice"])
+        for level, message in findings:
+            print(LEVEL_PREFIX.get(level, "  ") + message)
+        if not ok:
+            return 1
     existing_header, existing = read_existing(path)
     wanted_header = header_line(config["do_notice"])
     if existing_header and existing_header != wanted_header:
@@ -4403,7 +4452,8 @@ def cmd_build(args):
     fresh_lines = rows_to_lines(rows, config["do_notice"])
     combined = merge_additive(existing, fresh_lines)
     verdicts = run_guardrails(rows, len(existing),
-                              intel_dir=os.path.dirname(path),
+                              intel_dir=None if offline
+                              else os.path.dirname(path),
                               append_only=True,
                               cap=config.get("max_indicators"))
     print("\nGuardrails")
@@ -4441,12 +4491,23 @@ def cmd_build(args):
         return 0
 
     if config["backup"]:
-        saved = backup_file(path, os.path.join(NEXUS_HOME, "backups"))
+        # Off-box there is no writable /opt/nexus to back up into -- and the
+        # output directory is the one place check_output_target proved we can
+        # write.  Without this the second offline build over the same file
+        # dies in os.makedirs.
+        saved = backup_file(path, os.path.join(
+            os.path.dirname(os.path.abspath(path)), "nexus-backups")
+            if offline else os.path.join(NEXUS_HOME, "backups"))
         if saved:
             print("\nbacked up to %s" % saved)
     write_atomic(path, lines)
     print("added %d new indicators; %d total in %s"
           % (len(added), len(combined), path))
+
+    if offline:
+        # Nothing here to apply to; the manager-side steps are the operator's.
+        print_transfer_instructions(path, config["do_notice"])
+        return 0
 
     if not config.get("apply"):
         target = ("standalone node" if config.get("deployment") == "standalone"
