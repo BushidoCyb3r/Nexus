@@ -3144,7 +3144,7 @@ def _stage6_exclusions(config, input_fn):
     return config
 
 
-def _stage7_metadata(config, input_fn):
+def _stage7_metadata(config, input_fn, offline=False):
     _stage(7, "Metadata")
     opencti = config.get("source") == "opencti"
     formats = OPENCTI_SOURCE_FORMATS if opencti else SOURCE_FORMATS
@@ -3173,7 +3173,9 @@ def _stage7_metadata(config, input_fn):
 
     config["do_notice"] = ask_yes_no(
         "Emit the meta.do_notice column?", False, input_fn)
-    if config["do_notice"]:
+    # Offline, the local policy tree says nothing about the manager this
+    # file is going to, so neither message would be true of it.
+    if config["do_notice"] and not offline:
         if notice_policy_loaded():
             print("  detected: policy/frameworks/intel/do_notice.zeek is loaded")
         else:
@@ -3286,7 +3288,7 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
         _stage4_quality(config, input_fn)
         _stage5_scope(config, discovery, input_fn)
     _stage6_exclusions(config, input_fn)
-    _stage7_metadata(config, input_fn)
+    _stage7_metadata(config, input_fn, offline=offline)
     _stage8_output(config, input_fn, offline=offline)
 
     if config.get("feeds") and "{feed}" not in (config.get("source_fmt") or ""):
@@ -3847,7 +3849,7 @@ def apply_to_grid(intel_dir=SO_INTEL_DIR, runtime_dir=SO_INTEL_RUNTIME_DIR,
     return ok, steps
 
 
-def print_transfer_instructions(path, do_notice=False):
+def print_transfer_instructions(path):
     """Both manager-side routes, and the difference between them.
 
     An operator who copies the file into place by hand gets no guardrails and
@@ -4369,7 +4371,9 @@ def cmd_build(args):
     # Profiles written before topology became explicit remain compatible.
     config.setdefault("deployment", "distributed")
     config.setdefault("max_indicators", None)
-    if config.get("do_notice") and not notice_policy_loaded():
+    # Off-box this would report on the build host, which is not where the
+    # file runs; the manager's own --check-env is what answers it.
+    if not offline and config.get("do_notice") and not notice_policy_loaded():
         print("WARNING: policy/frameworks/intel/do_notice.zeek is not loaded; "
               "meta.do_notice will have no effect.")
 
@@ -4378,6 +4382,19 @@ def cmd_build(args):
         config["dry_run"] = True
     if args.yes:
         config["apply"] = config.get("apply", False)
+
+    path = config["output_path"]
+    if offline:
+        # Stage 0 for an offline run: it needs the output path, and that is the
+        # last thing the config settles.  Before the fetch, so a typo'd
+        # directory costs nothing.  Every finding prints, not just the
+        # failures -- "output directory: X" is the operator's only
+        # confirmation of where the file is landing.
+        ok, findings = check_output_target(path, config["do_notice"])
+        for level, message in findings:
+            print(LEVEL_PREFIX.get(level, "  ") + message)
+        if not ok:
+            return 1
 
     client = make_client(config)
 
@@ -4431,16 +4448,6 @@ def cmd_build(args):
     )
     print("\n" + stats.report())
 
-    path = config["output_path"]
-    if offline:
-        # Stage 0 for an offline run, deferred until the path is known.  Every
-        # finding prints, not just the failures: "output directory: X" is the
-        # only confirmation an operator gets of where the file is landing.
-        ok, findings = check_output_target(path, config["do_notice"])
-        for level, message in findings:
-            print(LEVEL_PREFIX.get(level, "  ") + message)
-        if not ok:
-            return 1
     existing_header, existing = read_existing(path)
     wanted_header = header_line(config["do_notice"])
     if existing_header and existing_header != wanted_header:
@@ -4495,9 +4502,12 @@ def cmd_build(args):
         # output directory is the one place check_output_target proved we can
         # write.  Without this the second offline build over the same file
         # dies in os.makedirs.
-        saved = backup_file(path, os.path.join(
-            os.path.dirname(os.path.abspath(path)), "nexus-backups")
-            if offline else os.path.join(NEXUS_HOME, "backups"))
+        if offline:
+            backup_dir = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                      "nexus-backups")
+        else:
+            backup_dir = os.path.join(NEXUS_HOME, "backups")
+        saved = backup_file(path, backup_dir)
         if saved:
             print("\nbacked up to %s" % saved)
     write_atomic(path, lines)
@@ -4506,7 +4516,7 @@ def cmd_build(args):
 
     if offline:
         # Nothing here to apply to; the manager-side steps are the operator's.
-        print_transfer_instructions(path, config["do_notice"])
+        print_transfer_instructions(path)
         return 0
 
     if not config.get("apply"):

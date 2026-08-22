@@ -2631,6 +2631,18 @@ class TestStage7SourceFormats(Quiet):
             "opencti", by_prompt([("meta.source format", "4")], fill=""))
         self.assertEqual(config["source_fmt"], "OpenCTI")
 
+    def test_offline_says_nothing_about_this_host_s_policy_tree(self):
+        # Both the "detected" and the "not detected" line describe the build
+        # host's Zeek policy; offline, the file runs on a manager this host
+        # cannot see, so neither is a true statement about it.
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        nexus._stage7_metadata(
+            config, by_prompt([("meta.do_notice", "y")], fill=""),
+            offline=True)
+        self.assertTrue(config["do_notice"])
+        self.assertNotIn("do_notice.zeek", self.printed)
+
     def test_misp_stage7_is_byte_identical(self):
         config = {"source": "misp", "source_host": "h.local",
                   "scheme": "https", "port": 443}
@@ -4520,8 +4532,10 @@ class TestOfflineBuild(Quiet):
     def build(self, config, argv=None):
         """Run cmd_build with the platform stubbed out; returns the exit code.
 
-        check_env() is deliberately *not* stubbed -- an offline run must not
-        call it at all, and against the poisoned paths it would fail if it did.
+        check_env() is stubbed to fail the test outright: an offline run must
+        not call it at all.  Poisoning the SO_* constants would not catch that
+        on a real manager -- check_env() binds them as argument defaults at
+        import, so a later setattr never reaches it.
         """
         class Client(object):
             host = "misp.local"
@@ -4535,19 +4549,22 @@ class TestOfflineBuild(Quiet):
             self.interview_kwargs = kwargs
             return config
 
-        real = (nexus.make_client, nexus.run_interview, nexus._fetch_records)
+        real = (nexus.make_client, nexus.run_interview, nexus._fetch_records,
+                nexus.check_env)
         self.client_factory = lambda cfg: Client()
         nexus.make_client = self.client_factory
         nexus.run_interview = fake_interview
         nexus._fetch_records = lambda client, cfg: iter(self.records())
+        nexus.check_env = lambda: self.fail(
+            "an offline build must not check this host's environment")
         try:
             args = nexus.resolve_source_args(
                 nexus.build_parser().parse_args(
                     ["--offline"] if argv is None else argv))
             return nexus.cmd_build(args)
         finally:
-            (nexus.make_client, nexus.run_interview,
-             nexus._fetch_records) = real
+            (nexus.make_client, nexus.run_interview, nexus._fetch_records,
+             nexus.check_env) = real
 
     def test_offline_build_writes_without_any_security_onion(self):
         self.assertEqual(self.build(self.config()), 0)
@@ -4579,6 +4596,13 @@ class TestOfflineBuild(Quiet):
         self.assertEqual(self.interview_kwargs["source"], "opencti")
         self.assertEqual(self.interview_kwargs["host"], "cti.local")
         self.assertIs(self.interview_kwargs["connect"], self.client_factory)
+
+    def test_no_do_notice_warning_about_a_policy_tree_on_the_wrong_host(self):
+        # The warning describes the *build* host's Zeek policy, which says
+        # nothing about the manager the file is going to.  Off-box the policy
+        # dirs never exist, so it fired on every --do-notice offline build.
+        self.assertEqual(self.build(self.config(do_notice=True)), 0)
+        self.assertNotIn("do_notice.zeek is not loaded", self.printed)
 
     def test_the_backup_lands_beside_the_output_not_in_opt_nexus(self):
         # The interview defaults "back up first" to yes, so the *second*
