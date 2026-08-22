@@ -120,46 +120,52 @@ Counts come from `pageInfo.globalCount`, which — unlike MISP's bounded probe �
 
 ## 4. Architecture
 
-One file, banner-delimited sections in dependency order:
+One file, banner-delimited sections in dependency order (line numbers omitted
+-- they drift every time a section above them grows; regenerate on demand
+with `grep -n '^# [A-Z]' nexus.py`):
 
 ```
-CONSTANTS   39  SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
-LOGGING    337  RedactingFilter + RedactingFormatter (token scrubbing)
-CLIENT     427  _HttpTransport (shared base), MispClient, OpenctiClient,
-                NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
-                MispAuthError are aliases), flatten_attribute, flatten_indicator,
-                parse_stix_pattern
-FEEDS     1241  feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
-                no feed concept)
-MAPPING   1301  map_attribute — source type -> Zeek type, composite splitting;
-                table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
-NORMALISE 1361  norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
-FILTERS   1609  ExclusionSet — private IPs, own networks/domains, allowlist
-INTEL     1687  build/render/lint/read/merge_additive/backup/write_atomic
-CHECKENV  2080  check_env + notice_policy_loaded — stage 0 on a manager;
-                check_output_target — the off-box counterpart for an offline
-                build, same (ok, findings) shape, no Security Onion question
-GUARDRAILS 2237 check_size/not_empty/delta/load_file/broad, run_guardrails
-INTERVIEW 2408  ask* primitives, discover (MISP) / discover_opencti,
-                build_search_params (MISP) / build_opencti_filters (OpenCTI),
-                _stage1_connection, _stage_feeds, _stage3_iocs shared across
-                sources; _stage4_quality/_stage5_scope have an `_opencti`
-                sibling each and run_interview picks the pair by source;
-                run_interview ties the stages together; resolve_build_target
-                decides offline-vs-manager, asked before check_env() so it
-                also governs whether check_env() runs at all
-PROFILES 3594   save_profile, load_profile (JSON, 0600, profile v2 with a v1
-                reader that migrates the old MISP-only keys forward in memory)
-DIFF     3668   indicator_delta, summarise_delta, unified_intel_diff
-APPLY    3712   seed_load_file, salt_apply, log_errors_since, apply_to_grid,
-                print_transfer_instructions — the two manager-side routes
-                (--import vs. hand-placing the file) for an offline build
-MAIN     3877   argparse (--import's dest is "import_file", since import is a
-                Python keyword), cmd_* dispatch (client factory picks Misp/
-                OpenctiClient from config["source"]), ensure_intel_env — the
-                check_env()-plus-seed shared by cmd_build and cmd_import,
-                cmd_build orchestration, cmd_import (merge into a manager's
-                live intel.dat, append-only)
+CONSTANTS   SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
+LOGGING     RedactingFilter + RedactingFormatter (token scrubbing)
+CLIENT      _HttpTransport (shared base), MispClient, OpenctiClient,
+            NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
+            MispAuthError are aliases), flatten_attribute, flatten_indicator,
+            parse_stix_pattern
+FEEDS       feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
+            no feed concept)
+MAPPING     map_attribute — source type -> Zeek type, composite splitting;
+            table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
+NORMALISE   norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
+FILTERS     ExclusionSet — private IPs, own networks/domains, allowlist
+INTEL       build/render/lint/read/merge_additive/backup/write_atomic
+CHECKENV    check_env + notice_policy_loaded — stage 0 on a manager;
+            check_output_target — the off-box counterpart for an offline
+            build, same (ok, findings) shape, no Security Onion question
+GUARDRAILS  check_size/not_empty/delta/load_file/broad, run_guardrails
+INTERVIEW   ask* primitives, discover (MISP) / discover_opencti,
+            build_search_params (MISP) / build_opencti_filters (OpenCTI),
+            _stage1_connection, _stage_feeds, _stage3_iocs shared across
+            sources; _stage4_quality/_stage5_scope have an `_opencti`
+            sibling each and run_interview picks the pair by source;
+            run_interview ties the stages together; resolve_build_target
+            decides offline-vs-manager, asked before check_env() so it
+            also governs whether check_env() runs at all
+PROFILES    save_profile, load_profile (JSON, 0600, profile v2 with a v1
+            reader that migrates the old MISP-only keys forward in memory)
+DIFF        indicator_delta, summarise_delta, unified_intel_diff
+APPLY       seed_load_file, salt_apply, log_errors_since, apply_to_grid,
+            print_transfer_instructions — the two manager-side routes
+            (--import vs. hand-placing the file) for an offline build
+MAIN        argparse (--import's dest is "import_file", since import is a
+            Python keyword), cmd_* dispatch (client factory picks Misp/
+            OpenctiClient from config["source"]), ensure_intel_env — the
+            check_env()-plus-seed shared by cmd_build and cmd_import,
+            _report_guardrails/_report_lint/_report_dry_run — the
+            print-and-block ceremonies extracted out of cmd_build and
+            cmd_import once they'd copy-pasted them (the lint message had
+            already drifted between the two, "rendered" vs "merged" file),
+            cmd_build orchestration, cmd_import (merge into a manager's
+            live intel.dat, append-only)
 ```
 
 The `CLIENT` section holds both clients and both flatteners; its banner was renamed from `# MISP CLIENT` when `OpenctiClient` landed.
