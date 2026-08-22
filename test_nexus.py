@@ -3855,6 +3855,42 @@ class TestTransportRefactor(unittest.TestCase):
         self.assertEqual(client.base_url, "http://10.0.0.1:8080")
 
 
+class TestTransportHooks(unittest.TestCase):
+    """TAXII needs a version-specific Accept header and a second secret --
+    both are shared transport hooks so later sources don't monkey-patch."""
+
+    def test_accept_defaults_to_json(self):
+        self.assertEqual(nexus._HttpTransport.ACCEPT, "application/json")
+
+    def test_a_subclass_can_override_accept(self):
+        class Probe(nexus._HttpTransport):
+            ACCEPT = "application/taxii+json;version=2.1"
+
+            def _auth_headers(self):
+                return {}
+        client = Probe(host="example.test", token="t")
+        self.assertEqual(client.ACCEPT, "application/taxii+json;version=2.1")
+
+    def test_add_secret_registers_with_the_redactor(self):
+        class Probe(nexus._HttpTransport):
+            def _auth_headers(self):
+                return {}
+        client = Probe(host="example.test", token="first")
+        client.add_secret("second-secret")
+        record = logging.LogRecord("n", logging.INFO, "p", 1,
+                                   "saw second-secret here", None, None)
+        nexus.REDACTOR.filter(record)
+        self.assertNotIn("second-secret", record.getMessage())
+
+    def test_add_secret_tolerates_empty(self):
+        class Probe(nexus._HttpTransport):
+            def _auth_headers(self):
+                return {}
+        client = Probe(host="example.test", token="t")
+        client.add_secret(None)      # must not raise
+        client.add_secret("")
+
+
 class TestOpenctiMapping(unittest.TestCase):
 
     def rec(self, value_type, value):

@@ -478,6 +478,11 @@ class _HttpTransport(object):
 
     RETRY_STATUS = frozenset((429, 500, 502, 503, 504))
 
+    # TAXII negotiates a version-specific media type; everything else is
+    # plain JSON.  A class attribute rather than a constructor argument
+    # because it is a property of the protocol, not of the connection.
+    ACCEPT = "application/json"
+
     def __init__(self, host, token, scheme="https", port=None, verify_tls=True,
                  proxy=None, timeout=30, retries=3):
         self.host = host
@@ -515,12 +520,21 @@ class _HttpTransport(object):
     def _auth_headers(self):
         raise NotImplementedError("a transport subclass must supply its auth header")
 
+    def add_secret(self, value):
+        """Register a further secret with the redactor.
+
+        Basic auth carries two -- a username and a password -- where every
+        other source Nexus speaks to carries one.
+        """
+        if value:
+            REDACTOR.add_secret(value)
+
     def _request(self, method, path, body=None):
         """Return (parsed_json, headers).  Retries on transient failures."""
         url = urllib.parse.urljoin(self.base_url, path)
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {
-            "Accept": "application/json",
+            "Accept": self.ACCEPT,
             "Content-Type": "application/json",
             "User-Agent": "nexus/%s" % __version__,
         }
