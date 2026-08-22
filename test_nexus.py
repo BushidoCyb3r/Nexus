@@ -969,6 +969,7 @@ class FakeOpenctiHandler(BaseHTTPRequestHandler):
         self.server.requests.append({
             "path": self.path,
             "auth": self.headers.get("Authorization"),
+            "accept": self.headers.get("Accept"),
             "body": json.loads(raw.decode("utf-8")) if raw else {},
         })
         if self.server.script:
@@ -3870,6 +3871,40 @@ class TestTransportHooks(unittest.TestCase):
                 return {}
         client = Probe(host="example.test", token="t")
         self.assertEqual(client.ACCEPT, "application/taxii+json;version=2.1")
+
+    def test_overridden_accept_header_reaches_the_server(self):
+        # The class-attribute check above proves inheritance, not wiring --
+        # this drives a real request through _request and inspects what the
+        # server actually received.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            class Probe(nexus._HttpTransport):
+                ACCEPT = "application/taxii+json;version=2.1"
+
+                def _auth_headers(self):
+                    return {}
+            client = Probe(host="127.0.0.1", token="t", scheme="http",
+                          port=fake.port, retries=1)
+            client._request("POST", "/")
+            self.assertEqual(fake.requests[0]["accept"],
+                             "application/taxii+json;version=2.1")
+        finally:
+            fake.stop()
+
+    def test_default_accept_header_is_still_json_on_the_wire(self):
+        # The mirror of the above: an unmodified client -- MISP, OpenCTI --
+        # must still send application/json over the wire.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            class Probe(nexus._HttpTransport):
+                def _auth_headers(self):
+                    return {}
+            client = Probe(host="127.0.0.1", token="t", scheme="http",
+                          port=fake.port, retries=1)
+            client._request("POST", "/")
+            self.assertEqual(fake.requests[0]["accept"], "application/json")
+        finally:
+            fake.stop()
 
     def test_add_secret_registers_with_the_redactor(self):
         class Probe(nexus._HttpTransport):
