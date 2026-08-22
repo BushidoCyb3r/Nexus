@@ -4938,6 +4938,29 @@ class TestBuildAppendOnlyGuards(Quiet):
         with io.open(self.out, encoding="utf-8") as handle:
             return handle.read()
 
+    def test_a_header_mismatch_blocks_and_writes_nothing(self):
+        # A do_notice file under a no-notice run: append-only mode will not
+        # rewrite the existing rows into the other schema, so it stops.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(True),
+            "a.example\tIntel::DOMAIN\tMISP\td\t-\tT"])
+        before = self._raw()
+        self.assertEqual(self.build(self.config(do_notice=False)), 1)
+        self.assertIn("schema differs", self.printed)
+        self.assertEqual(self._raw(), before)
+
+    def test_a_computed_removal_blocks_and_writes_nothing(self):
+        # The invariant, forced.  merge_additive cannot drop a row, so this
+        # stubs it to prove the check downstream is real and not decorative.
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "a.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+        nexus.merge_additive = lambda existing, new: list(new)
+        self.assertEqual(self.build(self.config()), 1)
+        self.assertIn("removed indicators", self.printed)
+        self.assertEqual(self._raw(), before)
+
     def test_an_unreadable_existing_file_is_an_error_not_a_traceback(self):
         with open(self.out, "wb") as handle:
             handle.write(b"\xff\xfe not utf-8 at all\n")
