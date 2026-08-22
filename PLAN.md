@@ -6,7 +6,7 @@
 
 ```
 nexus.py        the tool          python3 nexus.py
-test_nexus.py   525 tests         python3 -m unittest test_nexus
+test_nexus.py   537 tests         python3 -m unittest test_nexus
 ```
 
 **New assistant picking this up: read `HANDOFF.md` first.**
@@ -416,7 +416,7 @@ Per Intel type, before an indicator enters the file:
 6. Exactly one `\n` after the last record, no trailing blank line.
 7. Confirm `__load__.Zeek` is still present alongside it.
 
-**Merge mode**: append-only. `cmd_build` calls `merge_additive()`, which keeps *every* existing line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
+**Merge mode**: append-only. `cmd_build` and `cmd_import` both call `merge_additive()`, which keeps every existing *indicator* line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Operator `#` comment lines are the one thing this does not cover: `read_existing()` filters them out, so they do not survive a merge on either path — see the "Append-only does not currently cover operator comment lines" entry in `HANDOFF.md` §6. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
 
 **Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count. Under `--offline`, `/opt/nexus` does not exist on that host and is not writable, so the backup instead goes to `nexus-backups/intel.dat.<ISO8601>` beside the output path, same retention count.
 
@@ -517,8 +517,8 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 | 5 ✅ | Local exclusions + all §8 guardrails | a test per refusal path |
 | 6 ✅ | Apply — `__load__.Zeek` seeding, salt apply, reporter check | lab grid: apply → hit in `intel.log` |
 | 7 | systemd timer, install steps, operator README | fresh-manager install works |
-| 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (525 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
-| 9 ✅ | Offline build (`--offline`) — build a transfer-ready `intel.dat` on a host with no Security Onion installed, plus `--import PATH` to merge one back into a manager's live file, append-only | offline test suite (525 tests, includes a poison-path assertion that an offline build never touches the real `SO_*` paths, and a byte-identity assertion that import never rewrites an existing row) |
+| 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (537 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
+| 9 ✅ | Offline build (`--offline`) — build a transfer-ready `intel.dat` on a host with no Security Onion installed, plus `--import PATH` to merge one back into a manager's live file, append-only | offline test suite (537 tests, includes a poison-path assertion that an offline build never touches the real `SO_*` paths, and a byte-identity assertion that import never rewrites an existing row) |
 
 Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phases 8 and 9 were both taken out of numeric order — they landed after phase 6 while phase 7 (systemd timer, install docs) was still outstanding, since both are source-neutral/deployment-neutral to what phase 7 covers.
 

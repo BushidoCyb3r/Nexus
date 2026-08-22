@@ -3,7 +3,7 @@
 Written for a fresh assistant with no prior context. Read this, then `PLAN.md` for the full design.
 
 **Last updated:** 2026-08-22
-**State:** phases 0–6, 8 and 9 complete, phase 7 remaining. 525 offline tests passing.
+**State:** phases 0–6, 8 and 9 complete, phase 7 remaining. 537 offline tests passing.
 **Never yet run against a real MISP, a real OpenCTI, or a real Security Onion box.** Everything below was verified against fakes.
 
 ---
@@ -17,8 +17,8 @@ Not a library. Not a package. **One script**, standard library only, so it drops
 ### Files
 
 ```
-nexus.py        4746 lines   the tool
-test_nexus.py   5122 lines   525 tests, no MISP, OpenCTI or SO required
+nexus.py        4781 lines   the tool
+test_nexus.py   5302 lines   537 tests, no MISP, OpenCTI or SO required
 PLAN.md          555 lines   full design doc, section numbers referenced below
 HANDOFF.md       ~350 lines   this file (self-referential count omitted -- drifts every time this file is edited)
 ```
@@ -30,7 +30,7 @@ A git repository, currently on branch `offline-build`. There is no CI — `pytho
 ## 2. Run it
 
 ```bash
-python3 -m unittest test_nexus        # 525 tests, ~20s, needs nothing external
+python3 -m unittest test_nexus        # 537 tests, ~20s, needs nothing external
 python3 nexus.py --help
 
 python3 nexus.py                      # default: full interview -> writes intel.dat
@@ -168,7 +168,7 @@ The `CLIENT` section holds both clients and both flatteners; its banner was rena
 
 - **Stdlib only.** No pip, no venv, no new dependencies. Ever.
 - **Python 3.6+ syntax.** No f-strings, no type hints, no dataclasses, no walrus. `%`-formatting throughout. The manager's Python version is unconfirmed, so the floor stays low.
-- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 449 tests runnable with nothing installed. Do not put I/O in them.
+- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 537 tests runnable with nothing installed. Do not put I/O in them.
 - **Every prompt takes `input_fn`** (and `getpass_fn` for the token), defaulting to the real thing. No test may block on a TTY.
 - **Only `write_atomic` writes the intel file.** Same-directory temp, fsync, `os.replace`.
 - **Updates are append-only by indicator key.** Every existing `(indicator,
@@ -311,7 +311,7 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 > **Status: live validation deferred.** As of 2026-08-21 the operator has no OpenCTI
 > instance available to test against, and has deliberately postponed this. The OpenCTI
-> code path is complete, unit-tested (449 tests, all sources) and reviewed, but **no part
+> code path is complete, unit-tested (537 tests, all sources) and reviewed, but **no part
 > of it has ever exchanged a packet with a real OpenCTI server.** Treat it as untested in
 > production until the checklist below has been run. This is a known, accepted gap — not
 > an oversight to re-flag.
