@@ -3,34 +3,34 @@
 Written for a fresh assistant with no prior context. Read this, then `PLAN.md` for the full design.
 
 **Last updated:** 2026-08-22
-**State:** phases 0–6, 8 and 9 complete, phase 7 remaining. 537 offline tests passing.
-**Never yet run against a real MISP, a real OpenCTI, or a real Security Onion box.** Everything below was verified against fakes.
+**State:** phases 0–6 and 8–10 complete, phase 7 remaining. 650 offline tests passing.
+**Never yet run against a real MISP, a real OpenCTI, a real TAXII server, or a real Security Onion box.** Everything below was verified against fakes (or, for TAXII, against the specification documents and a fake server -- see §7).
 
 ---
 
 ## 1. What this is
 
-`nexus.py` is an interactive CLI for a **Security Onion 3.x manager**. It asks which platform to pull from — **MISP or OpenCTI, one source per run** — plus that platform's address and API token, interrogates it for what's actually in it (MISP: attribute types, tags, orgs, feeds; OpenCTI: labels, marking definitions, organisations), walks the operator through a staged interview, pulls matching IOCs from the platform's API, maps them to Zeek Intel framework types, diffs them against the existing `intel.dat`, and appends only genuinely new indicators. It can then apply the result to either a standalone node or a distributed sensor grid via salt and verify Zeek accepted it.
+`nexus.py` is an interactive CLI for a **Security Onion 3.x manager**. It asks which platform to pull from — **MISP, OpenCTI or TAXII, one source per run** — plus that platform's address and credentials, interrogates it for what's actually in it (MISP: attribute types, tags, orgs, feeds; OpenCTI: labels, marking definitions, organisations; TAXII: collections, discovered per API root), walks the operator through a staged interview, pulls matching IOCs from the platform's API, maps them to Zeek Intel framework types, diffs them against the existing `intel.dat`, and appends only genuinely new indicators. It can then apply the result to either a standalone node or a distributed sensor grid via salt and verify Zeek accepted it.
 
 Not a library. Not a package. **One script**, standard library only, so it drops onto an air-gapped manager with no pip install.
 
 ### Files
 
 ```
-nexus.py        4781 lines   the tool
-test_nexus.py   5302 lines   537 tests, no MISP, OpenCTI or SO required
-PLAN.md          555 lines   full design doc, section numbers referenced below
-HANDOFF.md       ~350 lines   this file (self-referential count omitted -- drifts every time this file is edited)
+nexus.py        5532 lines   the tool
+test_nexus.py   6850 lines   650 tests, no MISP, OpenCTI, TAXII or SO required
+PLAN.md          ~580 lines  full design doc, section numbers referenced below
+HANDOFF.md       ~400 lines  this file (self-referential count omitted -- drifts every time this file is edited)
 ```
 
-A git repository, currently on branch `offline-build`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
+A git repository, currently on branch `taxii-source`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
 
 ---
 
 ## 2. Run it
 
 ```bash
-python3 -m unittest test_nexus        # 537 tests, ~20s, needs nothing external
+python3 -m unittest test_nexus        # 650 tests, ~40s, needs nothing external
 python3 nexus.py --help
 
 python3 nexus.py                      # default: full interview -> writes intel.dat
@@ -38,6 +38,7 @@ python3 nexus.py --check-env          # verify SO paths, __load__.Zeek, do_notic
 python3 nexus.py --seed               # copy SO default intel files into the local dir
 python3 nexus.py --probe --source misp --host HOST      # MISP: per-type IOC counts, write nothing
 python3 nexus.py --probe --source opencti --host HOST   # OpenCTI: per-type IOC counts, write nothing
+python3 nexus.py --probe --source taxii --host HOST     # TAXII: per-collection object counts (pre-filter), write nothing
 python3 nexus.py --lint PATH          # validate an intel.dat
 python3 nexus.py --apply              # push existing intel.dat to the grid
 python3 nexus.py --explain --profile daily          # show the resolved platform query
@@ -48,7 +49,7 @@ python3 nexus.py --import /media/usb/intel.dat      # merge a transferred file i
 python3 nexus.py --import /media/usb/intel.dat --yes  # merge unattended; also applies to the grid
 ```
 
-`--source {misp,opencti}` picks the platform; if omitted, the interview asks (stage 1). `--host` is the source-neutral form of the old `--misp` flag, which still works as a **deprecated alias for `--host --source misp`** — existing MISP-only invocations and profiles keep working unchanged.
+`--source {misp,opencti,taxii}` picks the platform; if omitted, the interview asks (stage 1). `--host` is the source-neutral form of the old `--misp` flag, which still works as a **deprecated alias for `--host --source misp`** — existing MISP-only invocations and profiles keep working unchanged.
 
 `--probe` is the cheapest way to test credentials — it needs a token but skips the interview.
 
@@ -116,6 +117,27 @@ Filters use OpenCTI **6.x `FilterGroup` syntax only** — nested `{mode, filters
 
 Counts come from `pageInfo.globalCount`, which — unlike MISP's bounded probe — is an exact total when present. `count_type` falls back to `len(nodes)` from a `first: 1` probe when `globalCount` is absent, and that fallback is still exact (a closed page at `first: 1` has already seen the whole result), which the code documents since it's easy to mistake for a lower bound.
 
+### TAXII API
+
+Everything below is sourced from the TAXII 2.0/2.1 specification documents, not from a live server — nothing in this project has ever exchanged a packet with a real TAXII implementation. See §7 for the full unverified list and first-contact checklist.
+
+`TaxiiClient(host, token, ..., version="2.1", username=None)`. `username` set means Basic (`Authorization: Basic base64(username:token)`); `username` absent means Bearer (`Authorization: Bearer <token>`). **Both** the username and the token/password are secrets — Basic is TAXII's only source needing two, and both are in `PROFILE_EXCLUDED_KEYS` and registered with the redactor.
+
+`detect_version()` probes `/taxii2/` (2.1) then `/taxii/` (2.0) and returns whichever answers first; the result becomes the interview's **default** answer, it does not skip the question — the standing no-implicit-default rule applies here too. An auth error during detection propagates as `SourceAuthError` rather than being read as "wrong version, try the other discovery path."
+
+Errors use ordinary HTTP status codes — 401/403 map directly to `TaxiiAuthError`/`TaxiiError`, unlike OpenCTI's GraphQL, which answers 200 even on a rejected token.
+
+Pagination is completely different between versions, and `fetch_objects(collection, added_after=None, max_results=None, page_size=100)` dispatches accordingly:
+
+- **2.1**: an envelope response (`objects`, `more`, `next`), `limit` as a query parameter, cursor-paginated like OpenCTI. A cursor that repeats or goes missing stops the walk with a warning, the same single-cursor guard `OpenctiClient.search_indicators` already carries.
+- **2.0**: a STIX bundle response, paged via the `Range` request header / `Content-Range` response header — **there is no `limit` query parameter on this path**; page size only reaches the server through the width of the `Range` window. `_fetch_objects_20` carries six termination guards, not the four originally planned: `Content-Range` absent, a `*` (unknown) total, the last index reaching the total, an empty page, the window failing to advance, and a **pinned first-page total** — a server whose reported total keeps outrunning `last` (items 0-0/2, then 1-1/3, then 2-2/4) would otherwise satisfy every other guard forever. The next window resumes from the server's reported `last + 1`, not from `start + page_size`.
+
+TAXII defines exactly two server-side filters, both always sent: `match[type]=indicator` and `added_after` (computed per run from the interview's days-back answer — see the honesty item in §6). Everything else the interview asks about — labels, markings, confidence, `valid_until`, `created_by_ref` — is applied client-side, after download, by `taxii_object_allowed()`.
+
+`flatten_taxii_object(obj, collection_title=None, stats=None)` is 1:N like `flatten_indicator`, not 1:1 like `flatten_attribute`. Only `type == "indicator"` objects are read; malware, campaigns, relationships and bare observables are context, not verdicts, and are skipped. It unions `labels` and `indicator_types` — STIX 2.1 moved the indicator open-vocabulary to `indicator_types` and made `labels` optional, so reading only `labels` would silently exclude everything on a 2.1 feed that only populates the newer field. **STIX 2.0 has no `confidence` property at all** (added in 2.1); an absent value is carried through as `None`, never coerced to `0` — a real (low) confidence in 2.1 is a legitimate `0`, and treating "absent" the same way would let a minimum-confidence filter silently drop every object from a 2.0 feed. `taxii_object_allowed()` only compares confidence when both the filter's minimum and the record's value are not `None`.
+
+`render_meta` takes a `{collection}` placeholder; `TAXII_SOURCE_FORMATS` makes `TAXII-{collection}` the stage-7 default `meta.source` for a TAXII run, mirroring `MISP-feed-<slug>`.
+
 ---
 
 ## 4. Architecture
@@ -125,28 +147,47 @@ One file, banner-delimited sections in dependency order (line numbers omitted
 with `grep -n '^# [A-Z]' nexus.py`):
 
 ```
-CONSTANTS   SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping, thresholds
+CONSTANTS   SO paths, ZEEK_TYPES, MISP_TO_ZEEK / OPENCTI_TO_ZEEK mapping,
+            TAXII_VERSIONS / TAXII_DISCOVERY / TAXII_ACCEPT, thresholds
 LOGGING     RedactingFilter + RedactingFormatter (token scrubbing)
-CLIENT      _HttpTransport (shared base), MispClient, OpenctiClient,
-            NoCrossHostRedirect, SourceError/SourceAuthError (MispError/
-            MispAuthError are aliases), flatten_attribute, flatten_indicator,
+CLIENT      _HttpTransport (shared base; _request takes extra_headers=None,
+            used by TAXII 2.0's Range pagination), MispClient, OpenctiClient,
+            TaxiiClient (2.0/2.1, Basic or Bearer), NoCrossHostRedirect,
+            SourceError/SourceAuthError (MispError/MispAuthError are
+            aliases; TaxiiError/TaxiiAuthError are TAXII's own subclasses),
+            flatten_attribute, flatten_indicator, flatten_taxii_object,
             parse_stix_pattern
-FEEDS       feed_provenance, apply_feed_to_params  (MISP only — OpenCTI has
-            no feed concept)
+FEEDS       feed_provenance, apply_feed_to_params  (MISP only — OpenCTI and
+            TAXII have no feed concept)
 MAPPING     map_attribute — source type -> Zeek type, composite splitting;
-            table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK
+            table-driven over MISP_TO_ZEEK or OPENCTI_TO_ZEEK (TAXII reuses
+            OPENCTI_TO_ZEEK — parse_stix_pattern already emits its keys)
 NORMALISE   norm_addr/subnet/domain/url/hash/email/..., sanitize_meta
-FILTERS     ExclusionSet — private IPs, own networks/domains, allowlist
-INTEL       build/render/lint/read/merge_additive/backup/write_atomic
+FILTERS     ExclusionSet — private IPs, own networks/domains, allowlist;
+            taxii_object_allowed — the six client-side filters for what
+            TAXII's query syntax cannot express (include/exclude labels,
+            markings, authors, min confidence, valid_until)
+INTEL       build/render/lint/read/merge_additive/backup/write_atomic;
+            render_meta's source_fmt template also takes {collection} for
+            TAXII (TAXII_SOURCE_FORMATS defaults meta.source to
+            TAXII-{collection})
 CHECKENV    check_env + notice_policy_loaded — stage 0 on a manager;
             check_output_target — the off-box counterpart for an offline
             build, same (ok, findings) shape, no Security Onion question
 GUARDRAILS  check_size/not_empty/delta/load_file/broad, run_guardrails
-INTERVIEW   ask* primitives, discover (MISP) / discover_opencti,
-            build_search_params (MISP) / build_opencti_filters (OpenCTI),
-            _stage1_connection, _stage_feeds, _stage3_iocs shared across
-            sources; _stage4_quality/_stage5_scope have an `_opencti`
-            sibling each and run_interview picks the pair by source;
+INTERVIEW   ask* primitives, discover (MISP) / discover_opencti /
+            discover_taxii, build_search_params (MISP) /
+            build_opencti_filters (OpenCTI), _stage1_connection (branches
+            on source for TAXII's version-detection and Basic/Bearer
+            questions), _stage_feeds, _stage3_iocs shared across MISP and
+            OpenCTI; _stage3_collections_taxii stands in for it on TAXII
+            (collection choice, not a type menu — match[type]=indicator
+            already narrows every collection); _stage4_quality/_stage5_scope
+            have an `_opencti` sibling each, _stage5_scope_taxii stands in
+            for both on TAXII (the one server-side time filter plus the six
+            client-side-and-said-so-in-the-prompt filters), and
+            run_interview picks by source; taxii_added_after turns the
+            days-back answer into the added_after query param;
             run_interview ties the stages together; resolve_build_target
             decides offline-vs-manager, asked before check_env() so it
             also governs whether check_env() runs at all
@@ -157,8 +198,11 @@ APPLY       seed_load_file, salt_apply, log_errors_since, apply_to_grid,
             print_transfer_instructions — the two manager-side routes
             (--import vs. hand-placing the file) for an offline build
 MAIN        argparse (--import's dest is "import_file", since import is a
-            Python keyword), cmd_* dispatch (client factory picks Misp/
-            OpenctiClient from config["source"]), ensure_intel_env — the
+            Python keyword; --source now accepts "taxii"), cmd_* dispatch
+            (client factory picks Misp/Opencti/TaxiiClient from
+            config["source"]), cmd_probe branches per source
+            (_cmd_probe_misp/_opencti/_taxii — TAXII's reports per-collection
+            object counts, explicitly pre-filter), ensure_intel_env — the
             check_env()-plus-seed shared by cmd_build and cmd_import,
             _report_guardrails/_report_lint/_report_dry_run — the
             print-and-block ceremonies extracted out of cmd_build and
@@ -168,13 +212,13 @@ MAIN        argparse (--import's dest is "import_file", since import is a
             live intel.dat, append-only)
 ```
 
-The `CLIENT` section holds both clients and both flatteners; its banner was renamed from `# MISP CLIENT` when `OpenctiClient` landed.
+The `CLIENT` section holds all three clients and all three flatteners; its banner was renamed from `# MISP CLIENT` when `OpenctiClient` landed, and stayed `CLIENT` when `TaxiiClient` did.
 
 ### Rules the code holds to — preserve these
 
 - **Stdlib only.** No pip, no venv, no new dependencies. Ever.
 - **Python 3.6+ syntax.** No f-strings, no type hints, no dataclasses, no walrus. `%`-formatting throughout. The manager's Python version is unconfirmed, so the floor stays low.
-- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 537 tests runnable with nothing installed. Do not put I/O in them.
+- **Purity where it matters.** `mapping`, `normalise`, `filters`, `intel`, `guardrails`, `diff`, `build_search_params`, `build_opencti_filters` touch no network and no filesystem. That is what makes 650 tests runnable with nothing installed. Do not put I/O in them.
 - **Every prompt takes `input_fn`** (and `getpass_fn` for the token), defaulting to the real thing. No test may block on a TTY.
 - **Only `write_atomic` writes the intel file.** Same-directory temp, fsync, `os.replace`.
 - **Updates are append-only by indicator key.** Every existing `(indicator,
@@ -289,6 +333,9 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 - **Non-STIX pattern types are never mined for values.** `parse_stix_pattern` only runs for `pattern_type == "stix"`; a YARA or Sigma rule's string literals are not treated as indicators.
 - **The interview's hostname question is type-name-sensitive per source.** It drops the literal `"Hostname"` on OpenCTI but `"hostname"` on MISP — the two platforms spell the type differently. Before this was fixed, an OpenCTI operator answering "no" to "treat hostnames as domains" still got hostname indicators, silently, because the MISP-only literal never matched.
 - **`meta.url` is source-aware.** OpenCTI indicators link to `{base}/dashboard/observations/indicators/{id}`; the MISP event URL shape (`{base}/events/view/{id}`) is unchanged. `render_meta` branches on the record's source rather than assuming one URL template — though the stage 7 *question wording* ("Link meta.url back to the MISP event?") and the `meta.source` presets (`SOURCE_FORMATS`, defaulting to `MISP-event-{event_id}`) are still MISP-labelled on an OpenCTI run, a known cosmetic gap recorded at `PLAN.md` §4 item 31.
+- **TAXII filters most scoping AFTER download, not on the server.** TAXII's query syntax reaches exactly two things: `match[type]=indicator` and `added_after`. Nexus pushes fifteen filter parameters into a MISP `restSearch` body or an OpenCTI `FilterGroup`; against TAXII, `include_labels`, `exclude_labels`, `include_markings`, `include_authors`, `min_confidence` and `drop_expired` are all applied client-side in `taxii_object_allowed()`, after every object in the time window has already been downloaded. An operator used to MISP will expect `include_labels` to reduce transfer volume the way `tags.OR` does. **It does not.** Stage 5 says so in its own prompt text ("applied after download") so an interactive operator sees it live; this entry is the same fact for whoever is reading code instead of prompts.
+- **`--probe`'s TAXII counts are pre-filter.** The server cannot count a filtered subset — TAXII has no query for labels, markings, confidence, validity or author — so a probe number means "objects in this collection" (bounded by `--probe-limit`, default 5000, marked with a trailing `+` when the cap was hit), not "indicators you will actually get" once stage 5's client-side filters run. `_cmd_probe_taxii` prints this caveat directly under its table.
+- **STIX 2.0 has no `confidence` property at all.** It arrived in STIX 2.1. `flatten_taxii_object` carries an absent confidence through as `obj.get("confidence")` — `None`, never coerced to `0` — because `0` is a real, valid (low) confidence value in 2.1, and treating "absent" the same way would let a minimum-confidence filter silently drop every object from a 2.0 feed. `taxii_object_allowed()` only compares confidence when both the configured minimum and the record's value are not `None`, and stage 5 warns explicitly in its own text when the detected TAXII version is 2.0.
 
 ---
 
@@ -317,7 +364,7 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 > **Status: live validation deferred.** As of 2026-08-21 the operator has no OpenCTI
 > instance available to test against, and has deliberately postponed this. The OpenCTI
-> code path is complete, unit-tested (537 tests, all sources) and reviewed, but **no part
+> code path is complete, unit-tested (650 tests, all sources) and reviewed, but **no part
 > of it has ever exchanged a packet with a real OpenCTI server.** Treat it as untested in
 > production until the checklist below has been run. This is a known, accepted gap — not
 > an oversight to re-flag.
@@ -358,9 +405,79 @@ writes an `intel.dat`. Nothing here needs a Security Onion box.
 Record what each step actually returned. Several items above become moot the moment real
 responses are observed, and the list should shrink rather than be carried forward intact.
 
+### Flagged as unverified, TAXII
+
+> **Status: never run against a real server.** Every protocol claim below comes from the
+> TAXII 2.0 and 2.1 specification documents, not from a server this project has exchanged
+> a packet with. The TAXII code path is complete, unit-tested (650 tests, all three
+> sources) and reviewed against a fake server implementing both protocol versions, but
+> **no part of it has ever talked to a real TAXII implementation.** Treat it as untested
+> in production until the checklist below has been run. This is a known, accepted gap —
+> not an oversight to re-flag.
+
+Six items come from the design spec's own §12; two more surfaced during implementation and are not
+in the spec. None block what has already shipped, and each is a contained fix.
+
+1. **The `/taxii2/` then `/taxii/` probe order**, and whether servers reliably answer the
+   version they actually implement.
+2. **TAXII 2.0's `Range`/`Content-Range` pagination** — materially different from 2.1's
+   `more`/`next`, and the most likely place the client is wrong. Six termination guards
+   protect it (§3), all unverified against a real response.
+3. **Whether real servers honour `match[type]=indicator`**, or return every object type
+   and expect the client to filter.
+4. **Whether `added_after` is inclusive or exclusive at the boundary.**
+5. **The 2.0 confidence gap** — that absent `confidence` is genuinely absent on the wire,
+   rather than defaulted by some server to a value Nexus would need to treat differently.
+6. **Basic auth in practice**, including whether servers challenge with `WWW-Authenticate`
+   before accepting a pre-emptive `Authorization: Basic` header.
+7. **Found during implementation, not in the spec:** the 2.0 path's next window resumes
+   from the server's reported `last + 1`, not from `start + page_size`. If a server's
+   `Content-Range` disagrees with what it actually sent, the next request's window could
+   be wrong in a way the fake server cannot expose.
+8. **Found during implementation, not in the spec:** `page_size` only reaches a TAXII 2.0
+   server through the width of the `Range` header's window — there is no `limit` query
+   parameter on that path (2.1's `fetch_objects` does send one). A server that ignores
+   `Range` gets no page-size hint at all, and how such a server behaves is unknown.
+
+#### First-contact checklist — run this when a TAXII server becomes available
+
+1. `python3 nexus.py --probe --source taxii --host <HOST>` — proves reachability, version
+   detection, and whichever auth scheme was configured. Try a bad token or password once
+   to confirm it reports an authentication failure (401/403) rather than an empty
+   collection list succeeding quietly.
+2. Confirm the collections list is non-empty and the printed object counts look plausible.
+   Zero everywhere with a successful connection points at item 3 above (`match[type]` not
+   honoured) or an API-root permission problem that discovery is silently swallowing.
+3. Run a full interview through to a `--dry-run` build. Confirm the TAXII-version
+   question's *default* matches what step 1 detected — the default should be right even
+   though the question is still asked.
+4. If the server turns out to speak TAXII 2.0, confirm stage 5's "no confidence property"
+   warning appears, and that answering a minimum-confidence question does not drop
+   everything (item 5).
+5. Inspect the dry-run's unmapped/skipped counters in the run report. A large "pattern
+   unparseable" count means real-world STIX patterns differ from what `parse_stix_pattern`
+   handles; capture a few offending patterns verbatim before changing anything.
+6. Let a pull run past one page, on a 2.0 collection and a 2.1 collection if both are
+   reachable, to exercise items 2, 7 and 8 for real rather than only against the fake
+   server.
+7. Only then do a real build, against a scratch output path first (`--offline` with an
+   explicit output path), and diff it by hand before it goes near a manager.
+
+**Accepted risk: an uncooperative TAXII 2.1 server could pull forever.** If a server
+issues a fresh cursor on every page and never sets `more: false`, `fetch_objects`'s
+single-cursor-repeat guard never fires, and the pull continues until `max_indicators`
+stops it — unbounded by default. TAXII 2.1 carries no `total` to pin the way the 2.0 path
+pins `first_total` (§3), and `more: false` is the protocol's own termination signal, so
+the only additional honest protection would be a page cap. It was deliberately not added:
+this project has already removed dead parameters for being unused, and the `max_pages`
+argument that exists on both `search_attributes` and `search_indicators` is exercised only
+by tests today, never by a real caller. If an operator hits this in practice,
+`max_indicators` is the immediate mitigation; a real page cap is the fix, added then
+rather than speculatively now.
+
 ### Explicitly out of scope (`PLAN.md` §14)
 
-Indicator aging/expiry, multiple MISP instances, Suricata rule generation, an Elastic feedback loop to prune indicators that never fire, event-level pull for richer descriptions, PyMISP as an optional backend. Specific to OpenCTI: dual-source runs, OpenCTI observables as a source, 5.x filter syntax, writing anything back to OpenCTI, connectors/streams/live-stream API, relationship traversal for richer descriptions.
+Indicator aging/expiry, multiple MISP instances, Suricata rule generation, an Elastic feedback loop to prune indicators that never fire, event-level pull for richer descriptions, PyMISP as an optional backend. Specific to OpenCTI: dual-source runs, OpenCTI observables as a source, 5.x filter syntax, writing anything back to OpenCTI, connectors/streams/live-stream API, relationship traversal for richer descriptions. Specific to TAXII: TAXII 1.x (a different protocol, not a version of this one), non-indicator STIX objects (malware, campaigns, relationships, bare observables — context, not verdicts), and remembered incremental state (a per-collection last-cursor) — see `PLAN.md` §14 for the reasoning behind each.
 
 ---
 

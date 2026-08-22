@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.4.0-dev"
+__version__ = "0.5.0-dev"
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
