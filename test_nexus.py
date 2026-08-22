@@ -5361,6 +5361,73 @@ class TestTaxiiProbe(unittest.TestCase):
         self.assertIn("Feed One", printed)
         self.assertRegex(printed, r"Feed One\s+3\s")
 
+    def test_probe_marks_a_count_that_hit_the_limit(self):
+        # A count equal to probe_limit means the pull was capped, not that
+        # the collection really holds exactly that many objects -- the "+"
+        # is the only thing telling the two apart.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T", "api_roots": ["/api1/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Feed One"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--%d" % n,
+             "pattern": "[domain-name:value = 'x%d.example']" % n,
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}
+            for n in range(3)]}]
+        client = self.server.client()
+
+        capped = argparse.Namespace(probe_limit=3)
+        self.assertEqual(nexus._cmd_probe_taxii(client, capped), 0)
+        printed = self.buffer.getvalue()
+        self.assertRegex(printed, r"Feed One\s+3\+")
+
+        self.buffer.truncate(0)
+        self.buffer.seek(0)
+        self.server.server.objects_index = 0
+        under = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, under), 0)
+        printed = self.buffer.getvalue()
+        line = [l for l in printed.splitlines() if "Feed One" in l][0]
+        self.assertNotIn("+", line)
+
+    def test_probe_reports_one_collections_error_without_losing_the_rest(self):
+        # The whole point of a probe is a survey; one unreadable collection
+        # must not cost the operator the counts for the others. The fake
+        # server's /objects/ branch always answers 200 regardless of
+        # routes= (it is intercepted ahead of the routes lookup), so the
+        # fault is injected at the client instead -- fetch_objects raising
+        # for one collection is exactly what a real 500 or connection
+        # failure would look like from _cmd_probe_taxii's point of view.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T",
+                               "api_roots": ["/api1/", "/api2/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Bad Feed"}]}),
+            "/api2/collections/": (200, {"collections": [
+                {"id": "c2", "title": "Good Feed"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--0",
+             "pattern": "[domain-name:value = 'x0.example']",
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}]}]
+        client = self.server.client()
+        real_fetch_objects = client.fetch_objects
+
+        def flaky_fetch_objects(collection, **kwargs):
+            if collection["id"] == "c1":
+                raise nexus.SourceError("boom")
+            return real_fetch_objects(collection, **kwargs)
+
+        client.fetch_objects = flaky_fetch_objects
+        args = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, args), 0)
+        printed = self.buffer.getvalue()
+        bad_line = [l for l in printed.splitlines() if "Bad Feed" in l][0]
+        good_line = [l for l in printed.splitlines() if "Good Feed" in l][0]
+        self.assertIn("ERR", bad_line)
+        self.assertRegex(good_line, r"Good Feed\s+1\s")
+
 
 class TestTaxiiExplain(unittest.TestCase):
     """--explain on a TAXII profile must not print a MISP restSearch body."""
