@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""nexus.py - build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2.
+"""nexus.py - build a Zeek intel.dat from MISP, OpenCTI or TAXII, for Security
+Onion 3.2.
 
-Phases 0-6, 8 and 9: environment check, source client (MISP or OpenCTI), the
-mapping/normalise/write core, the interactive interview, profiles and the
-unattended modes, the safety guardrails, apply-to-grid, OpenCTI as a second
-source, and offline build plus airgapped import.  Phase 7 (systemd timer,
+Phases 0-6, 8 and 9: environment check, source client (MISP, OpenCTI or a
+TAXII 2.0/2.1 server), the mapping/normalise/write core, the interactive
+interview, profiles and the unattended modes, the safety guardrails,
+apply-to-grid, OpenCTI and TAXII as further sources, and offline build plus
+airgapped import.  Phase 7 (systemd timer,
 install docs) is outstanding.
 One source per run, selected in the interview or via --source.  --offline
 builds a transfer-ready intel.dat on a host with no Security Onion installed;
@@ -1507,8 +1509,12 @@ def flatten_taxii_object(obj, collection_title=None, stats=None):
             stats.unmap("pattern:%s" % pattern_type)
         return []
 
+    # STIX 2.1 moved the indicator open-vocab to `indicator_types` and made
+    # `labels` optional, so a 2.1 feed can carry an empty `labels` -- reading
+    # only that would let an include-labels answer exclude everything while
+    # the pre-flight summary reports the filter as applied.
     labels = []
-    for label in obj.get("labels") or []:
+    for label in (obj.get("labels") or []) + (obj.get("indicator_types") or []):
         if label and label not in labels:
             labels.append(label)
 
@@ -4882,8 +4888,8 @@ def _cmd_probe_opencti(client, args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="nexus",
-        description="Build a Zeek intel.dat from MISP or OpenCTI, for "
-                    "Security Onion 3.2.",
+        description="Build a Zeek intel.dat from MISP, OpenCTI or TAXII, "
+                    "for Security Onion 3.2.",
     )
     parser.add_argument("--version", action="version",
                         version="nexus %s" % __version__)
@@ -5310,11 +5316,7 @@ def _fetch_records(client, config):
         budget = config.get("max_indicators")
         seen = 0
         for collection in config.get("collections") or []:
-            remaining = None if budget is None else max(0, budget - seen)
-            if remaining == 0:
-                log.warning("indicator budget spent before collection %s",
-                            collection.get("title") or collection.get("id"))
-                return
+            remaining = None if budget is None else budget - seen
             log.info("fetching collection %s",
                      collection.get("title") or collection.get("id"))
             for obj in client.fetch_objects(collection,
@@ -5326,9 +5328,25 @@ def _fetch_records(client, config):
                     # Everything but match[type] and added_after is filtered
                     # here, after the object has already crossed the wire.
                     if not taxii_object_allowed(record, config):
+                        # build_indicators counts what it is handed, so a
+                        # record dropped here would never be counted at all
+                        # and the stats line would report fewer records than
+                        # crossed the wire -- contradicting the summary.
+                        if stats is not None:
+                            stats.fetched += 1
+                            stats.exclude("taxii post-download filter")
                         continue
                     seen += 1
                     yield record
+                    # fetch_objects' max_results counts objects, and TAXII
+                    # flattening is 1:N -- one 50-value pattern would blow a
+                    # cap of 3 ten times over.  check_size treats the cap as
+                    # a hard block, not a trim, so overshooting means a
+                    # failed build and no file at all.
+                    if budget is not None and seen >= budget:
+                        log.warning("indicator cap of %d reached; stopped "
+                                    "fetching", budget)
+                        return
         return
 
     if config.get("source") == "opencti":

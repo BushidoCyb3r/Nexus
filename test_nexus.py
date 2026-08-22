@@ -5049,6 +5049,39 @@ class TestFlattenTaxii(unittest.TestCase):
         self.assertEqual(taxii_keys - self.TAXII_ONLY_KEYS, opencti_keys)
 
 
+class TestTaxiiIndicatorTypes(unittest.TestCase):
+    """STIX 2.1 moved the indicator open-vocab from `labels` to
+    `indicator_types` and made `labels` optional, so a 2.1 feed can carry an
+    empty `labels`.  Reading only `labels` would let an include-labels answer
+    exclude everything while the summary reports it as applied."""
+
+    def object(self, **over):
+        obj = {"type": "indicator", "id": "indicator--1", "name": "n",
+               "pattern": "[domain-name:value = 'evil.example']",
+               "pattern_type": "stix"}
+        obj.update(over)
+        return obj
+
+    def test_indicator_types_are_read_as_labels(self):
+        record = nexus.flatten_taxii_object(
+            self.object(indicator_types=["malicious-activity"]))[0]
+        self.assertEqual(record["labels"], ["malicious-activity"])
+
+    def test_both_vocabularies_are_unioned_without_duplicates(self):
+        record = nexus.flatten_taxii_object(self.object(
+            labels=["phishing", "apt"],
+            indicator_types=["phishing", "malicious-activity"]))[0]
+        self.assertEqual(record["labels"],
+                         ["phishing", "apt", "malicious-activity"])
+        self.assertEqual(record["event_tags"], record["labels"])
+
+    def test_an_include_filter_matches_an_indicator_type(self):
+        record = nexus.flatten_taxii_object(
+            self.object(indicator_types=["malicious-activity"]))[0]
+        self.assertTrue(nexus.taxii_object_allowed(
+            record, {"include_labels": ["malicious-activity"]}))
+
+
 class TestTaxiiClientSideFilters(unittest.TestCase):
 
     def _record(self, **over):
@@ -5160,6 +5193,10 @@ class TestTaxiiWiring(Quiet):
         nexus._stage7_metadata(config, lambda _p: "", offline=True)
         self.assertEqual(config["source_fmt"], "TAXII-{collection}")
         self.assertNotIn("MISP", self.printed)
+        # The link question is not asked -- "yes" is the default everywhere
+        # else, so leaving it in would have produced a MISP-shaped meta.url.
+        self.assertIsNone(config["source_base_url"])
+        self.assertNotIn("Link meta.url", self.printed)
 
     def test_an_interview_answer_reaches_a_rendered_collection_name(self):
         # The whole point: {collection} is reachable without a test reaching
@@ -5265,8 +5302,16 @@ class TestTaxiiProbe(unittest.TestCase):
         self.addCleanup(redirect.__exit__, None, None, None)
 
     def test_the_probe_reports_the_collections(self):
-        client = self.server.client()
-        self.assertEqual(nexus._cmd_probe_taxii(client, None), 0)
+        # Through cmd_probe, not _cmd_probe_taxii: calling the helper proves
+        # it works, never that --source taxii reaches it.
+        token = os.path.join(tempfile.mkdtemp(), "token")
+        with io.open(token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        args = nexus.build_parser().parse_args(
+            ["--probe", "--source", "taxii", "--host", "127.0.0.1",
+             "--scheme", "http", "--port", str(self.server.port),
+             "--insecure", "--retries", "1", "--token-file", token])
+        self.assertEqual(nexus.cmd_probe(args), 0)
         printed = self.buffer.getvalue()
         self.assertIn("Feed One", printed)
         self.assertIn("Feed Two", printed)
@@ -5300,6 +5345,109 @@ class TestTaxiiExplain(unittest.TestCase):
         self.assertIn("/api1/collections/c1/objects/", printed)
         self.assertIn("/api2/collections/c2/objects/", printed)
         self.assertIn("added_after=", printed)
+
+
+class TestTaxiiBuild(Quiet):
+    """cmd_build driven all the way through on a TAXII profile.
+
+    TestTaxiiEndToEnd hand-passes mapping_table=OPENCTI_TO_ZEEK to
+    build_indicators, which is precisely the line cmd_build's taxii branch
+    exists to set -- so it could not catch that branch going missing.
+    Mutating the branch to `elif False:` writes an empty file and exits 0.
+    """
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.out = os.path.join(self.dir, "intel.dat")
+        self.token = os.path.join(self.dir, "token")
+        with io.open(self.token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+
+    def objects(self, count=1, values_per_pattern=1):
+        objects = []
+        for n in range(count):
+            values = ["evil%d-%d.example" % (n, v)
+                      for v in range(values_per_pattern)]
+            pattern = " OR ".join("domain-name:value = '%s'" % v
+                                  for v in values)
+            objects.append({"type": "indicator", "id": "indicator--%d" % n,
+                            "name": "bad %d" % n, "pattern": "[%s]" % pattern,
+                            "pattern_type": "stix", "labels": ["phishing"],
+                            "created": "2026-08-01T00:00:00Z"})
+        return objects
+
+    def profile(self, **over):
+        config = {
+            "source": "taxii", "source_host": "127.0.0.1", "scheme": "http",
+            "port": self.server.port, "verify_tls": False, "proxy": None,
+            "timeout": 5, "retries": 1, "taxii_version": "2.1",
+            "collections": [{"id": "c1", "title": "Feed One",
+                             "api_root": "/api1/"}],
+            "days": 0, "include_labels": [], "exclude_labels": [],
+            "include_markings": [], "include_authors": [],
+            "min_confidence": 0, "drop_expired": True,
+            "split_composites": "both", "allow_subnet": True,
+            "hostname_as_domain": True, "types": None,
+            "exclude_private": True, "own_networks": [], "own_domains": [],
+            "allowlist_file": None, "source_fmt": "TAXII-{collection}",
+            "desc_template": "{event_info}", "source_base_url": None,
+            "do_notice": False, "meta_maxlen": 200,
+            "output_path": self.out, "offline": True,
+            "deployment": "offline", "backup": False, "dry_run": False,
+            "apply": False, "max_indicators": None,
+        }
+        config.update(over)
+        path = os.path.join(self.dir, "taxii.json")
+        nexus.save_profile(config, path)
+        return path
+
+    def run_build(self, profile_path):
+        args = nexus.resolve_source_args(nexus.build_parser().parse_args(
+            ["--profile", profile_path, "--yes", "--offline",
+             "--token-file", self.token]))
+        return nexus.cmd_build(args)
+
+    def test_a_taxii_profile_builds_a_real_intel_file(self):
+        self.server.server.pages = [{"more": False,
+                                     "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self.profile()), 0)
+        with io.open(self.out, encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertIn("evil0-0.example\tIntel::DOMAIN\tTAXII-Feed-One",
+                      body)
+
+    def test_the_indicator_cap_is_honoured_exactly(self):
+        # Five objects, three values each: 15 indicators from 5 objects.
+        # fetch_objects counts objects and _fetch_records counts records, so
+        # a cap enforced only by max_results overshoots 3x -- and check_size
+        # treats the cap as a hard block, so the build fails and writes
+        # nothing rather than trimming.
+        self.server.server.pages = [{"more": False,
+                                     "objects": self.objects(5, 3)}]
+        self.assertEqual(self.run_build(self.profile(max_indicators=3)), 0)
+        with io.open(self.out, encoding="utf-8") as handle:
+            rows = [l for l in handle.read().splitlines()
+                    if l and not l.startswith("#")]
+        self.assertEqual(len(rows), 3)
+
+    def test_a_dropped_object_is_still_counted_as_fetched(self):
+        # The summary promises the post-download filters "thin what is kept,
+        # not what is fetched"; a stats line reading "fetched 1" when two
+        # objects crossed the wire contradicts it.
+        self.server.server.pages = [{"more": False, "objects": [
+            self.objects(1)[0],
+            {"type": "indicator", "id": "indicator--x", "name": "benign",
+             "pattern": "[domain-name:value = 'ok.example']",
+             "pattern_type": "stix", "labels": ["benign"],
+             "created": "2026-08-01T00:00:00Z"}]}]
+        self.assertEqual(
+            self.run_build(self.profile(exclude_labels=["benign"])), 0)
+        self.assertIn("fetched 2 records -> 1 indicators", self.printed)
+        self.assertIn("taxii post-download filter", self.printed)
 
 
 class TestTaxiiFetchRecords(unittest.TestCase):
