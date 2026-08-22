@@ -1092,6 +1092,34 @@ class TaxiiClient(_HttpTransport):
         title = (payload or {}).get("title") or "TAXII server"
         return {"version": self.version, "title": title}
 
+    def get_collections(self):
+        """Every collection under every API root, in discovery order.
+
+        A server may expose several API roots; the operator picks collections,
+        not roots, so the root is carried on each collection rather than being
+        a separate question.
+        """
+        payload, _ = self._request("GET", TAXII_DISCOVERY[self.version])
+        roots = (payload or {}).get("api_roots") or []
+        found = []
+        for root in roots:
+            path = root if root.endswith("/") else root + "/"
+            try:
+                body, _ = self._request("GET", path + "collections/")
+            except SourceAuthError:
+                raise
+            except SourceError as exc:
+                # One unreadable root must not cost the operator the others.
+                log.warning("could not read collections under %s: %s", path, exc)
+                continue
+            for entry in (body or {}).get("collections") or []:
+                if not entry.get("id"):
+                    continue
+                found.append({"id": entry["id"],
+                              "title": entry.get("title") or entry["id"],
+                              "api_root": path})
+        return found
+
 
 def _misp_bool(value):
     """MISP returns booleans as 0/1, "0"/"1", or real bools depending on age."""

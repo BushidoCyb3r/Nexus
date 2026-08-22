@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -1013,19 +1014,40 @@ class FakeOpencti(object):
         self.server.server_close()
 
 
+TAXII_DISCOVERY_PATHS = ("/taxii2/", "/taxii/")
+
+# Two API roots, one collection apiece -- the default fixture for
+# TestTaxiiDiscovery.  Version-detection tests pass their own narrower
+# routes= and never see this.
+DEFAULT_TAXII_ROUTES = {
+    "/taxii2/": (200, {"title": "Test TAXII", "api_roots": ["/api1/", "/api2/"]}),
+    "/taxii/": (200, {"title": "Test TAXII", "api_roots": ["/api1/", "/api2/"]}),
+    "/api1/collections/": (200, {"collections": [{"id": "c1", "title": "Feed One"}]}),
+    "/api2/collections/": (200, {"collections": [{"id": "c2", "title": "Feed Two"}]}),
+}
+
+
 class FakeTaxiiHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
 
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
         self.server.requests.append({
             "path": self.path,
+            # Parsed, not raw: the client encodes query params with
+            # urlencode (brackets become %5B/%5D), so a raw-string
+            # assertion could never match what a later stage sends.
+            "query": urllib.parse.parse_qs(parsed.query),
             "accept": self.headers.get("Accept"),
             "auth": self.headers.get("Authorization"),
         })
-        status, payload = self.server.routes.get(
-            self.path, (404, {"title": "not found"}))
+        if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
+            status, payload = 404, {"title": "not found"}
+        else:
+            status, payload = self.server.routes.get(
+                parsed.path, (404, {"title": "not found"}))
         body = json.dumps(payload).encode("utf-8") if payload is not None else b""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -1036,15 +1058,25 @@ class FakeTaxiiHandler(BaseHTTPRequestHandler):
 
 
 class FakeTaxii(object):
-    """A local TAXII endpoint answering scripted per-path responses."""
+    """A local TAXII endpoint answering scripted per-path responses.
+
+    With no routes given it serves a two-API-root 2.1/2.0 discovery and
+    collections fixture (extended by later tasks to serve objects); pass
+    routes= to script something narrower, as the version-detection tests do.
+    """
 
     def __init__(self, routes=None):
         self.server = HTTPServer(("127.0.0.1", 0), FakeTaxiiHandler)
-        self.server.routes = dict(routes or {})
+        self.server.routes = (dict(routes) if routes is not None
+                              else dict(DEFAULT_TAXII_ROUTES))
+        self.server.serve_discovery = True
         self.server.requests = []
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
         self.thread.start()
+
+    def start(self):
+        pass  # already serving from __init__; kept for call-site symmetry
 
     @property
     def port(self):
@@ -1053,6 +1085,18 @@ class FakeTaxii(object):
     @property
     def requests(self):
         return self.server.requests
+
+    @property
+    def accepts(self):
+        return [r["accept"] for r in self.server.requests]
+
+    @property
+    def serve_discovery(self):
+        return self.server.serve_discovery
+
+    @serve_discovery.setter
+    def serve_discovery(self, value):
+        self.server.serve_discovery = value
 
     def client(self, **kwargs):
         return nexus.TaxiiClient("127.0.0.1", "tok", scheme="http",
@@ -1117,6 +1161,54 @@ class TestTaxiiVersionDetection(unittest.TestCase):
                          {"version": "2.1", "title": "My TAXII"})
         self.assertEqual(self.taxii.requests[0]["accept"],
                          nexus.TAXII_ACCEPT["2.1"])
+
+
+class TestTaxiiDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.start()
+
+    def _client(self, version="2.1"):
+        return nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                 port=self.server.port, version=version)
+
+    def test_detects_21(self):
+        self.assertEqual(self._client().detect_version(), "2.1")
+
+    def test_collections_span_every_api_root(self):
+        found = self._client().get_collections()
+        self.assertEqual(sorted(c["id"] for c in found), ["c1", "c2"])
+        self.assertEqual(found[0]["api_root"], "/api1/")
+
+    def test_the_accept_header_names_the_version(self):
+        self._client().get_collections()
+        self.assertIn("application/taxii+json;version=2.1",
+                      self.server.accepts)
+
+    def test_a_server_with_no_discovery_endpoint_raises(self):
+        self.server.serve_discovery = False
+        with self.assertRaises(nexus.TaxiiError):
+            self._client().detect_version()
+
+    def test_one_unreadable_root_does_not_cost_the_others(self):
+        # api2 is broken (500, past the retry budget); api1's collection
+        # must still come back rather than the whole call failing.  retries=1
+        # so the 500 fails fast instead of eating the backoff schedule.
+        self.server.server.routes["/api2/collections/"] = (500, {})
+        client = nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                   port=self.server.port, retries=1)
+        found = client.get_collections()
+        self.assertEqual([c["id"] for c in found], ["c1"])
+
+    def test_an_auth_failure_on_one_root_propagates_instead_of_being_skipped(self):
+        # Unlike a broken root, a rejected token means the credentials are
+        # wrong -- it must not be swallowed as "one root down, keep going".
+        self.server.server.routes["/api1/collections/"] = (401, {})
+        client = nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                   port=self.server.port, retries=1)
+        with self.assertRaises(nexus.SourceAuthError):
+            client.get_collections()
 
 
 class TestOpenctiClient(unittest.TestCase):
