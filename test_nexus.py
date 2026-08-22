@@ -1391,7 +1391,7 @@ class TestTaxii20Fetch(unittest.TestCase):
         ]
         self.assertEqual(len(self._fetch(max_results=2)), 2)
 
-    # -- the four ways this loop has to end ------------------------------
+    # -- the six ways this loop has to end -------------------------------
     # The fake replays its last scripted page forever (see FakeTaxiiHandler),
     # so each of these hangs the suite rather than failing if its guard in
     # _fetch_objects_20 is removed.  That is deliberate.
@@ -1437,6 +1437,20 @@ class TestTaxii20Fetch(unittest.TestCase):
         self.server.bundles = [
             ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/4"),
             ({"type": "bundle", "objects": [{"id": "b"}]}, "items 0-0/4"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_a_receding_total_does_not_extend_the_pull(self):
+        # A total that keeps outrunning `last` clears every other guard:
+        # objects present, header parsable, total numeric, last+1 < total,
+        # window advancing.  Only the first page's total is believed.
+        # Bounded on purpose -- without the pin this test fails on the
+        # request count rather than wedging the suite.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/2"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-1/3"),
+            ({"type": "bundle", "objects": [{"id": "c"}]}, "items 2-2/4"),
         ]
         self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
         self.assertEqual(len(self.server.requests), 2)
@@ -4369,10 +4383,15 @@ class TestTransportHooks(unittest.TestCase):
         try:
             client = self._probe(fake)
             client._request("POST", "/")
+            # Split so a red run after a Python bump is diagnosable at a
+            # glance: only the second list is Nexus's to defend.
+            URLLIB_ADDS = ["accept-encoding", "connection", "content-length",
+                           "host"]
+            NEXUS_SENDS = ["accept", "authorization", "content-type",
+                           "user-agent"]
             self.assertEqual(
                 sorted(k.lower() for k in fake.requests[0]["headers"]),
-                ["accept", "accept-encoding", "authorization", "connection",
-                 "content-length", "content-type", "host", "user-agent"])
+                sorted(URLLIB_ADDS + NEXUS_SENDS))
         finally:
             fake.stop()
 

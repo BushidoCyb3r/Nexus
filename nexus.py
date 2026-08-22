@@ -1195,6 +1195,7 @@ class TaxiiClient(_HttpTransport):
 
         sent = 0
         start = 0
+        first_total = None
         while True:
             body, headers = self._request(
                 "GET", query,
@@ -1207,13 +1208,22 @@ class TaxiiClient(_HttpTransport):
                 if max_results is not None and sent >= max_results:
                     return
             match = self._CONTENT_RANGE.search(
-                (headers.get("Content-Range") if headers else None) or "")
+                headers.get("Content-Range") or "")
             if not match:
                 return           # no header, or one we cannot read
             last, total = match.group(2), match.group(3)
             if total == "*":
                 return           # unknown total; do not guess
-            if int(last) + 1 >= int(total):
+            if first_total is None:
+                # Pin the first page's total.  A server whose reported total
+                # keeps outrunning `last` -- items 0-0/2, then 1-1/3, then
+                # 2-2/4 -- satisfies every other guard here forever.  The
+                # trade-off is deliberate: a collection genuinely growing
+                # mid-pull is truncated at the total it had when the pull
+                # started, and the next run's `added_after` picks up the
+                # remainder.  A short pull beats an endless one.
+                first_total = int(total)
+            if int(last) + 1 >= first_total:
                 return
             if not objects:
                 return           # no progress; stop rather than spin
