@@ -659,6 +659,18 @@ class TestCheckEnv(unittest.TestCase):
         self.assertTrue(any("intel directory missing" in m
                             for m in self.messages(findings, "error")))
 
+    def test_an_unreadable_intel_dat_is_an_error_not_a_traceback(self):
+        # check_env is the first thing to open the live file, so an
+        # undecodable byte in it came out as a traceback from --check-env and
+        # from every build that ran the check.
+        open(os.path.join(self.intel, nexus.SO_LOAD_FILE), "w").close()
+        with open(os.path.join(self.intel, "intel.dat"), "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        ok, findings = nexus.check_env(self.intel, self.default)
+        self.assertFalse(ok)
+        self.assertTrue(any("unreadable" in m
+                            for m in self.messages(findings, "error")))
+
     def test_apply_command_is_the_3x_form(self):
         _, findings = nexus.check_env(self.intel, self.default)
         apply_msgs = [m for m in self.messages(findings) if "state.apply" in m]
@@ -4877,6 +4889,63 @@ class TestResolveBuildTarget(unittest.TestCase):
             self._args(), input_fn=lambda _p: "", intel_dir=tmp))
 
 
+class TestBuildAppendOnlyGuards(Quiet):
+    """cmd_build's append-only guards, on the manager path.
+
+    cmd_import grew tests for the identical checks; these older copies had
+    none, so stubbing either condition out left the whole suite green.
+    """
+
+    class Client(object):
+        host = "misp.local"
+
+        def get_version(self):
+            return {"version": "2.4.190"}
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        open(os.path.join(self.dir, nexus.SO_LOAD_FILE), "w").close()
+        self.out = os.path.join(self.dir, "intel.dat")
+        for name in ("check_env", "run_interview", "make_client",
+                     "_fetch_records", "resolve_build_target",
+                     "merge_additive"):
+            self.addCleanup(setattr, nexus, name, getattr(nexus, name))
+        nexus.check_env = lambda: (True, [])
+        nexus.make_client = lambda cfg: self.Client()
+        nexus._fetch_records = lambda client, cfg: iter(
+            [{"type": "ip-dst", "value": "45.33.32.1",
+              "category": "Network activity", "event_id": "7",
+              "event_info": "phishing infrastructure"}])
+        nexus.resolve_build_target = lambda args: False
+
+    def config(self, **overrides):
+        config = nexus.run_interview(
+            None, input_fn=scripted(["misp.local"], fill=""),
+            getpass_fn=lambda prompt: "tok", source="misp")
+        config.update({"output_path": self.out, "profile_path": None,
+                       "backup": False, "dry_run": False, "apply": False})
+        config.update(overrides)
+        return config
+
+    def build(self, config):
+        nexus.run_interview = lambda client, **kwargs: config
+        return nexus.cmd_build(nexus.resolve_source_args(
+            nexus.build_parser().parse_args([])))
+
+    def _raw(self):
+        with io.open(self.out, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_an_unreadable_existing_file_is_an_error_not_a_traceback(self):
+        with open(self.out, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        self.assertEqual(self.build(self.config()), 1)
+        with open(self.out, "rb") as handle:
+            self.assertEqual(handle.read(), b"\xff\xfe not utf-8 at all\n")
+
+
 class TestOfflineFlagParsing(unittest.TestCase):
     def test_offline_defaults_to_false(self):
         args = nexus.build_parser().parse_args([])
@@ -5008,6 +5077,20 @@ class TestImportMode(Quiet):
         with open(self.incoming, "wb") as handle:
             handle.write(b"\xff\xfe not utf-8 at all\n")
         self.assertEqual(self._import(), 2)
+
+    def test_an_unreadable_live_file_is_an_error_not_a_traceback(self):
+        # The manager's own intel.dat, not the transferred one: on a real
+        # manager check_env traps this first, but nothing guarantees that
+        # ordering and the raise here escaped as a traceback.
+        self._write(self.incoming, ["b.example\tIntel::DOMAIN\tMISP\td\t-"])
+        with open(self.live, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8 at all\n")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(self._import(), 1)
+        self.assertIn("unreadable", errors.getvalue())
+        with open(self.live, "rb") as handle:
+            self.assertEqual(handle.read(), b"\xff\xfe not utf-8 at all\n")
 
     def test_broad_incoming_subnet_is_flagged(self):
         """The guardrail's own reason to exist: rows built somewhere else.

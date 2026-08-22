@@ -2167,16 +2167,23 @@ def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
     intel_path = os.path.join(intel_dir, "intel.dat")
     if os.path.exists(intel_path):
         st = os.stat(intel_path)
-        _, rows = read_existing(intel_path)
-        findings.append(("info", "intel.dat present: %d indicators, mode %o, %d bytes"
-                                 % (len(rows), st.st_mode & 0o777, st.st_size)))
         try:
+            _, rows = read_existing(intel_path)
             problems = lint_file(intel_path)
         except (OSError, UnicodeDecodeError) as exc:
-            problems = ["unreadable: %s" % exc]
-        if problems:
-            findings.append(("warn", "existing intel.dat has %d lint problem(s); "
-                                     "run --lint for detail" % len(problems)))
+            # Every build merges into this file.  Unreadable here is a hard
+            # stop, not a warning: the alternative is a traceback out of
+            # cmd_build once it opens the same file for itself.
+            ok = False
+            findings.append(("error", "existing intel.dat is unreadable: %s "
+                                      "-- append-only mode cannot merge into "
+                                      "it" % exc))
+        else:
+            findings.append(("info", "intel.dat present: %d indicators, mode %o, %d bytes"
+                                     % (len(rows), st.st_mode & 0o777, st.st_size)))
+            if problems:
+                findings.append(("warn", "existing intel.dat has %d lint problem(s); "
+                                         "run --lint for detail" % len(problems)))
     else:
         findings.append(("warn", "intel.dat does not exist yet at %s" % intel_path))
 
@@ -4487,7 +4494,11 @@ def cmd_build(args):
     )
     print("\n" + stats.report())
 
-    existing_header, existing = read_existing(path)
+    try:
+        existing_header, existing = read_existing(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        print("\nBlocked. %s is unreadable: %s" % (path, exc), file=sys.stderr)
+        return 1
     wanted_header = header_line(config["do_notice"])
     if existing_header and existing_header != wanted_header:
         print("\nBlocked. Existing intel.dat schema differs from the requested "
@@ -4675,7 +4686,11 @@ def cmd_import(args):
         return 1
 
     path = SO_INTEL_FILE
-    existing_header, existing = read_existing(path)
+    try:
+        existing_header, existing = read_existing(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        print("\nBlocked. %s is unreadable: %s" % (path, exc), file=sys.stderr)
+        return 1
     wanted_header = header_line(do_notice)
     if existing_header and existing_header != wanted_header:
         print("\nBlocked. %s was built with a different meta.do_notice "
