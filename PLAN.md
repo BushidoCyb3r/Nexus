@@ -418,7 +418,7 @@ Per Intel type, before an indicator enters the file:
 
 **Merge mode**: append-only. `cmd_build` calls `merge_additive()`, which keeps *every* existing line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
 
-**Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count.
+**Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count. Under `--offline`, `/opt/nexus` does not exist on that host and is not writable, so the backup instead goes to `nexus-backups/intel.dat.<ISO8601>` beside the output path, same retention count.
 
 ---
 

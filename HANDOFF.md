@@ -20,7 +20,7 @@ Not a library. Not a package. **One script**, standard library only, so it drops
 nexus.py        4746 lines   the tool
 test_nexus.py   5122 lines   525 tests, no MISP, OpenCTI or SO required
 PLAN.md          555 lines   full design doc, section numbers referenced below
-HANDOFF.md       355 lines   this file
+HANDOFF.md       ~350 lines   this file (self-referential count omitted -- drifts every time this file is edited)
 ```
 
 A git repository, currently on branch `offline-build`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
@@ -259,6 +259,13 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
   by `print_transfer_instructions`, and the hand-copy route says so at the
   point of use. It stays supported anyway, because an operator who cannot run
   Python on the manager has no other route in.
+- **Offline builds back up to `nexus-backups/`, not `/opt/nexus/backups`.**
+  `/opt/nexus` is a manager-only directory; it does not exist and is not
+  writable on an arbitrary offline host. `cmd_build` under `--offline`
+  backs up to `nexus-backups/` next to the output file instead, same
+  retention count. Without this, a second offline build over the same
+  output path used to crash in `os.makedirs`. `cmd_import` (which only
+  ever runs on a manager) still uses `/opt/nexus/backups`.
 - **"Append-only" does not currently cover operator comment lines.** `read_existing`
   filters out any line in the live `intel.dat` that starts with `#` (other than
   the `#fields` header), so a hand-written `#` comment does not survive a
