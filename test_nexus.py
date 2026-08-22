@@ -2982,8 +2982,10 @@ class TestTaxiiCollectionsStage(Quiet):
 
     def test_defaults_to_every_collection(self):
         config = {}
+        # fill="" takes the default for the two shaping questions that
+        # follow the collection menu; the assertion is about the menu.
         nexus._stage3_collections_taxii(config, self.discovery(),
-                                        scripted([""]))
+                                        scripted([""], fill=""))
         self.assertEqual([c["id"] for c in config["collections"]],
                          ["c1", "c2"])
 
@@ -2993,7 +2995,7 @@ class TestTaxiiCollectionsStage(Quiet):
         # from "never asked, defaulted to all" -- pick the subset instead.
         config = {}
         nexus._stage3_collections_taxii(config, self.discovery(),
-                                        scripted(["1"]))
+                                        scripted(["1"], fill=""))
         self.assertEqual([c["id"] for c in config["collections"]], ["c1"])
 
     def test_no_collections_discovered_is_handled_not_crashed(self):
@@ -5093,6 +5095,373 @@ class TestTaxiiClientSideFilters(unittest.TestCase):
         config = {"include_authors": ["identity--b"]}
         self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
 
+
+
+class TestTaxiiWiring(Quiet):
+    """Task 10: TAXII stops being staged delivery and becomes a real source."""
+
+    def collection(self, ident="c1", title="Feed One", root="/api1/"):
+        return {"id": ident, "title": title, "api_root": root}
+
+    def indicator(self, value="evil.example", **over):
+        obj = {"type": "indicator", "id": "indicator--1", "name": "n",
+               "pattern": "[domain-name:value = '%s']" % value,
+               "pattern_type": "stix", "labels": ["phishing"],
+               "confidence": 80, "created": "2026-08-01T00:00:00Z"}
+        obj.update(over)
+        return obj
+
+    def test_taxii_is_a_selectable_source(self):
+        self.assertIn("taxii", nexus.SOURCES)
+        args = nexus.build_parser().parse_args(["--source", "taxii"])
+        self.assertEqual(args.source, "taxii")
+        self.assertEqual(nexus.SOURCE_LABELS["taxii"], "TAXII")
+
+    def test_make_client_builds_a_taxii_client(self):
+        config = {"source": "taxii", "source_host": "h", "token": "t",
+                  "scheme": "https", "port": None, "verify_tls": True,
+                  "timeout": 30, "retries": 3, "taxii_version": "2.0",
+                  "taxii_username": "alice"}
+        client = nexus.make_client(config)
+        self.assertIsInstance(client, nexus.TaxiiClient)
+        # Both TAXII-only answers have to survive the trip, and neither is
+        # the constructor's own default.
+        self.assertEqual(client.version, "2.0")
+        self.assertEqual(client.username, "alice")
+
+    def test_meta_source_names_the_collection(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "Domain-Name", "value": "evil.example",
+              "event_id": "indicator--1", "category": "phishing",
+              "comment": "", "timestamp": "", "collection": "Feed One"}],
+            types=None, source="taxii", mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="TAXII-{collection}")
+        self.assertIn("TAXII-Feed-One", rows[0][2])
+
+    def test_a_collection_name_cannot_break_the_tab_layout(self):
+        source, _, _ = nexus.render_meta(
+            {"collection": "Feed\tOne / two", "event_id": "indicator--1"},
+            source_fmt="TAXII-{collection}", source="taxii")
+        self.assertNotIn("\t", source)
+        self.assertEqual(source, "TAXII-Feed-One-two")
+
+    def test_no_meta_url_is_invented_for_taxii(self):
+        # A TAXII object has no browsable page; the MISP /events/view/ shape
+        # would point an analyst at a server that has no such event.
+        _, _, url = nexus.render_meta(
+            {"event_id": "indicator--1"}, base_url="https://taxii.example",
+            source="taxii")
+        self.assertEqual(url, nexus.NULL_FIELD)
+
+    def test_the_interview_offers_the_collection_placeholder(self):
+        # Empty answers take every default; without a TAXII format list the
+        # default here would be SOURCE_FORMATS[0], "MISP-event-{event_id}".
+        config = {"source": "taxii", "source_host": "taxii.example"}
+        nexus._stage7_metadata(config, lambda _p: "", offline=True)
+        self.assertEqual(config["source_fmt"], "TAXII-{collection}")
+        self.assertNotIn("MISP", self.printed)
+
+    def test_an_interview_answer_reaches_a_rendered_collection_name(self):
+        # The whole point: {collection} is reachable without a test reaching
+        # past the interview to set source_fmt by hand.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["taxii.example"], fill=""),
+            getpass_fn=lambda _p: "tok", source="taxii", offline=True)
+        records = nexus.flatten_taxii_object(self.indicator(),
+                                             collection_title="Feed One")
+        rows, _ = nexus.build_indicators(
+            records, types=config.get("types"), source="taxii",
+            mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt=config["source_fmt"])
+        self.assertEqual(rows[0][2], "TAXII-Feed-One")
+
+    def test_the_taxii_path_does_not_run_the_misp_feed_stage(self):
+        config = nexus.run_interview(
+            None, input_fn=scripted(["taxii.example"], fill=""),
+            getpass_fn=lambda _p: "tok", source="taxii", offline=True)
+        self.assertNotIn("feeds", config)
+        self.assertNotIn("MISP feeds", self.printed)
+
+    def test_the_shaping_answers_the_build_needs_are_asked(self):
+        # cmd_build reads these three off the config; the OpenCTI path asks
+        # them in stage 3 and the TAXII path has to as well.  "n" differs
+        # from both defaults, so this fails if the questions are skipped.
+        config = {}
+        nexus._stage3_collections_taxii(
+            config, {"collections": [self.collection()]},
+            by_prompt([("Treat hostname", "n"),
+                       ("Emit Intel::SUBNET", "n")]))
+        self.assertEqual(config["split_composites"], "both")
+        self.assertIs(config["hostname_as_domain"], False)
+        self.assertIs(config["allow_subnet"], False)
+        self.assertNotIn("Hostname", config["types"])
+        self.assertIn("Domain-Name", config["types"])
+
+    def test_declining_hostname_actually_drops_hostname_rows(self):
+        config = {}
+        nexus._stage3_collections_taxii(
+            config, {"collections": [self.collection()]},
+            by_prompt([("Treat hostname", "n")]))
+        records = nexus.flatten_taxii_object(
+            self.indicator(pattern="[hostname:value = 'box.example']"))
+        rows, _ = nexus.build_indicators(
+            records, types=config["types"], source="taxii",
+            mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(rows, [])
+
+
+class TestTaxiiEndToEnd(unittest.TestCase):
+    """A real TAXII server, over a real socket, through the real client and
+    out as a rendered intel.dat line -- the wiring this task is for."""
+
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--1", "name": "bad domain",
+             "pattern": "[domain-name:value = 'evil.example']",
+             "pattern_type": "stix", "labels": ["phishing"],
+             "confidence": 80, "created": "2026-08-01T00:00:00Z"},
+            {"type": "indicator", "id": "indicator--2", "name": "benign",
+             "pattern": "[ipv4-addr:value = '203.0.113.9']",
+             "pattern_type": "stix", "labels": ["benign"],
+             "confidence": 80, "created": "2026-08-01T00:00:00Z"},
+        ]}]
+
+    def test_a_taxii_run_renders_an_intel_line(self):
+        config = {"source": "taxii", "source_host": "127.0.0.1",
+                  "token": "t", "scheme": "http", "port": self.server.port,
+                  "verify_tls": False, "timeout": 5, "retries": 1,
+                  "taxii_version": "2.1", "taxii_username": None,
+                  "days": 90, "exclude_labels": ["benign"],
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"}]}
+        client = nexus.make_client(config)
+        rows, stats = nexus.build_indicators(
+            nexus._fetch_records(client, config), types=None,
+            source="taxii", mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="TAXII-{collection}",
+            desc_template="{event_info}")
+        lines = nexus.rows_to_lines(rows)
+        self.assertEqual(lines, ["evil.example\tIntel::DOMAIN\t"
+                                 "TAXII-Feed-One\tbad domain\t-"])
+        # The excluded object was fetched and then dropped locally, which is
+        # exactly what the summary promises.
+        self.assertEqual(stats.fetched, 1)
+        self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
+
+
+class TestTaxiiProbe(unittest.TestCase):
+    """--probe --source taxii became reachable the moment "taxii" joined
+    SOURCES; before this it fell through to the MISP probe and died on
+    describe_types()."""
+
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.buffer = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.buffer)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def test_the_probe_reports_the_collections(self):
+        client = self.server.client()
+        self.assertEqual(nexus._cmd_probe_taxii(client, None), 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("Feed One", printed)
+        self.assertIn("Feed Two", printed)
+        self.assertIn("after download", printed)
+
+    def test_an_endpoint_with_no_readable_collection_is_a_failure(self):
+        self.server.server.routes = {"/taxii2/": (200, {"title": "T",
+                                                        "api_roots": []})}
+        client = self.server.client()
+        self.assertEqual(nexus._cmd_probe_taxii(client, None), 1)
+        self.assertIn("none readable", self.buffer.getvalue())
+
+
+class TestTaxiiExplain(unittest.TestCase):
+    """--explain on a TAXII profile must not print a MISP restSearch body."""
+
+    def test_it_prints_one_request_per_collection(self):
+        path = os.path.join(tempfile.mkdtemp(), "t.json")
+        nexus.save_profile({"source": "taxii", "source_host": "taxii.example",
+                            "days": 90, "collections": [
+                                {"id": "c1", "title": "Feed One",
+                                 "api_root": "/api1/"},
+                                {"id": "c2", "title": "Feed Two",
+                                 "api_root": "/api2/"}]}, path)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = nexus.cmd_explain(argparse.Namespace(profile=path))
+        printed = buffer.getvalue()
+        self.assertEqual(code, 0)
+        self.assertNotIn("restSearch", printed)
+        self.assertIn("/api1/collections/c1/objects/", printed)
+        self.assertIn("/api2/collections/c2/objects/", printed)
+        self.assertIn("added_after=", printed)
+
+
+class TestTaxiiFetchRecords(unittest.TestCase):
+    """_fetch_records' TAXII branch: one query per collection, flattened,
+    then thinned by the post-download filters."""
+
+    class StubClient(object):
+        def __init__(self, objects_by_collection):
+            self.objects = objects_by_collection
+            self.calls = []
+
+        def fetch_objects(self, collection, added_after=None,
+                          max_results=None, page_size=100):
+            self.calls.append({"collection": collection["id"],
+                               "added_after": added_after,
+                               "max_results": max_results})
+            for obj in self.objects.get(collection["id"], []):
+                yield obj
+
+    def indicator(self, value, ident, **over):
+        obj = {"type": "indicator", "id": ident, "name": "n",
+               "pattern": "[domain-name:value = '%s']" % value,
+               "pattern_type": "stix", "labels": ["phishing"],
+               "created": "2026-08-01T00:00:00Z"}
+        obj.update(over)
+        return obj
+
+    def config(self, **over):
+        config = {"source": "taxii", "days": 0,
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"},
+                                  {"id": "c2", "title": "Feed Two",
+                                   "api_root": "/api2/"}]}
+        config.update(over)
+        return config
+
+    def test_every_selected_collection_is_queried_and_named(self):
+        client = self.StubClient({"c1": [self.indicator("a.example", "i--1")],
+                                  "c2": [self.indicator("b.example", "i--2")]})
+        records = list(nexus._fetch_records(client, self.config()))
+        self.assertEqual([c["collection"] for c in client.calls], ["c1", "c2"])
+        self.assertEqual([r["value"] for r in records],
+                         ["a.example", "b.example"])
+        self.assertEqual([r["collection"] for r in records],
+                         ["Feed One", "Feed Two"])
+
+    def test_days_becomes_a_server_side_added_after(self):
+        client = self.StubClient({})
+        list(nexus._fetch_records(client, self.config(days=90)))
+        stamp = client.calls[0]["added_after"]
+        self.assertIsNotNone(stamp)
+        moment = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - moment
+        self.assertAlmostEqual(delta.total_seconds(), 90 * 86400, delta=120)
+
+    def test_no_time_filter_sends_no_added_after(self):
+        client = self.StubClient({})
+        list(nexus._fetch_records(client, self.config(days=0)))
+        self.assertIsNone(client.calls[0]["added_after"])
+
+    def test_the_post_download_filters_are_actually_applied(self):
+        client = self.StubClient({
+            "c1": [self.indicator("keep.example", "i--1", labels=["phishing"]),
+                   self.indicator("drop.example", "i--2", labels=["benign"])]})
+        config = self.config(collections=[{"id": "c1", "title": "Feed One",
+                                           "api_root": "/api1/"}],
+                             exclude_labels=["benign"])
+        records = list(nexus._fetch_records(client, config))
+        self.assertEqual([r["value"] for r in records], ["keep.example"])
+
+
+class TestTaxiiSummary(unittest.TestCase):
+    """The Proceed prompt is where an operator approves the scope, so the
+    summary has to describe the TAXII run, not a MISP one."""
+
+    def config(self, **over):
+        config = {"source": "taxii", "source_host": "taxii.example",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "taxii_version": "2.1", "days": 90,
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"}],
+                  "split_composites": "both", "allow_subnet": True,
+                  "hostname_as_domain": True,
+                  "include_labels": ["apt"], "exclude_labels": ["benign"],
+                  "include_markings": ["marking-definition--m1"],
+                  "include_authors": ["identity--a1"],
+                  "min_confidence": 75, "drop_expired": True,
+                  "exclude_private": True, "own_networks": [],
+                  "own_domains": [], "allowlist_file": None,
+                  "source_fmt": "TAXII-{collection}",
+                  "desc_template": "", "source_base_url": None,
+                  "do_notice": False, "meta_maxlen": 200,
+                  "output_path": "/tmp/intel.dat"}
+        config.update(over)
+        return config
+
+    def test_the_answered_window_is_not_reported_as_all_time(self):
+        # The TAXII path never sets time_mode; reading it made the summary
+        # claim "all time" over an answered 90-day added_after -- the one
+        # filter TAXII really does apply server-side.
+        text = nexus.summarise_config(self.config())
+        self.assertNotIn("all time", text)
+        self.assertIn("90 days", text)
+        self.assertIn("added_after", text)
+
+    def test_no_time_filter_says_so(self):
+        text = nexus.summarise_config(self.config(days=0))
+        self.assertIn("all time", text)
+
+    def test_the_selected_collections_are_named(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("Feed One", text)
+
+    def test_no_collections_is_called_out_not_left_blank(self):
+        text = nexus.summarise_config(self.config(collections=[]))
+        self.assertIn("none selected", text)
+
+    def test_the_client_side_filters_are_marked_after_download(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("after download", text.lower())
+        for fragment in ("apt", "benign", "marking-definition--m1",
+                         "identity--a1", "75"):
+            self.assertIn(fragment, text)
+        self.assertIn("valid_until", text)
+
+    def test_no_misp_lines_leak_onto_the_taxii_summary(self):
+        text = nexus.summarise_config(self.config())
+        self.assertNotIn("all of MISP", text)
+        self.assertNotIn("to_ids", text)
+        self.assertNotIn("restSearch", text)
+
+    def test_the_summary_shows_the_query_that_will_be_sent(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("match[type]=indicator", text)
+
+
+class TestTaxiiProfiles(unittest.TestCase):
+
+    def test_a_v2_profile_without_taxii_keys_still_loads(self):
+        path = os.path.join(tempfile.mkdtemp(), "old.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"profile_version": nexus.PROFILE_VERSION,
+                       "nexus_version": "x", "saved_utc": "now",
+                       "config": {"source": "misp", "types": ["ip-dst"]}},
+                      handle)
+        config = nexus.load_profile(path)
+        self.assertEqual(config["source"], "misp")
+        self.assertNotIn("taxii_version", config)
+
+    def test_a_taxii_profile_keeps_the_collections_but_not_the_secrets(self):
+        path = os.path.join(tempfile.mkdtemp(), "taxii.json")
+        nexus.save_profile({"source": "taxii", "token": "pw",
+                            "taxii_username": "alice",
+                            "taxii_version": "2.0",
+                            "collections": [{"id": "c1", "title": "Feed One",
+                                             "api_root": "/api1/"}]}, path)
+        config = nexus.load_profile(path)
+        self.assertEqual(config["taxii_version"], "2.0")
+        self.assertEqual(config["collections"][0]["title"], "Feed One")
+        self.assertNotIn("token", config)
+        self.assertNotIn("taxii_username", config)
 
 class TestOpenctiSearch(unittest.TestCase):
 

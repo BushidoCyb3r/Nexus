@@ -74,8 +74,8 @@ PROFILE_EXCLUDED_KEYS = ("token", "taxii_username", "discovery", "_stats")
 PROFILE_V1_KEY_MAP = {"misp_host": "source_host",
                       "misp_base_url": "source_base_url"}
 
-SOURCES = ("misp", "opencti")
-SOURCE_LABELS = {"misp": "MISP", "opencti": "OpenCTI"}
+SOURCES = ("misp", "opencti", "taxii")
+SOURCE_LABELS = {"misp": "MISP", "opencti": "OpenCTI", "taxii": "TAXII"}
 
 TAXII_VERSIONS = ("2.1", "2.0")
 # 2.1 renamed the media type and moved discovery; 2.0 servers answer neither.
@@ -2085,6 +2085,7 @@ def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
         event_id=record.get("event_id") or "0",
         event_uuid=record.get("event_uuid") or "",
         feed=_slug(record.get("feed") or "none"),
+        collection=_slug(record.get("collection") or "none"),
     ) if "{" in source_fmt else source_fmt
 
     if desc_template:
@@ -2107,8 +2108,11 @@ def render_meta(record, source_fmt=DEFAULT_SOURCE_PREFIX, desc_template=None,
         if source == "opencti":
             url = "%s/dashboard/observations/indicators/%s" % (
                 base_url.rstrip("/"), record["event_id"])
-        else:
+        elif source == "misp":
             url = "%s/events/view/%s" % (base_url.rstrip("/"), record["event_id"])
+        # A TAXII object has no browsable page of its own, so no URL is
+        # invented for it -- the MISP shape would send an analyst to a
+        # server that has no such event.
 
     return (sanitize_meta(meta_source, maxlen),
             sanitize_meta(desc, maxlen),
@@ -2814,6 +2818,17 @@ OPENCTI_SOURCE_FORMATS = (
     ("fixed string", "type your own"),
 )
 
+# TAXII's own identity for an object is the collection it came from; the
+# STIX id is the only other thing on the wire worth naming, and there is no
+# organisation -- created_by_ref is an unresolved identity reference, not a
+# name, so it is not offered here.
+TAXII_SOURCE_FORMATS = (
+    ("TAXII-{collection}", "TAXII-Feed-One"),
+    ("TAXII-{event_id}", "TAXII-indicator--6c1f0a2e-..."),
+    ("TAXII", "TAXII"),
+    ("fixed string", "type your own"),
+)
+
 DEFAULT_DESC_TEMPLATE = "{event_info} | {category}"
 DEFAULT_DAYS = 90
 DEFAULT_MAX_INDICATORS = None
@@ -3441,6 +3456,15 @@ def _stage3_collections_taxii(config, discovery, input_fn):
     reproducing here.
     """
     _stage(3, "Collections")
+    # TAXII values come out of parse_stix_pattern against OPENCTI_TO_ZEEK, the
+    # same table OpenCTI uses, so the two shaping answers _stage3_iocs asks
+    # there apply here too and cmd_build reads all three off the config.  No
+    # OPENCTI_TO_ZEEK entry carries a second spec, so there is no composite
+    # half to choose -- same reason the OpenCTI path does not ask either.
+    config["split_composites"] = "both"
+    config["hostname_as_domain"] = True
+    config["allow_subnet"] = True
+    config["types"] = None
     collections = discovery.get("collections") or []
     if not collections:
         print("  no collections were discovered; check TAXII discovery and "
@@ -3454,6 +3478,16 @@ def _stage3_collections_taxii(config, discovery, input_fn):
                        [c["id"] for c in collections], input_fn)
     by_id = dict((c["id"], c) for c in collections)
     config["collections"] = [by_id[cid] for cid in chosen if cid in by_id]
+
+    config["hostname_as_domain"] = ask_yes_no(
+        "Treat hostname as Intel::DOMAIN?", True, input_fn)
+    if not config["hostname_as_domain"]:
+        # There is no type menu on this path, so "no" has to become an
+        # explicit allow-list of everything else -- otherwise the answer
+        # would be collected and then do nothing.
+        config["types"] = [t for t in OPENCTI_TO_ZEEK if t != "Hostname"]
+    config["allow_subnet"] = ask_yes_no(
+        "Emit Intel::SUBNET for CIDR values in IP attributes?", True, input_fn)
     return config
 
 
@@ -3657,9 +3691,10 @@ def _stage6_exclusions(config, input_fn):
 
 def _stage7_metadata(config, input_fn, offline=False):
     _stage(7, "Metadata")
-    opencti = config.get("source") == "opencti"
-    formats = OPENCTI_SOURCE_FORMATS if opencti else SOURCE_FORMATS
-    platform = "OpenCTI" if opencti else "MISP"
+    source = config.get("source") or "misp"
+    formats = {"opencti": OPENCTI_SOURCE_FORMATS,
+               "taxii": TAXII_SOURCE_FORMATS}.get(source, SOURCE_FORMATS)
+    platform = SOURCE_LABELS.get(source, "MISP")
     choice = ask_choice("meta.source format", list(formats),
                         formats[0][0], input_fn)
     if choice == "fixed string":
@@ -3670,9 +3705,15 @@ def _stage7_metadata(config, input_fn, offline=False):
         "meta.desc template ({event_info} {category} {tags} {comment} "
         "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
 
-    link_target = "OpenCTI indicator" if opencti else "MISP event"
-    if ask_yes_no("Link meta.url back to the %s?" % link_target, True,
-                  input_fn):
+    link_target = {"opencti": "OpenCTI indicator",
+                   "taxii": None}.get(source, "MISP event")
+    if link_target is None:
+        # Nothing to ask: a TAXII object has no page to link to, and saying
+        # so beats a question whose only honest answer is "no".
+        print("  meta.url is left empty: a TAXII object has no browsable URL.")
+        config["source_base_url"] = None
+    elif ask_yes_no("Link meta.url back to the %s?" % link_target, True,
+                    input_fn):
         netloc = config.get("source_host") or ""
         port = config.get("port")
         if port and port not in (80, 443):
@@ -3801,7 +3842,11 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
                      len(discovery["orgs"]), len(discovery["sharing_groups"])))
     config["discovery"] = discovery
 
-    _stage_feeds(config, discovery, input_fn, source=config["source"])
+    if config["source"] != "taxii":
+        # _stage_feeds only has MISP feeds to offer (and an explanatory note
+        # for OpenCTI); on TAXII it would silently set feeds=[] and return,
+        # which reads as a stage that ran and found nothing.
+        _stage_feeds(config, discovery, input_fn, source=config["source"])
     if config["source"] == "taxii":
         # TAXII has no local IOC-type menu (stage 3 asks collections
         # instead, above) and no separate quality stage -- everything that
@@ -3912,6 +3957,20 @@ def _opencti_iso_date(value):
         return False
 
 
+def taxii_added_after(config, now=None):
+    """days back -> the `added_after` timestamp, or None for no time filter.
+
+    Shared by _fetch_records and summarise_config deliberately: added_after
+    is the only filter TAXII applies server-side, and a summary that
+    computed it separately could describe a window the query does not have.
+    """
+    days = config.get("days")
+    if not days:
+        return None
+    moment = now or datetime.now(timezone.utc)
+    return _opencti_stamp(moment - timedelta(days=int(days)))
+
+
 def build_opencti_filters(config, now=None):
     """Interview answers -> the OpenCTI 6.x FilterGroup.  Pure, no I/O.
 
@@ -4009,7 +4068,7 @@ def summarise_config(config):
     if config.get("proxy"):
         lines.append("  proxy       : %s" % config["proxy"])
 
-    if source != "opencti":
+    if source == "misp":
         feeds = config.get("feeds") or []
         if feeds:
             lines.append("  feeds       : %d selected (one query each)" % len(feeds))
@@ -4020,15 +4079,31 @@ def summarise_config(config):
         else:
             lines.append("  feeds       : all of MISP (no feed restriction)")
 
-    types = config.get("types") or []
-    lines.append("  IOC types   : %d selected%s"
-                 % (len(types), " (%s)" % ", ".join(types[:6]) if types else ""))
+    if source == "taxii":
+        collections = config.get("collections") or []
+        if collections:
+            lines.append("  collections : %d selected (one query each)"
+                         % len(collections))
+            for collection in collections:
+                lines.append("                  %-28s via %s"
+                             % ((collection.get("title") or "?")[:28],
+                                collection.get("api_root") or "?"))
+        else:
+            lines.append("  collections : none selected -- this run would "
+                         "fetch nothing")
+    else:
+        types = config.get("types") or []
+        lines.append("  IOC types   : %d selected%s"
+                     % (len(types),
+                        " (%s)" % ", ".join(types[:6]) if types else ""))
     lines.append("  composites  : emit %s, subnets %s, hostname %s"
                  % (config.get("split_composites", "both"),
                     "on" if config.get("allow_subnet") else "off",
                     "as DOMAIN" if config.get("hostname_as_domain") else "dropped"))
 
-    if source == "opencti":
+    if source == "taxii":
+        pass  # every TAXII filter is post-download; see the block below
+    elif source == "opencti":
         lines.append("  quality     : min_score=%s min_confidence=%s revoked=%s "
                      "detection=%s expired=%s"
                      % (config.get("min_score", 0), config.get("min_confidence", 0),
@@ -4046,18 +4121,54 @@ def summarise_config(config):
             lines.append("  event state : threat_level<=%s analysis=%s"
                          % (config.get("threat_level"), config.get("analysis")))
 
-    mode = config.get("time_mode") or "all"
-    if mode == "last":
-        window = "last %s days (%s)" % (config.get("days"),
-                                        config.get("timestamp_field"))
-    elif mode == "range":
-        window = "%s .. %s" % (config.get("date_from") or "beginning",
-                               config.get("date_to") or "now")
+    if source == "taxii":
+        # The TAXII path never sets time_mode; reading it here reported an
+        # answered added_after window as "all time" -- misdescribing the one
+        # filter TAXII really does apply server-side, on the very screen the
+        # operator approves.
+        added_after = taxii_added_after(config)
+        if added_after:
+            lines.append("  window      : last %s days, sent as "
+                         "added_after=%s (server-side)"
+                         % (config.get("days"), added_after))
+        else:
+            lines.append("  window      : all time (no added_after sent)")
+        lines.append("  applied after download (TAXII cannot express these; "
+                     "they thin what is kept, not what is fetched):")
+        lines.append("      include labels  : %s"
+                     % (", ".join(config.get("include_labels") or []) or "all"))
+        lines.append("      exclude labels  : %s"
+                     % (", ".join(config.get("exclude_labels") or []) or "none"))
+        lines.append("      markings        : %s"
+                     % (", ".join(config.get("include_markings") or [])
+                        or "all"))
+        lines.append("      authors         : %s"
+                     % (", ".join(config.get("include_authors") or []) or "all"))
+        lines.append("      min confidence  : %s%s"
+                     % (config.get("min_confidence") or 0,
+                        "  (STIX 2.0 carries no confidence; this excludes "
+                        "nothing on a 2.0 feed)"
+                        if config.get("taxii_version") == "2.0"
+                        and config.get("min_confidence") else ""))
+        lines.append("      past valid_until: %s"
+                     % ("dropped" if config.get("drop_expired") else "kept"))
     else:
-        window = "all time"
-    lines.append("  window      : %s" % window)
+        mode = config.get("time_mode") or "all"
+        if mode == "last":
+            window = "last %s days (%s)" % (config.get("days"),
+                                            config.get("timestamp_field"))
+        elif mode == "range":
+            window = "%s .. %s" % (config.get("date_from") or "beginning",
+                                   config.get("date_to") or "now")
+        else:
+            window = "all time"
+        lines.append("  window      : %s" % window)
 
-    if source == "opencti":
+    if source == "taxii":
+        # The six lines above are the whole of the TAXII scope, and none of
+        # them resolves to a server-side id.
+        scope_fields = ()
+    elif source == "opencti":
         scope_fields = (("include labels", "include_labels",
                          "include_label_ids"),
                         ("exclude labels", "exclude_labels",
@@ -4107,7 +4218,12 @@ def summarise_config(config):
         lines.append("  profile     : %s" % config["profile_path"])
 
     lines.append("")
-    if source == "opencti":
+    if source == "taxii":
+        added_after = taxii_added_after(config)
+        lines.append("  TAXII query : match[type]=indicator%s  "
+                     "(one per collection)"
+                     % ("&added_after=%s" % added_after if added_after else ""))
+    elif source == "opencti":
         lines.append("  filters     : %s"
                      % json.dumps(build_opencti_filters(config), sort_keys=True))
     else:
@@ -4468,6 +4584,13 @@ def make_client(config):
     }
     if config.get("source") == "opencti":
         return OpenctiClient(**kwargs)
+    if config.get("source") == "taxii":
+        # A probe has no interview behind it, so the version falls back to
+        # the current default rather than to None, which the constructor
+        # rejects; _cmd_probe_taxii then detects the real one.
+        return TaxiiClient(version=config.get("taxii_version")
+                                   or TAXII_VERSIONS[0],
+                           username=config.get("taxii_username"), **kwargs)
     return MispClient(**kwargs)
 
 
@@ -4512,6 +4635,20 @@ def cmd_explain(args):
 
     print(summarise_config(config))
     print("")
+    if config.get("source") == "taxii":
+        collections = config.get("collections") or []
+        added_after = taxii_added_after(config)
+        if not collections:
+            print("No collections selected -- this profile would fetch "
+                  "nothing.")
+            return 0
+        print("%d GET request(s), one per collection:" % len(collections))
+        for collection in collections:
+            print("  %scollections/%s/objects/?match[type]=indicator%s"
+                  % (collection.get("api_root") or "?", collection.get("id"),
+                     "&added_after=%s" % added_after if added_after else ""))
+        return 0
+
     if config.get("source") == "opencti":
         print("One query to POST /graphql:")
         print("  " + json.dumps(build_opencti_filters(config), indent=2,
@@ -4571,7 +4708,41 @@ def cmd_probe(args):
 
     if args.source == "opencti":
         return _cmd_probe_opencti(client, args)
+    if args.source == "taxii":
+        return _cmd_probe_taxii(client, args)
     return _cmd_probe_misp(client, args)
+
+
+def _cmd_probe_taxii(client, args):
+    """What this TAXII endpoint is, and what it will let us read."""
+    try:
+        # A probe has no interview to have asked the version, so it detects
+        # one rather than assuming the 2.1 the client was built at.
+        client.version = client.detect_version()
+        version = client.get_version()
+        collections = client.get_collections()
+    except SourceAuthError as exc:
+        print("authentication failed: %s" % exc, file=sys.stderr)
+        return 2
+    except SourceError as exc:
+        print("connection failed: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("Connected to %s" % client.base_url)
+    print("  TAXII version : %s" % version.get("version", "unknown"))
+    print("  title         : %s" % version.get("title", "unknown"))
+
+    print("\nCollections (%d)" % len(collections))
+    for collection in collections:
+        print("  %-40s %s" % ((collection["title"] or "")[:40],
+                              collection["api_root"]))
+    if not collections:
+        print("  none readable -- check the API root permissions for this "
+              "account")
+        return 1
+    print("\nOnly match[type]=indicator and added_after are filtered on the "
+          "server;\neverything else Nexus asks for is applied after download.")
+    return 0
 
 
 def _cmd_probe_misp(client, args):
@@ -5019,6 +5190,12 @@ def cmd_build(args):
         # config["types"] is in main_observable_type form for the server-side
         # filter; the records build_indicators sees are one level finer.
         wanted_types = opencti_record_types(config["types"])
+    elif config.get("source") == "taxii":
+        # parse_stix_pattern already emits OPENCTI_TO_ZEEK keys, so there is
+        # no vocabulary to expand.  types is None (every mappable type)
+        # unless stage 3's hostname answer narrowed it.
+        table = OPENCTI_TO_ZEEK
+        wanted_types = config.get("types")
     else:
         table = MISP_TO_ZEEK
         wanted_types = config["types"]
@@ -5119,12 +5296,41 @@ def _fetch_records(client, config):
     """Yield records from whichever platform the config names.
 
     OpenCTI expresses its whole query as one FilterGroup, so it is a single
-    call.  MISP needs the per-feed fan-out below: two feeds identified by
+    call.  TAXII gets one query per selected collection -- a collection is
+    the only thing its query syntax can scope to -- and then filters what
+    came back locally.  MISP needs the per-feed fan-out below: two feeds identified by
     different mechanisms -- one by fixed event, one by tag -- cannot be
     expressed in a single restSearch body, so each gets its own query and the
     results are merged.  build_indicators() dedupes across them, so an
     indicator carried by two feeds is written once.
     """
+    if config.get("source") == "taxii":
+        added_after = taxii_added_after(config)
+        stats = config.get("_stats")
+        budget = config.get("max_indicators")
+        seen = 0
+        for collection in config.get("collections") or []:
+            remaining = None if budget is None else max(0, budget - seen)
+            if remaining == 0:
+                log.warning("indicator budget spent before collection %s",
+                            collection.get("title") or collection.get("id"))
+                return
+            log.info("fetching collection %s",
+                     collection.get("title") or collection.get("id"))
+            for obj in client.fetch_objects(collection,
+                                            added_after=added_after,
+                                            max_results=remaining):
+                for record in flatten_taxii_object(
+                        obj, collection_title=collection.get("title"),
+                        stats=stats):
+                    # Everything but match[type] and added_after is filtered
+                    # here, after the object has already crossed the wire.
+                    if not taxii_object_allowed(record, config):
+                        continue
+                    seen += 1
+                    yield record
+        return
+
     if config.get("source") == "opencti":
         filters = build_opencti_filters(config)
         for record in client.search_indicators(
