@@ -2330,9 +2330,15 @@ class TestOfflineInterview(Quiet):
         self.assertEqual(config["output_path"], "./intel.dat")
 
     def test_offline_never_applies(self):
-        config = self.run_it(offline=True)
+        feed = scripted(["misp.example"], fill="")
+        config = nexus.run_interview(
+            None, input_fn=feed, getpass_fn=lambda prompt: "tok",
+            source="misp", offline=True)
         self.assertIs(config["apply"], False)
         self.assertEqual(config["deployment"], "offline")
+        # Not just "the answer came back False" -- the question must never
+        # be asked at all off-box.
+        self.assertFalse(any("Apply to" in p for p in feed.state["prompts"]))
 
     def test_offline_flag_is_recorded_in_the_config(self):
         self.assertIs(self.run_it(offline=True)["offline"], True)
