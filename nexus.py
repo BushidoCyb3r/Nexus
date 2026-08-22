@@ -3864,7 +3864,7 @@ def print_transfer_instructions(path):
     print("  1. Merge it (keeps the indicators already there):")
     print("       python3 nexus.py --import %s" % os.path.basename(path))
     print("  2. Or put it in place by hand:")
-    print("       sudo cp %s %s/" % (os.path.basename(path), SO_INTEL_DIR))
+    print("       sudo cp %s %s" % (os.path.basename(path), SO_INTEL_FILE))
     print("     This REPLACES the manager's intel.dat. Safe on a fresh")
     print("     install; on a manager that has been running, it drops every")
     print("     indicator not in this file.")

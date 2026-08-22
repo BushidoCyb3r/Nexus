@@ -4789,6 +4789,22 @@ class TestOpenctiEndToEnd(unittest.TestCase):
         self.assertEqual(removed, [])
 
 
+class TestTransferInstructions(Quiet):
+    """The hand-copy route printed after an offline build."""
+
+    def test_the_hand_copy_names_the_destination_file(self):
+        # The output path is free-form and dating an export is natural for a
+        # sneakernet workflow.  Copying by source name drops a file Zeek never
+        # loads beside the real intel.dat, with no error to notice.
+        nexus.print_transfer_instructions(
+            "/home/op/exports/misp-2026-08-22.dat")
+        copies = [l.strip() for l in self.printed.splitlines()
+                  if l.strip().startswith("sudo cp")]
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0].endswith(nexus.SO_INTEL_FILE), copies[0])
+        self.assertNotIn("misp-2026-08-22.dat", copies[0].split()[-1])
+
+
 class TestResolveBuildTarget(unittest.TestCase):
     def _args(self, **kw):
         return argparse.Namespace(offline=kw.get("offline", False))
