@@ -2349,6 +2349,21 @@ class TestOfflineInterview(Quiet):
         self.assertEqual(config["output_path"], nexus.SO_INTEL_FILE)
         self.assertEqual(config["deployment"], "distributed")
 
+    def test_offline_saves_the_profile_beside_the_output_file(self):
+        # "Save these answers as a profile?" defaults to yes, and /opt/nexus
+        # is not writable on a workstation -- same reason the offline backups
+        # moved.  Left in PROFILE_DIR the save dies in os.makedirs, so
+        # --offline --profile ... could never be bootstrapped on its own host.
+        config = self.run_it(offline=True)
+        self.assertEqual(
+            config["profile_path"],
+            os.path.join(os.path.dirname(os.path.abspath(
+                config["output_path"])), "nexus.json"))
+
+    def test_manager_mode_still_saves_the_profile_under_nexus_home(self):
+        self.assertEqual(self.run_it(offline=False)["profile_path"],
+                         os.path.join(nexus.PROFILE_DIR, "nexus.json"))
+
     def test_offline_is_not_dropped_by_a_profile_round_trip(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -4613,6 +4628,14 @@ class TestOfflineBuild(Quiet):
         saved = os.listdir(os.path.join(self.dir, "nexus-backups"))
         self.assertEqual(len(saved), 1)
         self.assertTrue(saved[0].startswith("intel.dat."))
+
+    def test_the_offline_profile_is_written_where_the_interview_put_it(self):
+        # The end-to-end half of the same point: no /opt/nexus anywhere on
+        # this host, and the save still happens rather than warning past it.
+        profile = os.path.join(self.dir, "laptop.json")
+        self.assertEqual(self.build(self.config(profile_path=profile)), 0)
+        self.assertTrue(os.path.exists(profile))
+        self.assertIn(profile, self.printed)
 
     def test_a_profile_replay_honours_its_recorded_answer_without_asking(self):
         profile = os.path.join(self.dir, "offline.json")

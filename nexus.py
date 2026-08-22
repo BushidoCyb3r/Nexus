@@ -3224,7 +3224,12 @@ def _stage8_output(config, input_fn, offline=False):
         name = ask_required("Profile name", "nexus", input_fn)
         if not name.endswith(".json"):
             name += ".json"
-        config["profile_path"] = os.path.join(PROFILE_DIR, name)
+        # Off-box there is no writable /opt/nexus, and the output directory is
+        # the one place check_output_target proves we can write -- same reason
+        # the offline backups live there.
+        directory = (os.path.dirname(os.path.abspath(config["output_path"]))
+                     if offline else PROFILE_DIR)
+        config["profile_path"] = os.path.join(directory, name)
 
     if offline:
         config["apply"] = False

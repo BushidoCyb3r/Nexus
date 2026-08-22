@@ -43,7 +43,7 @@ python3 nexus.py --apply              # push existing intel.dat to the grid
 python3 nexus.py --explain --profile daily          # show the resolved platform query
 python3 nexus.py --profile daily --yes              # unattended
 python3 nexus.py --profile daily --dry-run --diff   # build and compare, write nothing
-python3 nexus.py --offline --profile laptop --yes   # build for transfer, on a host with no SO installed
+python3 nexus.py --offline --profile ./laptop.json --yes  # build for transfer, on a host with no SO installed
 python3 nexus.py --import /media/usb/intel.dat      # merge a transferred file into this manager's intel.dat
 python3 nexus.py --import /media/usb/intel.dat --yes  # merge unattended; also applies to the grid
 ```
@@ -259,13 +259,17 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
   by `print_transfer_instructions`, and the hand-copy route says so at the
   point of use. It stays supported anyway, because an operator who cannot run
   Python on the manager has no other route in.
-- **Offline builds back up to `nexus-backups/`, not `/opt/nexus/backups`.**
-  `/opt/nexus` is a manager-only directory; it does not exist and is not
-  writable on an arbitrary offline host. `cmd_build` under `--offline`
-  backs up to `nexus-backups/` next to the output file instead, same
-  retention count. Without this, a second offline build over the same
-  output path used to crash in `os.makedirs`. `cmd_import` (which only
-  ever runs on a manager) still uses `/opt/nexus/backups`.
+- **Offline builds keep their backups and their profile beside the output
+  file, not under `/opt/nexus`.** `/opt/nexus` is a manager-only directory; it
+  does not exist and is not writable on an arbitrary offline host. Under
+  `--offline` the interview defaults the profile to the output directory and
+  `cmd_build` backs up to `nexus-backups/` next to the output file, same
+  retention count. Without this, a second offline build over the same output
+  path used to crash in `os.makedirs` and the default profile save died the
+  same way. Because an offline profile is a path rather than a bare name,
+  replay it as `--profile ./laptop.json`, not `--profile laptop` (a bare name
+  always resolves under `/opt/nexus/profiles`). `cmd_import` (which only ever
+  runs on a manager) still uses `/opt/nexus/backups`.
 - **"Append-only" does not currently cover operator comment lines.** `read_existing`
   filters out any line in the live `intel.dat` that starts with `#` (other than
   the `#fields` header), so a hand-written `#` comment does not survive a
