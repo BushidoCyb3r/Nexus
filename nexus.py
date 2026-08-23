@@ -3350,10 +3350,14 @@ def _stage_feeds(config, discovery, input_fn, source="misp"):
         for feed in selectable:
             _, _, why = feed_provenance(feed)
             state = "enabled" if feed["enabled"] else "disabled"
+            # (value, annotation) pairs.  `_opt_parts` unpacks two-tuples only;
+            # a longer tuple comes back as its own repr and the id lookup
+            # below can never match, so the name rides in the annotation.
             options.append((
                 feed["id"],
-                feed["name"],
-                "%s, %s, %s" % (feed["provider"] or "no provider", state, why),
+                "%s -- %s, %s, %s" % (feed["name"],
+                                      feed["provider"] or "no provider",
+                                      state, why),
             ))
         chosen = ask_multi("Feeds to pull from", options, [], input_fn)
         by_id = dict((f["id"], f) for f in selectable)
@@ -3442,12 +3446,7 @@ def _stage3_collections_taxii(config, discovery, input_fn):
     which collection(s) to query.  Reuses ask_multi the way every *working*
     caller in this file does it -- (value, single annotation) pairs -- and
     then maps the chosen ids back to the full collection dicts, the same
-    two-step `_stage_feeds` uses.  `_stage_feeds` itself builds 3-tuple
-    options; `_opt_parts` only unpacks a 2-tuple, so a 3-tuple's value comes
-    back as the tuple's own repr and the id lookup below can never match --
-    that is a pre-existing, pre-dates-this-branch bug in `_stage_feeds`
-    (confirmed no test exercises its selection path), not a pattern worth
-    reproducing here.
+    two-step `_stage_feeds` uses.
     """
     _stage(3, "Collections")
     # TAXII values come out of parse_stix_pattern against OPENCTI_TO_ZEEK, the

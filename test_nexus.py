@@ -3188,6 +3188,41 @@ class TestOpenctiInterviewStages(Quiet):
         self.assertIn("Not applicable to OpenCTI", out.getvalue())
         self.assertEqual(config["feeds"], [])
 
+    def test_selecting_one_misp_feed_returns_that_feed(self):
+        """The selection has to survive `ask_multi` and the id lookup.
+
+        `ask_multi` returns option *values*, and `_opt_parts` only unpacks a
+        two-tuple -- a longer option comes back as its own repr, which no feed
+        id can ever match, so the run silently pulls all of MISP instead of the
+        one feed the operator picked.
+        """
+        discovery = {"feeds": [
+            {"id": "1", "name": "alpha", "provider": "Alpha Inc",
+             "enabled": True, "tag_name": "feed:alpha"},
+            {"id": "2", "name": "beta", "provider": "Beta Ltd",
+             "enabled": True, "fixed_event": True, "event_id": 77},
+        ]}
+        config = {}
+        # "yes" to restricting, then option 2 -- deliberately not the first,
+        # so an off-by-one or a fall-through to "everything" is visible.
+        with contextlib.redirect_stdout(io.StringIO()):
+            nexus._stage_feeds(config, discovery, scripted(["y", "2"]))
+        self.assertEqual([f["name"] for f in config["feeds"]], ["beta"])
+        self.assertEqual(config["source_fmt"], "MISP-feed-{feed}")
+
+    def test_the_feed_menu_still_shows_each_feed_name(self):
+        """Moving the name into the annotation must not hide it."""
+        discovery = {"feeds": [
+            {"id": "1", "name": "alpha", "provider": "Alpha Inc",
+             "enabled": False, "tag_name": "feed:alpha"},
+        ]}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            nexus._stage_feeds({}, discovery, scripted(["y", "1"]))
+        printed = out.getvalue()
+        self.assertIn("alpha", printed)
+        self.assertIn("Alpha Inc", printed)
+        self.assertIn("disabled", printed)
+
     def test_ioc_stage_offers_opencti_classes(self):
         discovery = {"counts": {"IPv4-Addr": (100, True)},
                      "types": ["IPv4-Addr", "Domain-Name"]}
@@ -3805,12 +3840,6 @@ class TestRunGuardrails(unittest.TestCase):
             rows, existing_count=None, intel_dir=None, warn_at=3, cap=10)
         size_verdicts = [v for v in verdicts if "indicators" in v.message and "warn threshold" in v.message]
         self.assertTrue(any(v.level == "warn" for v in size_verdicts))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -6957,6 +6986,7 @@ class TestEnsureIntelEnv(Quiet):
         open(os.path.join(self.tmp, nexus.SO_LOAD_FILE), "w").close()
         self.assertFalse(nexus.ensure_intel_env(True))
         self.assertIn("Environment is not ready", self.printed)
+
 
 
 if __name__ == "__main__":
