@@ -6989,5 +6989,309 @@ class TestEnsureIntelEnv(Quiet):
 
 
 
+# ---------------------------------------------------------------------------
+# SYSTEMD TIMER
+# ---------------------------------------------------------------------------
+
+def _timer_args(**over):
+    """An argparse namespace shaped like the one main() hands cmd_install_timer."""
+    base = {"profile": None, "yes": False, "dry_run": False, "token_file": None}
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+class TestRenderUnitFiles(unittest.TestCase):
+
+    def units(self, **kw):
+        kw.setdefault("profile", "/opt/nexus/profiles/misp.json")
+        kw.setdefault("oncalendar", "*-*-* 02:00:00")
+        return nexus.render_unit_files(**kw)
+
+    def test_the_service_replays_the_named_profile_unattended(self):
+        service, _ = self.units(python="/usr/bin/python3",
+                                script="/opt/nexus/nexus.py")
+        exec_lines = [l for l in service.splitlines()
+                      if l.startswith("ExecStart=")]
+        self.assertEqual(len(exec_lines), 1)
+        # --yes is what makes it unattended; without it the timed run stops at
+        # the first prompt and nothing is ever built.
+        self.assertIn("--profile /opt/nexus/profiles/misp.json", exec_lines[0])
+        self.assertIn("--yes", exec_lines[0])
+        self.assertIn("/usr/bin/python3 /opt/nexus/nexus.py", exec_lines[0])
+
+    def test_the_service_reads_credentials_from_an_optional_env_file(self):
+        service, _ = self.units()
+        # Leading "-" so a host keeping its token in credentials.json still
+        # starts instead of failing on a missing file.
+        self.assertIn("EnvironmentFile=-%s" % nexus.NEXUS_ENV_FILE, service)
+
+    def test_the_service_waits_for_routable_networking(self):
+        service, _ = self.units()
+        self.assertIn("Wants=network-online.target", service)
+        self.assertIn("After=network-online.target", service)
+
+    def test_the_service_is_oneshot_not_a_daemon(self):
+        service, _ = self.units()
+        self.assertIn("Type=oneshot", service)
+
+    def test_the_timer_carries_the_chosen_calendar(self):
+        _, timer = self.units(oncalendar="Sun *-*-* 03:00:00")
+        self.assertIn("OnCalendar=Sun *-*-* 03:00:00", timer)
+
+    def test_the_timer_catches_up_a_missed_run(self):
+        _, timer = self.units()
+        self.assertIn("Persistent=true", timer)
+
+    def test_the_timer_spreads_the_load_off_the_exact_second(self):
+        _, timer = self.units(delay_seconds=900)
+        self.assertIn("RandomizedDelaySec=900", timer)
+
+    def test_the_timer_installs_into_timers_target(self):
+        _, timer = self.units()
+        self.assertIn("[Install]", timer)
+        self.assertIn("WantedBy=timers.target", timer)
+
+    def test_rendering_writes_nothing(self):
+        before = os.path.exists(os.path.join(nexus.SYSTEMD_DIR,
+                                             nexus.SYSTEMD_SERVICE))
+        self.units()
+        self.assertEqual(
+            os.path.exists(os.path.join(nexus.SYSTEMD_DIR,
+                                        nexus.SYSTEMD_SERVICE)), before)
+
+
+class TestTimerPreconditions(Quiet):
+    """Each of these fails at 02:00 with nobody watching, so it fails here."""
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # A real systemd host and a writable unit directory, so each test
+        # below isolates the one precondition it is about.
+        self.patch(nexus, "SYSTEMD_MARKER", self.tmp)
+        self.patch(nexus, "SYSTEMD_DIR", self.tmp)
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "tok")
+        os.environ.pop("NEXUS_TAXII_USERNAME", None)
+
+    def patch(self, obj, name, value):
+        old = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, old)
+
+    def check(self, config, **kw):
+        return nexus.check_timer_preconditions(_timer_args(**kw), config,
+                                               "/p.json")
+
+    def test_a_normal_manager_profile_passes(self):
+        ok, findings = self.check({"apply": True})
+        self.assertTrue(ok)
+        self.assertEqual([f for f in findings if f[0] == "error"], [])
+
+    def test_a_host_without_systemd_is_refused(self):
+        self.patch(nexus, "SYSTEMD_MARKER", os.path.join(self.tmp, "absent"))
+        ok, findings = self.check({"apply": True})
+        self.assertFalse(ok)
+        self.assertIn("not running systemd", " ".join(m for _, m in findings))
+
+    def test_an_unwritable_unit_directory_is_refused(self):
+        os.chmod(self.tmp, 0o500)
+        self.addCleanup(os.chmod, self.tmp, 0o700)
+        if os.access(self.tmp, os.W_OK):
+            self.skipTest("running as root; the mode bits do not apply")
+        ok, findings = self.check({"apply": True})
+        self.assertFalse(ok)
+        self.assertIn("not writable", " ".join(m for _, m in findings))
+
+    def test_an_offline_profile_is_refused(self):
+        # It builds a file for transfer to another host; there is nothing on
+        # this one for a schedule to act on.
+        ok, findings = self.check({"apply": False, "offline": True})
+        self.assertFalse(ok)
+        self.assertIn("offline profile", " ".join(m for _, m in findings))
+
+    def test_no_reachable_token_is_refused(self):
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "")
+        ok, findings = self.check({"apply": True})
+        self.assertFalse(ok)
+        self.assertIn("no API token reachable",
+                      " ".join(m for _, m in findings))
+
+    def test_the_token_is_probed_the_way_the_timer_will_ask_for_it(self):
+        seen = []
+
+        def fake(args, interactive=True):
+            seen.append(interactive)
+            return "tok"
+
+        self.patch(nexus, "resolve_token", fake)
+        self.check({"apply": True})
+        # interactive=True would return a getpass prompt nobody answers, and
+        # the install would pass on a credential the timer cannot reach.
+        self.assertEqual(seen, [False])
+
+    def test_taxii_basic_without_the_username_in_the_environment_is_refused(self):
+        ok, findings = self.check({"apply": True, "source": "taxii",
+                                   "taxii_auth": "basic"})
+        self.assertFalse(ok)
+        self.assertIn("NEXUS_TAXII_USERNAME",
+                      " ".join(m for _, m in findings))
+
+    def test_taxii_basic_with_the_username_in_the_environment_passes(self):
+        os.environ["NEXUS_TAXII_USERNAME"] = "analyst-one"
+        self.addCleanup(os.environ.pop, "NEXUS_TAXII_USERNAME", None)
+        ok, _ = self.check({"apply": True, "source": "taxii",
+                            "taxii_auth": "basic"})
+        self.assertTrue(ok)
+
+    def test_taxii_bearer_needs_no_username(self):
+        ok, _ = self.check({"apply": True, "source": "taxii",
+                            "taxii_auth": "bearer"})
+        self.assertTrue(ok)
+
+    def test_a_profile_that_never_applies_warns_but_installs(self):
+        ok, findings = self.check({"apply": False})
+        self.assertTrue(ok)
+        self.assertIn("does not apply to the grid",
+                      " ".join(m for l, m in findings if l == "warn"))
+
+
+class TestInstallTimerCommand(Quiet):
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.units = os.path.join(self.tmp, "systemd")
+        os.makedirs(self.units)
+        self.patch(nexus, "SYSTEMD_DIR", self.units)
+        self.patch(nexus, "SYSTEMD_MARKER", self.tmp)
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "tok")
+        # systemd-analyze is not present on every host the suite runs on, and
+        # its absence must not be what a test is measuring.
+        self.patch(nexus, "describe_calendar", lambda spec: None)
+        self.profile = os.path.join(self.tmp, "misp.json")
+        nexus.save_profile({"source": "misp", "apply": True}, self.profile)
+
+    def patch(self, obj, name, value):
+        old = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, old)
+
+    def run_cmd(self, answers, **kw):
+        args = _timer_args(profile=self.profile, **kw)
+        return nexus.cmd_install_timer(args, scripted(answers))
+
+    def paths(self):
+        return (os.path.join(self.units, nexus.SYSTEMD_SERVICE),
+                os.path.join(self.units, nexus.SYSTEMD_TIMER))
+
+    def test_declining_the_confirmation_writes_nothing(self):
+        # "1" = the daily schedule, "n" = do not write.
+        self.assertEqual(self.run_cmd(["1", "n"]), 0)
+        for path in self.paths():
+            self.assertFalse(os.path.exists(path))
+        self.assertIn("Nothing written", self.printed)
+
+    def test_the_confirmation_defaults_to_not_writing(self):
+        # Empty answer, not "n": a bare Enter must not install units.
+        self.assertEqual(self.run_cmd(["1", ""]), 0)
+        for path in self.paths():
+            self.assertFalse(os.path.exists(path))
+
+    def test_accepting_writes_both_units(self):
+        self.assertEqual(self.run_cmd(["1", "y"]), 0)
+        service, timer = self.paths()
+        self.assertTrue(os.path.exists(service))
+        self.assertTrue(os.path.exists(timer))
+        with open(timer, encoding="utf-8") as handle:
+            self.assertIn("OnCalendar=*-*-* 02:00:00", handle.read())
+
+    def test_the_chosen_schedule_reaches_the_timer(self):
+        # Option 4 is the weekly one; picking the first would pass even if the
+        # answer were ignored, since daily is also the offered default.
+        self.assertEqual(self.run_cmd(["4", "y"]), 0)
+        with open(self.paths()[1], encoding="utf-8") as handle:
+            self.assertIn("OnCalendar=Sun *-*-* 03:00:00", handle.read())
+
+    def test_a_dry_run_writes_nothing_and_asks_nothing(self):
+        # No answer for a confirmation prompt: if one is asked, scripted()
+        # raises EOFError and the test fails rather than passing quietly.
+        self.assertEqual(self.run_cmd(["1"], dry_run=True), 0)
+        for path in self.paths():
+            self.assertFalse(os.path.exists(path))
+        self.assertIn("Dry run", self.printed)
+
+    def test_yes_skips_the_confirmation_but_not_the_schedule(self):
+        self.assertEqual(self.run_cmd(["1"], yes=True), 0)
+        self.assertTrue(os.path.exists(self.paths()[0]))
+
+    def test_the_units_are_shown_before_anything_is_written(self):
+        self.run_cmd(["1", "n"])
+        self.assertIn("ExecStart=", self.printed)
+        self.assertIn("OnCalendar=", self.printed)
+
+    def test_nothing_is_enabled_and_the_commands_are_printed_instead(self):
+        self.run_cmd(["1", "y"])
+        # Enabling a timer is the operator's decision, so the install stops at
+        # the files and hands over the exact commands either way.
+        self.assertIn("systemctl enable --now nexus.timer", self.printed)
+        self.assertIn("systemctl disable --now nexus.timer", self.printed)
+
+    def test_an_existing_unit_is_flagged_as_an_overwrite(self):
+        with open(self.paths()[0], "w", encoding="utf-8") as handle:
+            handle.write("[Unit]\n")
+        self.run_cmd(["1", "n"])
+        self.assertIn("already exists and will be overwritten", self.printed)
+
+    def test_a_failing_precondition_stops_before_the_schedule_question(self):
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "")
+        # No answers at all: reaching any prompt raises EOFError.
+        args = _timer_args(profile=self.profile)
+        self.assertEqual(nexus.cmd_install_timer(args, scripted([])), 1)
+        for path in self.paths():
+            self.assertFalse(os.path.exists(path))
+
+    def test_an_unreadable_profile_is_reported_not_raised(self):
+        args = _timer_args(profile=os.path.join(self.tmp, "absent.json"))
+        self.assertEqual(nexus.cmd_install_timer(args, scripted([])), 1)
+        self.assertIn("Cannot read", self.printed)
+
+
+class TestInstallTimerCli(unittest.TestCase):
+
+    def test_the_flag_parses_and_defaults_off(self):
+        args = nexus.build_parser().parse_args([])
+        self.assertFalse(args.install_timer)
+        args = nexus.build_parser().parse_args(["--install-timer"])
+        self.assertTrue(args.install_timer)
+
+    def test_main_dispatches_to_the_install(self):
+        seen = []
+        self.addCleanup(setattr, nexus, "cmd_install_timer",
+                        nexus.cmd_install_timer)
+        nexus.cmd_install_timer = lambda a, i=None: seen.append(a) or 0
+        self.assertEqual(nexus.main(["--install-timer"]), 0)
+        self.assertEqual(len(seen), 1)
+
+    def test_install_timer_with_yes_does_not_need_a_profile_flag(self):
+        # The --yes gate exists to catch an unattended *build* with nothing to
+        # answer with; an install picks its profile from disk.
+        seen = []
+        self.addCleanup(setattr, nexus, "cmd_install_timer",
+                        nexus.cmd_install_timer)
+        nexus.cmd_install_timer = lambda a, i=None: seen.append(a) or 0
+        self.assertEqual(nexus.main(["--install-timer", "--yes"]), 0)
+        self.assertEqual(len(seen), 1)
+
+    def test_a_build_never_installs_a_timer(self):
+        # Nothing outside --install-timer may write a unit file.
+        source = open(nexus.__file__, encoding="utf-8").read()
+        callers = [line for line in source.splitlines()
+                   if "render_unit_files(" in line]
+        self.assertEqual(len(callers), 2)  # the def, and cmd_install_timer
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

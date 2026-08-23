@@ -4509,6 +4509,303 @@ def print_transfer_instructions(path):
 
 
 # ---------------------------------------------------------------------------
+# SCHEDULE
+# ---------------------------------------------------------------------------
+
+# Never installed as a side effect of anything.  A scheduled run rewrites the
+# grid's intel file unattended, so it exists only when an operator asks for it
+# by name with --install-timer.
+SYSTEMD_DIR = "/etc/systemd/system"
+SYSTEMD_SERVICE = "nexus.service"
+SYSTEMD_TIMER = "nexus.timer"
+# systemd creates this on boot; its absence means the host is not running
+# systemd and the units would be inert files.
+SYSTEMD_MARKER = "/run/systemd/system"
+# Read by the unit as EnvironmentFile.  The two credentials a replayed profile
+# deliberately does not store (NEXUS_TOKEN, NEXUS_TAXII_USERNAME) have nowhere
+# else to come from under a timer -- there is no terminal to ask.
+NEXUS_ENV_FILE = os.path.join(NEXUS_HOME, "nexus.env")
+
+SCHEDULE_CHOICES = (
+    ("daily", "once a day at 02:00"),
+    ("six-hourly", "every six hours, on the hour"),
+    ("hourly", "every hour"),
+    ("weekly", "Sundays at 03:00"),
+    ("custom", "type a systemd OnCalendar expression"),
+)
+
+SCHEDULE_CALENDAR = {
+    "daily": "*-*-* 02:00:00",
+    "six-hourly": "*-*-* 00/6:00:00",
+    "hourly": "*-*-* *:00:00",
+    "weekly": "Sun *-*-* 03:00:00",
+}
+
+
+def render_unit_files(profile, oncalendar, python=None, script=None,
+                      log_file=None, delay_seconds=900):
+    """The two unit file bodies, as text.  Writes nothing.
+
+    Separate from the install so the exact bytes can be shown to the operator
+    before anything lands in /etc, and asserted on in a test without root.
+    """
+    python = python or sys.executable or "/usr/bin/python3"
+    script = script or os.path.abspath(__file__)
+    log_file = log_file or os.path.join(NEXUS_HOME, "logs", "nexus.log")
+
+    # --yes is what makes it unattended; without it the run stops at the first
+    # prompt and the timer silently accomplishes nothing.
+    exec_start = ("%s %s --profile %s --yes --log-file %s"
+                  % (python, script, profile, log_file))
+
+    service = "\n".join((
+        "[Unit]",
+        "Description=Nexus threat intelligence build for Zeek",
+        # A build with nothing to fetch from is a wasted run and a confusing
+        # log line, so the timer waits for routable networking, not just for
+        # the interface to exist.
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        # Leading "-" so a host that keeps its credentials somewhere else
+        # (NEXUS_HOME/credentials.json, or the environment) still starts.
+        "EnvironmentFile=-%s" % NEXUS_ENV_FILE,
+        # The salt apply and the manager's intel directory are both root-owned;
+        # dropping privileges here would only move the problem into sudo.
+        "User=root",
+        "ExecStart=%s" % exec_start,
+        "",
+    ))
+
+    timer = "\n".join((
+        "[Unit]",
+        "Description=Scheduled Nexus threat intelligence build",
+        "",
+        "[Timer]",
+        "OnCalendar=%s" % oncalendar,
+        # Every node behind this timer would otherwise hit the platform on the
+        # same second.
+        "RandomizedDelaySec=%d" % delay_seconds,
+        # A manager that was down at 02:00 still gets its build, rather than
+        # waiting a full period with a stale file.
+        "Persistent=true",
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    ))
+    return service, timer
+
+
+def describe_calendar(oncalendar):
+    """`systemd-analyze calendar` output, or None when it cannot be run.
+
+    A syntactically valid expression can still be the wrong one, and the next
+    elapse is the only thing that shows the operator which they typed.
+    """
+    try:
+        result = subprocess.run(["systemd-analyze", "calendar", oncalendar],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = result.stdout.decode("utf-8", "replace").strip()
+    if result.returncode != 0:
+        return ("invalid", text)
+    return ("ok", text)
+
+
+def check_timer_preconditions(args, config, profile):
+    """Can a timed replay of this profile actually succeed?  (ok, findings).
+
+    Everything here is a thing that fails at 02:00 with nobody watching, so it
+    is checked at install time instead: no systemd, no writable unit
+    directory, no reachable credential, or a profile that builds a file and
+    then never applies it.
+    """
+    findings = []
+    ok = True
+
+    if not os.path.isdir(SYSTEMD_MARKER):
+        findings.append(("error", "%s is absent -- this host is not running "
+                                  "systemd, so the units would never fire"
+                         % SYSTEMD_MARKER))
+        ok = False
+    if not os.access(SYSTEMD_DIR, os.W_OK):
+        findings.append(("error", "%s is not writable; re-run with sudo"
+                         % SYSTEMD_DIR))
+        findings.append(("fix", "sudo %s --install-timer" % sys.argv[0]))
+        ok = False
+
+    if config.get("offline"):
+        findings.append(("error", "%s is an offline profile -- it builds a "
+                                  "file for transfer to another host, which "
+                                  "is not something to schedule here"
+                         % profile))
+        ok = False
+
+    # resolve_token's own precedence, asked the way the timer will ask it.
+    # The value is only ever tested for emptiness; it is not logged or kept.
+    if not resolve_token(args, interactive=False):
+        findings.append(("error", "no API token reachable without a terminal"))
+        findings.append(("fix", "put NEXUS_TOKEN=... in %s (chmod 0600), or "
+                                "a token in %s/credentials.json"
+                         % (NEXUS_ENV_FILE, NEXUS_HOME)))
+        ok = False
+
+    if config.get("source") == "taxii" and config.get("taxii_auth") == "basic":
+        if not (os.environ.get("NEXUS_TAXII_USERNAME") or "").strip():
+            findings.append(("error", "this profile uses TAXII Basic auth and "
+                                      "the username is never stored"))
+            findings.append(("fix", "put NEXUS_TAXII_USERNAME=... in %s "
+                                    "(chmod 0600)" % NEXUS_ENV_FILE))
+            ok = False
+
+    if not config.get("apply"):
+        # Not fatal -- an operator may well want the file staged and the apply
+        # done by hand -- but it must not be a surprise.
+        findings.append(("warn", "this profile does not apply to the grid, so "
+                                 "each timed build stages the file and stops; "
+                                 "run %s afterwards" % SO_APPLY_CMD))
+    return ok, findings
+
+
+def _list_profiles():
+    directory = os.path.join(NEXUS_HOME, "profiles")
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+    except OSError:
+        return []
+    return [os.path.join(directory, n) for n in names]
+
+
+def _ask_profile(args, input_fn=input):
+    """Which profile the timer replays.  --profile skips the question."""
+    if args.profile:
+        return profile_path(args.profile)
+    found = _list_profiles()
+    if not found:
+        print("No profiles in %s/profiles. Run a build and save one first, "
+              "or pass --profile PATH." % NEXUS_HOME)
+        return None
+    if len(found) == 1:
+        # Still shown rather than assumed silently -- the unit file names it
+        # and the operator is about to approve that text.
+        print("Using the only saved profile: %s" % found[0])
+        return found[0]
+    return ask_choice("Profile to run on the timer", found, found[0], input_fn)
+
+
+def _ask_calendar(input_fn=input):
+    choice = ask_choice("Schedule", list(SCHEDULE_CHOICES), "daily", input_fn)
+    if choice != "custom":
+        return SCHEDULE_CALENDAR[choice]
+    while True:
+        spec = ask_required(
+            "OnCalendar expression (e.g. Mon,Thu *-*-* 04:30:00)", None,
+            input_fn)
+        described = describe_calendar(spec)
+        if described is None:
+            print("  systemd-analyze is not available here, so %r cannot be "
+                  "checked; systemctl will reject it if it is wrong." % spec)
+            return spec
+        state, text = described
+        if state == "ok":
+            print("  " + text.replace("\n", "\n  "))
+            return spec
+        print("  systemd rejects that expression:")
+        print("  " + text.replace("\n", "\n  "))
+
+
+def cmd_install_timer(args, input_fn=input):
+    """--install-timer: write nexus.service and nexus.timer, on request only."""
+    print("Nexus %s -- systemd timer install" % __version__)
+
+    try:
+        profile = _ask_profile(args, input_fn)
+    except InterviewAborted as exc:
+        print("\nAborted: %s" % exc)
+        return 130
+    if not profile:
+        return 1
+    try:
+        config = load_profile(profile)
+    except (OSError, ValueError) as exc:
+        print("Cannot read %s: %s" % (profile, exc))
+        return 1
+
+    ok, findings = check_timer_preconditions(args, config, profile)
+    for level, message in findings:
+        print(LEVEL_PREFIX.get(level, "  ") + message)
+    if not ok:
+        return 1
+
+    try:
+        oncalendar = _ask_calendar(input_fn)
+    except InterviewAborted as exc:
+        print("\nAborted: %s" % exc)
+        return 130
+
+    service, timer = render_unit_files(profile, oncalendar)
+    service_path = os.path.join(SYSTEMD_DIR, SYSTEMD_SERVICE)
+    timer_path = os.path.join(SYSTEMD_DIR, SYSTEMD_TIMER)
+
+    print("\n-- %s" % service_path)
+    print(service)
+    print("-- %s" % timer_path)
+    print(timer)
+
+    described = describe_calendar(oncalendar)
+    if described and described[0] == "ok":
+        print(described[1])
+
+    for path in (service_path, timer_path):
+        if os.path.exists(path):
+            print("NOTE: %s already exists and will be overwritten." % path)
+
+    if args.dry_run:
+        print("\nDry run: nothing written.")
+        return 0
+    try:
+        if not (args.yes or ask_yes_no("Write these two files?", False,
+                                       input_fn)):
+            print("Nothing written.")
+            return 0
+    except InterviewAborted as exc:
+        print("\nAborted: %s" % exc)
+        return 130
+
+    try:
+        for path, text in ((service_path, service), (timer_path, timer)):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.chmod(path, 0o644)
+    except OSError as exc:
+        print("Could not write the unit files: %s" % exc)
+        return 1
+    print("Wrote %s and %s." % (service_path, timer_path))
+
+    print("\nTo start it:")
+    print("  sudo systemctl daemon-reload")
+    print("  sudo systemctl enable --now %s" % SYSTEMD_TIMER)
+    print("To see when it next runs, and what the last run did:")
+    print("  systemctl list-timers %s" % SYSTEMD_TIMER)
+    print("  journalctl -u %s" % SYSTEMD_SERVICE)
+    print("To run it once now, without waiting:")
+    print("  sudo systemctl start %s" % SYSTEMD_SERVICE)
+    print("To remove it:")
+    print("  sudo systemctl disable --now %s" % SYSTEMD_TIMER)
+    print("  sudo rm %s %s" % (timer_path, service_path))
+    print("  sudo systemctl daemon-reload")
+    # Deliberately not run here: enabling a timer is the operator's decision,
+    # and the commands above are the same ones they will need to undo it.
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -4952,6 +5249,10 @@ def build_parser():
     mode.add_argument("--probe", action="store_true",
                       help="connect to the platform and report available "
                            "IOC counts")
+    mode.add_argument("--install-timer", action="store_true",
+                      help="write a systemd service and timer that replay a "
+                           "saved profile on a schedule; asks first, enables "
+                           "nothing, and is never done automatically")
     mode.add_argument("--import", dest="import_file", metavar="PATH",
                       default=None,
                       help="merge an intel.dat built on another host into "
@@ -5026,6 +5327,10 @@ def main(argv=None):
         return cmd_apply(args)
     if args.explain:
         return cmd_explain(args)
+    # Above the --yes gate for the same reason --import is: --install-timer
+    # --profile X --yes is a legitimate unattended invocation.
+    if args.install_timer:
+        return cmd_install_timer(args)
     # Above the --yes gate deliberately: an import runs no interview, so
     # --import --yes is a legitimate unattended invocation and the gate below
     # exists only to catch an unattended run with nothing to answer with.

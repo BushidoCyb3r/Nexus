@@ -2,8 +2,8 @@
 
 Written for a fresh assistant with no prior context. Read this, then `PLAN.md` for the full design.
 
-**Last updated:** 2026-08-22
-**State:** phases 0–6 and 8–10 complete, phase 7 remaining. 650 offline tests passing.
+**Last updated:** 2026-08-23
+**State:** all phases complete (0–10). 691 offline tests passing.
 **Never yet run against a real MISP, a real OpenCTI, a real TAXII server, or a real Security Onion box.** Everything below was verified against fakes (or, for TAXII, against the specification documents and a fake server -- see §7).
 
 ---
@@ -17,20 +17,21 @@ Not a library. Not a package. **One script**, standard library only, so it drops
 ### Files
 
 ```
-nexus.py        5532 lines   the tool
-test_nexus.py   6850 lines   650 tests, no MISP, OpenCTI, TAXII or SO required
+nexus.py        ~5850 lines  the tool
+test_nexus.py   ~7150 lines  691 tests, no MISP, OpenCTI, TAXII or SO required
 PLAN.md          ~580 lines  full design doc, section numbers referenced below
+README.md        ~230 lines  the operator-facing doc; PLAN.md is the designer-facing one
 HANDOFF.md       ~400 lines  this file (self-referential count omitted -- drifts every time this file is edited)
 ```
 
-A git repository, currently on branch `taxii-source`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
+A git repository, currently on `main`. There is no CI — `python3 -m unittest test_nexus` is the only gate.
 
 ---
 
 ## 2. Run it
 
 ```bash
-python3 -m unittest test_nexus        # 650 tests, ~40s, needs nothing external
+python3 -m unittest test_nexus        # 691 tests, ~45s, needs nothing external
 python3 nexus.py --help
 
 python3 nexus.py                      # default: full interview -> writes intel.dat
@@ -47,6 +48,7 @@ python3 nexus.py --profile daily --dry-run --diff   # build and compare, write n
 python3 nexus.py --offline --profile ./laptop.json --yes  # build for transfer, on a host with no SO installed
 python3 nexus.py --import /media/usb/intel.dat      # merge a transferred file into this manager's intel.dat
 python3 nexus.py --import /media/usb/intel.dat --yes  # merge unattended; also applies to the grid
+python3 nexus.py --install-timer      # write a systemd service + timer for a saved profile, on request only
 ```
 
 `--source {misp,opencti,taxii}` picks the platform; if omitted, the interview asks (stage 1). `--host` is the source-neutral form of the old `--misp` flag, which still works as a **deprecated alias for `--host --source misp`** — existing MISP-only invocations and profiles keep working unchanged.
@@ -343,13 +345,15 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 
 ## 7. What is left
 
-### Phase 7 — the only incomplete phase
+### Every phase is now built. What is left is live validation.
 
-- A systemd `nexus.service` + `nexus.timer` (not cron — failures should land in the journal).
-- Install steps: place at `/usr/local/bin/nexus`, `chmod 750`, root-owned; create `/opt/nexus/{profiles,backups,logs}`.
-- An operator README distinct from `PLAN.md`.
+Phase 7 closed on 2026-08-23: `--install-timer` renders and writes
+`nexus.service` and `nexus.timer`, and `README.md` is the operator doc. The
+timer is **never installed as a side effect of anything** — the user asked for
+it to be opt-in explicitly, and `TestInstallTimerCli` asserts that nothing
+outside `cmd_install_timer` reaches the unit renderer.
 
-### Open questions for the user — none are blocking, all affect phase 7
+### Open questions for the user — none are blocking
 
 1. Run `python3 nexus.py --check-env` on the real manager to confirm the local
    `__load__.Zeek`, runtime paths, and `do_notice.zeek` policy state. The code
@@ -357,6 +361,25 @@ These were explicitly chosen by the user (2026-08-16) after being presented with
 2. Exact 3.x point release, and whether anything else already manages that file.
 3. Expected indicator volume and available RAM per Zeek worker. Nexus imposes
    no default ceiling, but Zeek's in-memory Intel framework remains the real limit.
+
+### Flagged as unverified, systemd
+
+Written from the unit-file documentation, never installed on a real manager.
+
+1. That `--install-timer` run under `sudo` finds `/etc/systemd/system` writable
+   and `/run/systemd/system` present — both are checked, neither is observed.
+2. That the rendered `ExecStart` path is right on the manager. It is
+   `sys.executable` plus `os.path.abspath(__file__)` at render time, so
+   installing from a copy in `/tmp` bakes `/tmp` into the unit. Install from
+   the path the tool will live at.
+3. That `EnvironmentFile=-/opt/nexus/nexus.env` reaches `resolve_token`. The
+   precedence is env before `credentials.json`, so a stale value in the env
+   file wins over a fresh one in `credentials.json`.
+4. That `Persistent=true` behaves as intended here — a manager down across
+   several periods gets **one** catch-up run, not one per missed period.
+5. That the salt apply works from inside a unit. `User=root` is set so no sudo
+   is involved, but `SO_APPLY_ARGV` still starts with `sudo`, which is a no-op
+   as root on most managers and is not something this project has watched.
 
 ### Flagged as version-dependent, unverified
 

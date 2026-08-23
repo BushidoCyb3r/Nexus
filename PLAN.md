@@ -516,12 +516,12 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 | 4 ✅ | Profiles, `--yes`, `--dry-run`, `--diff`, `--explain` | unattended run reproduces phase-3 output |
 | 5 ✅ | Local exclusions + all §8 guardrails | a test per refusal path |
 | 6 ✅ | Apply — `__load__.Zeek` seeding, salt apply, reporter check | lab grid: apply → hit in `intel.log` |
-| 7 | systemd timer, install steps, operator README | fresh-manager install works |
+| 7 ✅ | systemd timer, install steps, operator README — `--install-timer` renders and writes `nexus.service`/`nexus.timer` on request only, after pre-flighting the failures that would otherwise surface unattended; enables nothing | offline test suite (691 tests, including that a build never reaches the unit renderer); unverified on a fresh manager |
 | 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (537 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
 | 9 ✅ | Offline build (`--offline`) — build a transfer-ready `intel.dat` on a host with no Security Onion installed, plus `--import PATH` to merge one back into a manager's live file, append-only | offline test suite (537 tests, includes a poison-path assertion that an offline build never touches the real `SO_*` paths, and a byte-identity assertion that import never rewrites an existing row) |
 | 10 ✅ | TAXII as a third, independently selectable IOC source — `TaxiiClient` (2.0/2.1, Basic or Bearer), version detection with an asked-not-skipped default, per-API-root collection discovery, pagination for both protocol versions, a STIX indicator flattener, six client-side filters for what TAXII's query syntax cannot express, source-aware interview stages, full wiring, `--probe` | offline test suite (650 tests, includes a fake server serving both protocol versions); unverified against a live TAXII server, see `HANDOFF.md` §7 |
 
-Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phases 8, 9 and 10 were all taken out of numeric order — they landed after phase 6 while phase 7 (systemd timer, install docs) was still outstanding, since all three are source-neutral/deployment-neutral to what phase 7 covers.
+Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phases 8, 9 and 10 were taken out of numeric order — they landed after phase 6 while phase 7 was still outstanding, since all three are source-neutral and deployment-neutral to what phase 7 covers. Phase 7 closed last, which is why the timer knows about all three sources and about offline profiles.
 
 ---
 
