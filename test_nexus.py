@@ -6,6 +6,7 @@ a local http.server that replays canned responses.
 """
 
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -969,6 +971,8 @@ class FakeOpenctiHandler(BaseHTTPRequestHandler):
         self.server.requests.append({
             "path": self.path,
             "auth": self.headers.get("Authorization"),
+            "accept": self.headers.get("Accept"),
+            "headers": dict(self.headers),
             "body": json.loads(raw.decode("utf-8")) if raw else {},
         })
         if self.server.script:
@@ -1009,6 +1013,501 @@ class FakeOpencti(object):
     def stop(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+TAXII_DISCOVERY_PATHS = ("/taxii2/", "/taxii/")
+
+# Two API roots, one collection apiece -- the default fixture for
+# TestTaxiiDiscovery.  Version-detection tests pass their own narrower
+# routes= and never see this.
+DEFAULT_TAXII_ROUTES = {
+    "/taxii2/": (200, {"title": "Test TAXII", "api_roots": ["/api1/", "/api2/"]}),
+    "/taxii/": (200, {"title": "Test TAXII", "api_roots": ["/api1/", "/api2/"]}),
+    "/api1/collections/": (200, {"collections": [{"id": "c1", "title": "Feed One"}]}),
+    "/api2/collections/": (200, {"collections": [{"id": "c2", "title": "Feed Two"}]}),
+}
+
+
+class FakeTaxiiHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        self.server.requests.append({
+            "path": self.path,
+            # Parsed, not raw: the client encodes query params with
+            # urlencode (brackets become %5B/%5D), so a raw-string
+            # assertion could never match what a later stage sends.
+            "query": urllib.parse.parse_qs(parsed.query),
+            "accept": self.headers.get("Accept"),
+            "auth": self.headers.get("Authorization"),
+        })
+        extra_headers = []
+        if parsed.path in TAXII_DISCOVERY_PATHS and not self.server.serve_discovery:
+            status, payload = 404, {"title": "not found"}
+        elif "/collections/" in parsed.path and parsed.path.endswith("/objects/"):
+            if self.server.objects_index >= self.server.max_pages:
+                # Insurance, not protocol.  The replays below are endless by
+                # design, so a client that lost a termination guard would hang
+                # the suite instead of failing a test -- and there is no CI
+                # here, so a hang reads as a stuck terminal.  This closing page
+                # ends the pull for either version (2.1: more false; 2.0: no
+                # Content-Range) and leaves a request-count assertion to fail.
+                status, payload = 200, {"objects": [], "more": False}
+            elif self.server.taxii_version == "2.0":
+                # 2.0 has no envelope: a STIX bundle plus a Content-Range
+                # header.  Kept a separate branch from 2.1 so neither
+                # version's pagination shape can quietly change the other's.
+                # It replays its last scripted page forever for the same
+                # reason the 2.1 branch does (see below).
+                self.server.ranges.append(self.headers.get("Range") or "")
+                bundles = self.server.bundles
+                idx = min(self.server.objects_index, len(bundles) - 1)
+                payload, content_range = bundles[idx]
+                status = 200
+                if content_range is not None:
+                    extra_headers.append(("Content-Range", content_range))
+            else:
+                # Envelope pagination: each hit serves the next scripted page.
+                # Once the script runs out, replay the last page forever rather
+                # than fall back to a closed one -- a fake that can end the loop
+                # on its own would let a test pass with the client's cursor
+                # guard removed, which is exactly the bug this fake exists to
+                # catch. Only the client's own guard (or a scripted page's own
+                # more: False) may stop the pull.
+                pages = self.server.pages
+                index = self.server.objects_index
+                status = 200
+                if index < len(pages):
+                    payload = pages[index]
+                else:
+                    # Replaying: mint a fresh cursor each time, so the
+                    # repeated-cursor guard cannot end a pull that some other
+                    # guard was supposed to end.
+                    payload = dict(pages[-1])
+                    if payload.get("next"):
+                        payload["next"] = "replay-%d" % index
+            self.server.objects_index += 1
+        else:
+            status, payload = self.server.routes.get(
+                parsed.path, (404, {"title": "not found"}))
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+class FakeTaxii(object):
+    """A local TAXII endpoint answering scripted per-path responses.
+
+    With no routes given it serves a two-API-root 2.1/2.0 discovery and
+    collections fixture (extended by later tasks to serve objects); pass
+    routes= to script something narrower, as the version-detection tests do.
+    """
+
+    def __init__(self, routes=None, version="2.1"):
+        self.server = HTTPServer(("127.0.0.1", 0), FakeTaxiiHandler)
+        self.server.taxii_version = version
+        self.server.routes = (dict(routes) if routes is not None
+                              else dict(DEFAULT_TAXII_ROUTES))
+        self.server.serve_discovery = True
+        self.server.requests = []
+        # Scripted 2.1 object envelopes for TestTaxii21Fetch; each request
+        # to a .../objects/ path serves the next one and advances the index.
+        self.server.pages = [{"objects": [], "more": False}]
+        # Scripted 2.0 pages for TestTaxii20Fetch: (bundle, Content-Range),
+        # where a Content-Range of None means the server sent none at all.
+        self.server.bundles = [({"type": "bundle", "objects": []}, None)]
+        self.server.ranges = []
+        self.server.objects_index = 0
+        # Ceiling on the endless replay above; see FakeTaxiiHandler.
+        self.server.max_pages = 50
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def start(self):
+        pass  # already serving from __init__; kept for call-site symmetry
+
+    @property
+    def port(self):
+        return self.server.server_address[1]
+
+    @property
+    def requests(self):
+        return self.server.requests
+
+    @property
+    def accepts(self):
+        return [r["accept"] for r in self.server.requests]
+
+    @property
+    def bundles(self):
+        return self.server.bundles
+
+    @bundles.setter
+    def bundles(self, value):
+        self.server.bundles = list(value)
+
+    @property
+    def ranges(self):
+        """The Range header of every 2.0 objects request, in order."""
+        return self.server.ranges
+
+    @property
+    def serve_discovery(self):
+        return self.server.serve_discovery
+
+    @serve_discovery.setter
+    def serve_discovery(self, value):
+        self.server.serve_discovery = value
+
+    def client(self, **kwargs):
+        return nexus.TaxiiClient("127.0.0.1", "tok", scheme="http",
+                                 port=self.port, retries=1, **kwargs)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestTaxiiVersionDetection(unittest.TestCase):
+    """detect_version() probes 2.1 then 2.0; both a plain SourceError and a
+    SourceAuthError need distinct handling, and self.version (which ACCEPT
+    is derived from) must land in a well-defined place either way."""
+
+    def tearDown(self):
+        if getattr(self, "taxii", None):
+            self.taxii.stop()
+
+    def test_detects_2_1_when_it_answers(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (200, {"title": "S"})})
+        client = self.taxii.client()
+        self.assertEqual(client.detect_version(), "2.1")
+        self.assertEqual(client.version, "2.1")
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
+
+    def test_falls_back_to_2_0_and_the_accept_header_tracks_the_probe(self):
+        self.taxii = FakeTaxii(routes={
+            "/taxii2/": (404, {}),
+            "/taxii/": (200, {"title": "old"}),
+        })
+        client = self.taxii.client()  # constructed at the 2.1 default
+        self.assertEqual(client.detect_version(), "2.0")
+        self.assertEqual(client.version, "2.0")
+        # Each probe's Accept header must match the version being tried at
+        # that moment, not the version the client started (or ends) on.
+        self.assertEqual(self.taxii.requests[0]["path"], "/taxii2/")
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
+        self.assertEqual(self.taxii.requests[1]["path"], "/taxii/")
+        self.assertEqual(self.taxii.requests[1]["accept"],
+                         nexus.TAXII_ACCEPT["2.0"])
+
+    def test_raises_and_restores_the_original_version_when_neither_answers(self):
+        self.taxii = FakeTaxii(routes={})  # both paths 404
+        client = self.taxii.client(version="2.1")
+        self.assertRaises(nexus.TaxiiError, client.detect_version)
+        self.assertEqual(client.version, "2.1")
+
+    def test_auth_error_propagates_instead_of_trying_the_next_version(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (401, {})})
+        client = self.taxii.client()
+        self.assertRaises(nexus.SourceAuthError, client.detect_version)
+        # A wrong password must not be swallowed and retried as "try 2.0".
+        self.assertEqual(len(self.taxii.requests), 1)
+
+    def test_get_version_reads_the_negotiated_endpoint_over_the_wire(self):
+        self.taxii = FakeTaxii(routes={"/taxii2/": (200, {"title": "My TAXII"})})
+        client = self.taxii.client(version="2.1")
+        self.assertEqual(client.get_version(),
+                         {"version": "2.1", "title": "My TAXII"})
+        self.assertEqual(self.taxii.requests[0]["accept"],
+                         nexus.TAXII_ACCEPT["2.1"])
+
+
+class TestTaxiiDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.start()
+
+    def _client(self, version="2.1"):
+        return nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                 port=self.server.port, version=version)
+
+    def test_detects_21(self):
+        self.assertEqual(self._client().detect_version(), "2.1")
+
+    def test_collections_span_every_api_root(self):
+        found = self._client().get_collections()
+        self.assertEqual(sorted(c["id"] for c in found), ["c1", "c2"])
+        self.assertEqual(found[0]["api_root"], "/api1/")
+
+    def test_the_accept_header_names_the_version(self):
+        self._client().get_collections()
+        self.assertIn("application/taxii+json;version=2.1",
+                      self.server.accepts)
+
+    def test_a_server_with_no_discovery_endpoint_raises(self):
+        self.server.serve_discovery = False
+        with self.assertRaises(nexus.TaxiiError):
+            self._client().detect_version()
+
+    def test_one_unreadable_root_does_not_cost_the_others(self):
+        # api2 is broken (500, past the retry budget); api1's collection
+        # must still come back rather than the whole call failing.  retries=1
+        # so the 500 fails fast instead of eating the backoff schedule.
+        self.server.server.routes["/api2/collections/"] = (500, {})
+        client = nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                   port=self.server.port, retries=1)
+        found = client.get_collections()
+        self.assertEqual([c["id"] for c in found], ["c1"])
+
+    def test_an_auth_failure_on_one_root_propagates_instead_of_being_skipped(self):
+        # Unlike a broken root, a rejected token means the credentials are
+        # wrong -- it must not be swallowed as "one root down, keep going".
+        self.server.server.routes["/api1/collections/"] = (401, {})
+        client = nexus.TaxiiClient(host="127.0.0.1", token="t", scheme="http",
+                                   port=self.server.port, retries=1)
+        with self.assertRaises(nexus.SourceAuthError):
+            client.get_collections()
+
+
+class TestTaxii21Fetch(unittest.TestCase):
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.start()
+        self.client = nexus.TaxiiClient(host="127.0.0.1", token="t",
+                                        scheme="http", port=self.server.port,
+                                        version="2.1")
+
+    def test_pages_until_more_is_false(self):
+        self.server.server.pages = [
+            {"objects": [{"id": "indicator--1"}], "more": True, "next": "n1"},
+            {"objects": [{"id": "indicator--2"}], "more": False},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual([o["id"] for o in got],
+                         ["indicator--1", "indicator--2"])
+
+    def test_it_asks_the_server_for_indicators_only(self):
+        list(self.client.fetch_objects({"id": "c1", "api_root": "/api1/"}))
+        params = self.server.requests[-1]["query"]
+        self.assertEqual(params["match[type]"], ["indicator"])
+
+    def test_added_after_is_sent_when_given(self):
+        list(self.client.fetch_objects({"id": "c1", "api_root": "/api1/"},
+                                       added_after="2026-08-01T00:00:00Z"))
+        params = self.server.requests[-1]["query"]
+        self.assertEqual(params["added_after"], ["2026-08-01T00:00:00Z"])
+
+    def test_max_results_stops_early(self):
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "more": True,
+             "next": "n1"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}, max_results=2))
+        self.assertEqual(len(got), 2)
+
+    def test_a_repeated_cursor_stops_the_loop(self):
+        # A server that keeps handing back the same next value would spin
+        # forever; OpenctiClient carries the same guard. The fake replays
+        # its last scripted page indefinitely (see FakeTaxiiHandler), so
+        # nothing but the client's own guard can end this pull -- without
+        # it, this test hangs rather than passing by accident.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True, "next": "same"},
+            {"objects": [{"id": "b"}], "more": True, "next": "same"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_an_empty_page_stops_the_loop(self):
+        # `objects: [], more: True` with a fresh cursor every time satisfies
+        # both the missing-cursor and the repeated-cursor guard for ever --
+        # 828,493 requests in three seconds, with an indicator cap set, which
+        # never fires because no record is ever yielded to count.  Nothing but
+        # "the page was empty" can end this pull; _fetch_objects_20 has
+        # carried the same guard all along.
+        self.server.server.pages = [{"objects": [], "more": True,
+                                     "next": "n1"}]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual(got, [])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_a_final_page_with_a_fresh_cursor_stops_on_more(self):
+        # The `more` check was untestable while the fake replayed its last
+        # page verbatim: the repeated-cursor guard stopped the pull either
+        # way.  A distinct cursor on the closing page leaves `more: False` as
+        # the only thing that can end it.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True, "next": "n1"},
+            {"objects": [{"id": "b"}], "more": False, "next": "n2"},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual([o["id"] for o in got], ["a", "b"])
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_a_missing_cursor_stops_the_loop(self):
+        # more: True with no next at all is the other way a server can
+        # fail to hand back a usable cursor; same guard, same fake trap.
+        self.server.server.pages = [
+            {"objects": [{"id": "a"}], "more": True},
+        ]
+        got = list(self.client.fetch_objects(
+            {"id": "c1", "api_root": "/api1/"}))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(len(self.server.requests), 1)
+
+
+class TestTaxii20Fetch(unittest.TestCase):
+    """2.0 has no envelope: a STIX bundle per page, paged with Range /
+    Content-Range.  Every one of these tests exists because the loop that
+    reads those headers has more ways to never end than to end."""
+
+    def setUp(self):
+        self.server = FakeTaxii(version="2.0")
+        self.addCleanup(self.server.stop)
+        self.server.start()
+        self.client = nexus.TaxiiClient(host="127.0.0.1", token="t",
+                                        scheme="http", port=self.server.port,
+                                        version="2.0")
+
+    def _fetch(self, **kwargs):
+        return list(self.client.fetch_objects({"id": "c1",
+                                               "api_root": "/api1/"}, **kwargs))
+
+    def test_reads_objects_out_of_a_bundle(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "indicator--1"}]},
+             "items 0-0/1"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["indicator--1"])
+
+    def test_it_pages_with_range_until_the_total_is_reached(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/2"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-1/2"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.ranges), 2)
+        self.assertTrue(all(r.startswith("items ") for r in self.server.ranges))
+
+    def test_the_range_header_asks_for_a_page_size_window(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/9"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-8/9"),
+        ]
+        self._fetch(page_size=5)
+        # First window starts at 0 and is page_size wide; the second resumes
+        # one past the last item the server actually served, not one past
+        # what we asked for.
+        self.assertEqual(self.server.ranges, ["items 0-4", "items 1-5"])
+
+    def test_it_asks_the_server_for_indicators_only(self):
+        self._fetch()
+        self.assertEqual(self.server.requests[-1]["query"]["match[type]"],
+                         ["indicator"])
+
+    def test_added_after_is_sent_when_given(self):
+        self._fetch(added_after="2026-08-01T00:00:00Z")
+        self.assertEqual(self.server.requests[-1]["query"]["added_after"],
+                         ["2026-08-01T00:00:00Z"])
+
+    def test_max_results_stops_early(self):
+        self.server.bundles = [
+            ({"type": "bundle",
+              "objects": [{"id": "a"}, {"id": "b"}, {"id": "c"}]},
+             "items 0-2/9"),
+        ]
+        self.assertEqual(len(self._fetch(max_results=2)), 2)
+
+    # -- the six ways this loop has to end -------------------------------
+    # The fake replays its last scripted page forever (see FakeTaxiiHandler),
+    # so each of these hangs the suite rather than failing if its guard in
+    # _fetch_objects_20 is removed.  That is deliberate.
+
+    def test_a_missing_content_range_ends_the_pull(self):
+        # Not every 2.0 server sends it; one page is better than a loop.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "only"}]}, None),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["only"])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_an_unknown_total_ends_the_pull(self):
+        # "items 0-0/*" means the server will not say how many there are;
+        # guessing a total is how a client pages forever.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/*"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a"])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_reaching_the_total_ends_the_pull(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}, {"id": "b"}]},
+             "items 0-1/2"),
+        ]
+        self.assertEqual(len(self._fetch()), 2)
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_an_empty_page_ends_the_pull(self):
+        # The arithmetic says there are three more, but the server just sent
+        # nothing -- asking again forever is the wrong reading.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": []}, "items 0-0/4"),
+        ]
+        self.assertEqual(self._fetch(), [])
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_a_content_range_that_does_not_advance_ends_the_pull(self):
+        # A server stuck on "items 0-0" would otherwise be re-asked for the
+        # same window forever; this is 2.1's repeated-cursor guard in
+        # Range clothing.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/4"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 0-0/4"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_a_receding_total_does_not_extend_the_pull(self):
+        # A total that keeps outrunning `last` clears every other guard:
+        # objects present, header parsable, total numeric, last+1 < total,
+        # window advancing.  Only the first page's total is believed.
+        # Bounded on purpose -- without the pin this test fails on the
+        # request count rather than wedging the suite.
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "items 0-0/2"),
+            ({"type": "bundle", "objects": [{"id": "b"}]}, "items 1-1/3"),
+            ({"type": "bundle", "objects": [{"id": "c"}]}, "items 2-2/4"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a", "b"])
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_an_unparsable_content_range_ends_the_pull(self):
+        self.server.bundles = [
+            ({"type": "bundle", "objects": [{"id": "a"}]}, "pages 1 of 7"),
+        ]
+        self.assertEqual([o["id"] for o in self._fetch()], ["a"])
+        self.assertEqual(len(self.server.requests), 1)
 
 
 class TestOpenctiClient(unittest.TestCase):
@@ -1219,12 +1718,6 @@ class TestFlatten(unittest.TestCase):
         self.assertEqual(record["event_info"], "Event 1")
         self.assertEqual(record["event_tags"], ["tlp:amber"])
         self.assertEqual(record["org"], "CIRCL")
-        self.assertIs(record["to_ids"], True)
-
-    def test_to_ids_string_zero_is_false(self):
-        raw = attr("1.2.3.4")
-        raw["to_ids"] = "0"
-        self.assertIs(nexus.flatten_attribute(raw)["to_ids"], False)
 
     def test_flatten_tolerates_a_bare_attribute(self):
         record = nexus.flatten_attribute({"value": "1.2.3.4", "type": "ip-dst"})
@@ -2447,6 +2940,194 @@ class TestOpenctiStage1(Quiet):
             None, input_fn=scripted(["2", "cti.local"], fill=""),
             getpass_fn=lambda prompt: "tok")
         self.assertEqual(config["source"], "opencti")
+
+
+class TestTaxiiStage1(Quiet):
+    """Real prompt order (client=None, verified by hand): address, scheme,
+    port, verify TLS, proxy, TAXII version, auth type, [username if basic],
+    secret (getpass), timeout, retries."""
+
+    def test_basic_auth_collects_both_secrets(self):
+        # Version answer is "2" (2.0), deliberately not "1" -- "1" also
+        # happens to be the client=None default (TAXII_VERSIONS[0], "2.1"),
+        # so scripting it would not distinguish "asked and honoured" from
+        # "asked for show and the default silently kept".
+        fake = scripted(["taxii.test", "1", "443", "y", "none",
+                         "2", "2", "alice", "30", "3"])
+        config = {}
+        nexus._stage1_connection(
+            config, None, fake, lambda _p: "s3cret", source="taxii")
+        self.assertEqual(config["taxii_version"], "2.0")
+        self.assertEqual(config["taxii_auth"], "basic")
+        self.assertEqual(config["taxii_username"], "alice")
+        self.assertEqual(config["token"], "s3cret")
+
+    def test_bearer_auth_asks_no_username(self):
+        fake = scripted(["taxii.test", "1", "443", "y", "none",
+                         "1", "1", "30", "3"])
+        config = {}
+        nexus._stage1_connection(
+            config, None, fake, lambda _p: "s3cret", source="taxii")
+        self.assertEqual(config["taxii_auth"], "bearer")
+        self.assertIsNone(config["taxii_username"])
+        self.assertEqual(config["token"], "s3cret")
+
+    def test_neither_secret_is_persisted(self):
+        # A Basic username is half a credential -- it must be excluded from
+        # a saved profile exactly like the password/token it is paired with.
+        # Checked against the raw file text, not the reloaded dict, so a
+        # future refactor that changes save_profile's read-back path cannot
+        # hide a leak.
+        config = {"token": "pw", "taxii_username": "alice",
+                  "source": "taxii"}
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "p.json")
+        nexus.save_profile(config, path)
+        raw = open(path).read()
+        self.assertNotIn("pw", raw)
+        self.assertNotIn("alice", raw)
+
+
+class TestDiscoverTaxii(unittest.TestCase):
+
+    def test_no_client_is_empty_not_a_crash(self):
+        self.assertEqual(nexus.discover_taxii(None), {"collections": []})
+
+    def test_forwards_get_collections(self):
+        class Stub(object):
+            def get_collections(self):
+                return [{"id": "c1", "title": "Feed", "api_root": "/api1/"}]
+        found = nexus.discover_taxii(Stub())
+        self.assertEqual(found["collections"][0]["id"], "c1")
+
+    def test_a_source_error_is_swallowed_not_raised(self):
+        class Stub(object):
+            def get_collections(self):
+                raise nexus.SourceError("down")
+        found = nexus.discover_taxii(Stub())
+        self.assertEqual(found["collections"], [])
+
+
+# ---------------------------------------------------------------------------
+# STAGE 3 -- TAXII collection selection
+# ---------------------------------------------------------------------------
+
+class TestTaxiiCollectionsStage(Quiet):
+
+    def discovery(self):
+        return {"collections": [
+            {"id": "c1", "title": "Feed One", "api_root": "/api1/"},
+            {"id": "c2", "title": "Feed Two", "api_root": "/api2/"},
+        ]}
+
+    def test_defaults_to_every_collection(self):
+        config = {}
+        # fill="" takes the default for the two shaping questions that
+        # follow the collection menu; the assertion is about the menu.
+        nexus._stage3_collections_taxii(config, self.discovery(),
+                                        scripted([""], fill=""))
+        self.assertEqual([c["id"] for c in config["collections"]],
+                         ["c1", "c2"])
+
+    def test_a_narrower_answer_is_honoured(self):
+        # "1" -> Feed One only.  Enter (the default) would pick both, so
+        # scripting "all" here could not distinguish "asked and honoured"
+        # from "never asked, defaulted to all" -- pick the subset instead.
+        config = {}
+        nexus._stage3_collections_taxii(config, self.discovery(),
+                                        scripted(["1"], fill=""))
+        self.assertEqual([c["id"] for c in config["collections"]], ["c1"])
+
+    def test_no_collections_discovered_is_handled_not_crashed(self):
+        config = {}
+        nexus._stage3_collections_taxii(config, {"collections": []},
+                                        scripted([]))
+        self.assertEqual(config["collections"], [])
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 -- TAXII scope: the post-download filters
+# ---------------------------------------------------------------------------
+
+class TestTaxiiScopeStage(Quiet):
+    """`_stage5_scope_taxii` prints with plain print(), the same as every
+    other interview stage in this file -- there is no printer= seam
+    anywhere else in the interview, so this task does not introduce one.
+    Quiet/self.printed (redirect_stdout) is how every other stage's wording
+    is asserted; these tests follow that, not the brief's printer=
+    suggestion."""
+
+    def test_the_wording_says_the_filters_are_applied_after_download(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertIn("after download", self.printed.lower())
+
+    def test_a_20_feed_is_warned_about_confidence(self):
+        config = {"source": "taxii", "taxii_version": "2.0"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        text = self.printed.lower()
+        self.assertIn("confidence", text)
+        self.assertIn("2.0", text)
+
+    def test_a_21_feed_is_not_warned_about_confidence(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertNotIn("2.0", self.printed)
+
+    def test_answers_are_honoured_not_defaulted(self):
+        # Every default in this stage is 0, "none" or True -- each scripted
+        # answer below differs from its default, so this can only pass if
+        # the answer was actually read.
+        fake = by_prompt([
+            ("Days back", "14"),
+            ("Include labels", "phishing,apt"),
+            ("Exclude labels", "benign"),
+            ("Include marking-definition refs", "marking-definition--m1"),
+            ("Include created_by_ref authors", "identity--a1"),
+            ("Minimum confidence", "75"),
+            ("Drop indicators past valid_until", "n"),
+        ])
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, fake)
+        self.assertEqual(config["days"], 14)
+        self.assertEqual(config["include_labels"], ["phishing", "apt"])
+        self.assertEqual(config["exclude_labels"], ["benign"])
+        self.assertEqual(config["include_markings"],
+                         ["marking-definition--m1"])
+        self.assertEqual(config["include_authors"], ["identity--a1"])
+        self.assertEqual(config["min_confidence"], 75)
+        self.assertIs(config["drop_expired"], False)
+
+    def test_defaults_when_the_operator_answers_nothing(self):
+        config = {"source": "taxii", "taxii_version": "2.1"}
+        nexus._stage5_scope_taxii(config, {"collections": []}, lambda _p: "")
+        self.assertEqual(config["days"], nexus.DEFAULT_DAYS)
+        self.assertEqual(config["include_labels"], [])
+        self.assertEqual(config["exclude_labels"], [])
+        self.assertEqual(config["include_markings"], [])
+        self.assertEqual(config["include_authors"], [])
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["drop_expired"], True)
+
+
+class TestTaxiiInterviewRouting(Quiet):
+    """run_interview must route a TAXII source through the new stages, not
+    fall through to the MISP-shaped ones -- if the dispatch in run_interview
+    regressed to unconditionally calling _stage3_iocs/_stage4_quality, this
+    would fail because config would carry ioc_classes/to_ids instead of
+    collections."""
+
+    def test_run_interview_routes_taxii_through_the_new_stages(self):
+        fake = scripted(["taxii.example"], fill="")
+        config = nexus.run_interview(
+            None, input_fn=fake, getpass_fn=lambda prompt: "tok",
+            source="taxii", offline=True)
+        self.assertEqual(config["collections"], [])
+        self.assertNotIn("ioc_classes", config)
+        self.assertNotIn("to_ids", config)
+        self.assertEqual(config["min_confidence"], 0)
+        self.assertIs(config["drop_expired"], True)
 
 
 # ---------------------------------------------------------------------------
@@ -3855,6 +4536,128 @@ class TestTransportRefactor(unittest.TestCase):
         self.assertEqual(client.base_url, "http://10.0.0.1:8080")
 
 
+class TestTransportHooks(unittest.TestCase):
+    """TAXII needs a version-specific Accept header and a second secret --
+    both are shared transport hooks so later sources don't monkey-patch."""
+
+    @staticmethod
+    def _probe(fake):
+        class Probe(nexus._HttpTransport):
+            def _auth_headers(self):
+                return {"Authorization": "tok"}
+        return Probe(host="127.0.0.1", token="tok", scheme="http",
+                     port=fake.port, retries=1)
+
+    def test_accept_defaults_to_json(self):
+        self.assertEqual(nexus._HttpTransport.ACCEPT, "application/json")
+
+    def test_a_subclass_can_override_accept(self):
+        class Probe(nexus._HttpTransport):
+            ACCEPT = "application/taxii+json;version=2.1"
+
+            def _auth_headers(self):
+                return {}
+        client = Probe(host="example.test", token="t")
+        self.assertEqual(client.ACCEPT, "application/taxii+json;version=2.1")
+
+    def test_overridden_accept_header_reaches_the_server(self):
+        # The class-attribute check above proves inheritance, not wiring --
+        # this drives a real request through _request and inspects what the
+        # server actually received.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            class Probe(nexus._HttpTransport):
+                ACCEPT = "application/taxii+json;version=2.1"
+
+                def _auth_headers(self):
+                    return {}
+            client = Probe(host="127.0.0.1", token="t", scheme="http",
+                          port=fake.port, retries=1)
+            client._request("POST", "/")
+            self.assertEqual(fake.requests[0]["accept"],
+                             "application/taxii+json;version=2.1")
+        finally:
+            fake.stop()
+
+    def test_default_accept_header_is_still_json_on_the_wire(self):
+        # The mirror of the above: an unmodified client -- MISP, OpenCTI --
+        # must still send application/json over the wire.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            class Probe(nexus._HttpTransport):
+                def _auth_headers(self):
+                    return {}
+            client = Probe(host="127.0.0.1", token="t", scheme="http",
+                          port=fake.port, retries=1)
+            client._request("POST", "/")
+            self.assertEqual(fake.requests[0]["accept"], "application/json")
+        finally:
+            fake.stop()
+
+    def test_extra_headers_reach_the_server(self):
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            client = self._probe(fake)
+            client._request("POST", "/", extra_headers={"Range": "items 0-9"})
+            self.assertEqual(fake.requests[0]["headers"]["Range"],
+                            "items 0-9")
+        finally:
+            fake.stop()
+
+    def test_without_extra_headers_a_request_is_unchanged(self):
+        # _request is shared by MISP, OpenCTI and TAXII; the extra_headers
+        # default must leave the other two sending byte-identical headers.
+        # An exact set, not a subset: a stray header is the regression.
+        fake = FakeOpencti(script=[(200, {"data": {}})])
+        try:
+            client = self._probe(fake)
+            client._request("POST", "/")
+            # Split so a red run after a Python bump is diagnosable at a
+            # glance: only the second list is Nexus's to defend.
+            URLLIB_ADDS = ["accept-encoding", "connection", "content-length",
+                           "host"]
+            NEXUS_SENDS = ["accept", "authorization", "content-type",
+                           "user-agent"]
+            self.assertEqual(
+                sorted(k.lower() for k in fake.requests[0]["headers"]),
+                sorted(URLLIB_ADDS + NEXUS_SENDS))
+        finally:
+            fake.stop()
+
+
+class TestTaxiiAuth(unittest.TestCase):
+    def test_bearer_when_no_username(self):
+        client = nexus.TaxiiClient(host="taxii.test", token="tok")
+        self.assertEqual(client._auth_headers()["Authorization"], "Bearer tok")
+
+    def test_basic_when_username_given(self):
+        client = nexus.TaxiiClient(host="taxii.test", token="pw",
+                                   username="alice")
+        expected = "Basic " + base64.b64encode(b"alice:pw").decode("ascii")
+        self.assertEqual(client._auth_headers()["Authorization"], expected)
+
+    def test_the_username_is_registered_as_a_secret(self):
+        # 8+ chars: RedactingFilter.add_secret ignores anything shorter (see
+        # TestRedaction.test_short_strings_are_not_treated_as_secrets), so a
+        # short username here would pass even if registration were broken.
+        nexus.TaxiiClient(host="taxii.test", token="pw", username="alice-admin")
+        record = logging.LogRecord("n", logging.INFO, "p", 1,
+                                   "user alice-admin here", None, None)
+        nexus.REDACTOR.filter(record)
+        self.assertNotIn("alice-admin", record.getMessage())
+
+    def test_accept_follows_the_version(self):
+        self.assertEqual(
+            nexus.TaxiiClient(host="h", token="t", version="2.1").ACCEPT,
+            "application/taxii+json;version=2.1")
+        self.assertEqual(
+            nexus.TaxiiClient(host="h", token="t", version="2.0").ACCEPT,
+            "application/vnd.oasis.taxii+json; version=2.0")
+
+    def test_taxii_errors_are_source_errors(self):
+        self.assertTrue(issubclass(nexus.TaxiiError, nexus.SourceError))
+
+
 class TestOpenctiMapping(unittest.TestCase):
 
     def rec(self, value_type, value):
@@ -3974,7 +4777,6 @@ class TestFlattenIndicator(unittest.TestCase):
         self.assertEqual(rec["value"], "evil.com")
         self.assertEqual(rec["type"], "Domain-Name")
         self.assertEqual(rec["category"], "stix")
-        self.assertIs(rec["to_ids"], True)
         self.assertEqual(rec["uuid"], "indicator--std")
         self.assertEqual(rec["event_id"], "indicator--1")
         self.assertEqual(rec["event_info"], "Evil domain")
@@ -4038,11 +4840,6 @@ class TestFlattenIndicator(unittest.TestCase):
         node = self.node(updated_at="not a date", observables=self.observables(
             [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
         self.assertEqual(nexus.flatten_indicator(node)[0]["timestamp"], "")
-
-    def test_detection_false_sets_to_ids_false(self):
-        node = self.node(x_opencti_detection=False, observables=self.observables(
-            [{"entity_type": "Domain-Name", "observable_value": "evil.com"}]))
-        self.assertIs(nexus.flatten_indicator(node)[0]["to_ids"], False)
 
     def test_truncated_observables_are_counted(self):
         stats = nexus.BuildStats()
@@ -4166,6 +4963,870 @@ class TestStixPattern(unittest.TestCase):
         self.assertEqual(nexus.parse_stix_pattern(pattern),
                          [("Domain-Name", "a.com")])
 
+
+class TestFlattenTaxii(unittest.TestCase):
+
+    # Keys that exist only to feed Task 7's client-side filters -- everything
+    # else must match flatten_indicator()'s output key for key.
+    TAXII_ONLY_KEYS = set(("collection", "labels", "confidence",
+                           "valid_until", "created_by_ref",
+                           "object_marking_refs"))
+
+    def _indicator(self, **over):
+        obj = {
+            "type": "indicator", "id": "indicator--abc",
+            "pattern_type": "stix",
+            "pattern": "[domain-name:value = 'evil.example']",
+            "created": "2026-08-01T00:00:00.000Z",
+            "labels": ["phishing"],
+        }
+        obj.update(over)
+        return obj
+
+    def test_a_domain_pattern_becomes_one_record(self):
+        rows = nexus.flatten_taxii_object(self._indicator())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["value"], "evil.example")
+        self.assertEqual(rows[0]["type"], "Domain-Name")
+
+    def test_a_file_pattern_fans_out(self):
+        obj = self._indicator(pattern=(
+            "[file:name = 'x.exe' OR file:hashes.'SHA-256' = '"
+            + "a" * 64 + "']"))
+        rows = nexus.flatten_taxii_object(obj)
+        self.assertEqual(sorted(r["type"] for r in rows),
+                         ["File-Name", "SHA-256"])
+
+    def test_a_non_stix_pattern_is_counted_not_guessed(self):
+        stats = nexus.BuildStats()
+        rows = nexus.flatten_taxii_object(
+            self._indicator(pattern_type="yara", pattern="rule x {}"),
+            stats=stats)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats.unmapped, {"pattern:yara": 1})
+
+    def test_the_collection_title_reaches_the_record(self):
+        rows = nexus.flatten_taxii_object(self._indicator(),
+                                          collection_title="Feed One")
+        self.assertEqual(rows[0]["collection"], "Feed One")
+
+    def test_a_non_indicator_object_yields_nothing(self):
+        self.assertEqual(
+            nexus.flatten_taxii_object({"type": "malware", "id": "malware--1"}),
+            [])
+
+    def test_none_object_is_safe(self):
+        self.assertEqual(nexus.flatten_taxii_object(None), [])
+
+    def test_missing_confidence_is_none_not_zero(self):
+        # STIX 2.0 has no confidence property at all -- absent must mean
+        # "unknown", never 0, or a confidence filter would silently drop
+        # every object from a 2.0 feed.
+        rows = nexus.flatten_taxii_object(self._indicator())
+        self.assertIsNone(rows[0]["confidence"])
+
+    def test_explicit_zero_confidence_is_preserved(self):
+        rows = nexus.flatten_taxii_object(self._indicator(confidence=0))
+        self.assertEqual(rows[0]["confidence"], 0)
+
+    def test_taxii_only_fields_are_carried_through(self):
+        rows = nexus.flatten_taxii_object(self._indicator(
+            confidence=75,
+            valid_until="2027-08-01T00:00:00Z",
+            created_by_ref="identity--org1",
+            object_marking_refs=["marking-definition--tlp-amber"]))
+        rec = rows[0]
+        self.assertEqual(rec["labels"], ["phishing"])
+        self.assertEqual(rec["confidence"], 75)
+        self.assertEqual(rec["valid_until"], "2027-08-01T00:00:00Z")
+        self.assertEqual(rec["created_by_ref"], "identity--org1")
+        self.assertEqual(rec["object_marking_refs"],
+                         ["marking-definition--tlp-amber"])
+
+    def test_shared_keys_match_flatten_indicator_exactly(self):
+        """A future divergence between the two flatteners must fail loudly,
+        not silently blank a metadata field downstream."""
+        opencti_node = {
+            "id": "indicator--1",
+            "standard_id": "indicator--std",
+            "name": "Evil domain",
+            "description": "seen in phishing",
+            "pattern_type": "stix",
+            "createdBy": {"name": "CIRCL"},
+            "observables": {
+                "pageInfo": {"hasNextPage": False},
+                "edges": [{"node": {"entity_type": "Domain-Name",
+                                    "observable_value": "evil.com"}}],
+            },
+        }
+        opencti_keys = set(nexus.flatten_indicator(opencti_node)[0].keys())
+        taxii_keys = set(nexus.flatten_taxii_object(self._indicator())[0].keys())
+        self.assertEqual(taxii_keys - self.TAXII_ONLY_KEYS, opencti_keys)
+        misp_keys = set(nexus.flatten_attribute(attr("1.2.3.4")).keys())
+        # to_ids was set by all three flatteners and read by none of them.
+        for keys in (opencti_keys, taxii_keys, misp_keys):
+            self.assertNotIn("to_ids", keys)
+
+
+class TestTaxiiIndicatorTypes(unittest.TestCase):
+    """STIX 2.1 moved the indicator open-vocab from `labels` to
+    `indicator_types` and made `labels` optional, so a 2.1 feed can carry an
+    empty `labels`.  Reading only `labels` would let an include-labels answer
+    exclude everything while the summary reports it as applied."""
+
+    def object(self, **over):
+        obj = {"type": "indicator", "id": "indicator--1", "name": "n",
+               "pattern": "[domain-name:value = 'evil.example']",
+               "pattern_type": "stix"}
+        obj.update(over)
+        return obj
+
+    def test_indicator_types_are_read_as_labels(self):
+        record = nexus.flatten_taxii_object(
+            self.object(indicator_types=["malicious-activity"]))[0]
+        self.assertEqual(record["labels"], ["malicious-activity"])
+
+    def test_both_vocabularies_are_unioned_without_duplicates(self):
+        record = nexus.flatten_taxii_object(self.object(
+            labels=["phishing", "apt"],
+            indicator_types=["phishing", "malicious-activity"]))[0]
+        self.assertEqual(record["labels"],
+                         ["phishing", "apt", "malicious-activity"])
+        self.assertEqual(record["event_tags"], record["labels"])
+
+    def test_an_include_filter_matches_an_indicator_type(self):
+        record = nexus.flatten_taxii_object(
+            self.object(indicator_types=["malicious-activity"]))[0]
+        self.assertTrue(nexus.taxii_object_allowed(
+            record, {"include_labels": ["malicious-activity"]}))
+
+
+class TestTaxiiClientSideFilters(unittest.TestCase):
+
+    def _record(self, **over):
+        rec = {"labels": ["phishing"], "confidence": 80,
+               "valid_until": "", "created_by_ref": "identity--a",
+               "object_marking_refs": ["marking-definition--green"]}
+        rec.update(over)
+        return rec
+
+    def test_no_filters_allows_everything(self):
+        self.assertTrue(nexus.taxii_object_allowed(self._record(), {}))
+
+    def test_include_labels_excludes_a_non_match(self):
+        config = {"include_labels": ["malware"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_exclude_labels_wins_over_include(self):
+        config = {"include_labels": ["phishing"],
+                  "exclude_labels": ["phishing"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_min_confidence_excludes_a_lower_score(self):
+        config = {"min_confidence": 90}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_absent_confidence_is_not_filtered_out(self):
+        # STIX 2.0 indicators have no confidence property at all.  Treating
+        # absent as zero would silently drop every object on a 2.0 feed.
+        config = {"min_confidence": 90}
+        self.assertTrue(nexus.taxii_object_allowed(
+            self._record(confidence=None), config))
+
+    def test_an_unparseable_confidence_is_unknown_not_an_error(self):
+        # STIX says confidence is an integer 0-100, but a feed that puts
+        # "high" there must not take the whole run down with a ValueError.
+        self.assertTrue(nexus.taxii_object_allowed(
+            self._record(confidence="high"), {"min_confidence": 90}))
+
+    def test_an_expired_indicator_is_excluded_when_asked(self):
+        config = {"drop_expired": True}
+        record = self._record(valid_until="2020-01-01T00:00:00Z")
+        self.assertFalse(nexus.taxii_object_allowed(
+            record, config, now=datetime(2026, 8, 22, tzinfo=timezone.utc)))
+
+    def test_markings_filter_matches_on_any_ref(self):
+        config = {"include_markings": ["marking-definition--red"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+    def test_authors_filter(self):
+        config = {"include_authors": ["identity--b"]}
+        self.assertFalse(nexus.taxii_object_allowed(self._record(), config))
+
+
+
+class TestTaxiiWiring(Quiet):
+    """Task 10: TAXII stops being staged delivery and becomes a real source."""
+
+    def collection(self, ident="c1", title="Feed One", root="/api1/"):
+        return {"id": ident, "title": title, "api_root": root}
+
+    def indicator(self, value="evil.example", **over):
+        obj = {"type": "indicator", "id": "indicator--1", "name": "n",
+               "pattern": "[domain-name:value = '%s']" % value,
+               "pattern_type": "stix", "labels": ["phishing"],
+               "confidence": 80, "created": "2026-08-01T00:00:00Z"}
+        obj.update(over)
+        return obj
+
+    def test_taxii_is_a_selectable_source(self):
+        self.assertIn("taxii", nexus.SOURCES)
+        args = nexus.build_parser().parse_args(["--source", "taxii"])
+        self.assertEqual(args.source, "taxii")
+        self.assertEqual(nexus.SOURCE_LABELS["taxii"], "TAXII")
+
+    def test_make_client_builds_a_taxii_client(self):
+        config = {"source": "taxii", "source_host": "h", "token": "t",
+                  "scheme": "https", "port": None, "verify_tls": True,
+                  "timeout": 30, "retries": 3, "taxii_version": "2.0",
+                  "taxii_username": "alice"}
+        client = nexus.make_client(config)
+        self.assertIsInstance(client, nexus.TaxiiClient)
+        # Both TAXII-only answers have to survive the trip, and neither is
+        # the constructor's own default.
+        self.assertEqual(client.version, "2.0")
+        self.assertEqual(client.username, "alice")
+
+    def test_meta_source_names_the_collection(self):
+        rows, _ = nexus.build_indicators(
+            [{"type": "Domain-Name", "value": "evil.example",
+              "event_id": "indicator--1", "category": "phishing",
+              "comment": "", "timestamp": "", "collection": "Feed One"}],
+            types=None, source="taxii", mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="TAXII-{collection}")
+        self.assertIn("TAXII-Feed-One", rows[0][2])
+
+    def test_a_collection_name_cannot_break_the_tab_layout(self):
+        source, _, _ = nexus.render_meta(
+            {"collection": "Feed\tOne / two", "event_id": "indicator--1"},
+            source_fmt="TAXII-{collection}", source="taxii")
+        self.assertNotIn("\t", source)
+        self.assertEqual(source, "TAXII-Feed-One-two")
+
+    def test_no_meta_url_is_invented_for_taxii(self):
+        # A TAXII object has no browsable page; the MISP /events/view/ shape
+        # would point an analyst at a server that has no such event.
+        _, _, url = nexus.render_meta(
+            {"event_id": "indicator--1"}, base_url="https://taxii.example",
+            source="taxii")
+        self.assertEqual(url, nexus.NULL_FIELD)
+
+    def test_the_interview_offers_the_collection_placeholder(self):
+        # Empty answers take every default; without a TAXII format list the
+        # default here would be SOURCE_FORMATS[0], "MISP-event-{event_id}".
+        config = {"source": "taxii", "source_host": "taxii.example"}
+        nexus._stage7_metadata(config, lambda _p: "", offline=True)
+        self.assertEqual(config["source_fmt"], "TAXII-{collection}")
+        self.assertNotIn("MISP", self.printed)
+        # The link question is not asked -- "yes" is the default everywhere
+        # else, so leaving it in would have produced a MISP-shaped meta.url.
+        self.assertIsNone(config["source_base_url"])
+        self.assertNotIn("Link meta.url", self.printed)
+
+    def test_an_interview_answer_reaches_a_rendered_collection_name(self):
+        # The whole point: {collection} is reachable without a test reaching
+        # past the interview to set source_fmt by hand.
+        config = nexus.run_interview(
+            None, input_fn=scripted(["taxii.example"], fill=""),
+            getpass_fn=lambda _p: "tok", source="taxii", offline=True)
+        records = nexus.flatten_taxii_object(self.indicator(),
+                                             collection_title="Feed One")
+        rows, _ = nexus.build_indicators(
+            records, types=config.get("types"), source="taxii",
+            mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt=config["source_fmt"])
+        self.assertEqual(rows[0][2], "TAXII-Feed-One")
+
+    def test_the_taxii_path_does_not_run_the_misp_feed_stage(self):
+        config = nexus.run_interview(
+            None, input_fn=scripted(["taxii.example"], fill=""),
+            getpass_fn=lambda _p: "tok", source="taxii", offline=True)
+        self.assertNotIn("feeds", config)
+        self.assertNotIn("MISP feeds", self.printed)
+
+    def test_the_shaping_answers_the_build_needs_are_asked(self):
+        # cmd_build reads these three off the config; the OpenCTI path asks
+        # them in stage 3 and the TAXII path has to as well.  "n" differs
+        # from both defaults, so this fails if the questions are skipped.
+        config = {}
+        nexus._stage3_collections_taxii(
+            config, {"collections": [self.collection()]},
+            by_prompt([("Treat hostname", "n"),
+                       ("Emit Intel::SUBNET", "n")]))
+        self.assertEqual(config["split_composites"], "both")
+        self.assertIs(config["hostname_as_domain"], False)
+        self.assertIs(config["allow_subnet"], False)
+        self.assertNotIn("Hostname", config["types"])
+        self.assertIn("Domain-Name", config["types"])
+
+    def test_declining_hostname_actually_drops_hostname_rows(self):
+        config = {}
+        nexus._stage3_collections_taxii(
+            config, {"collections": [self.collection()]},
+            by_prompt([("Treat hostname", "n")]))
+        records = nexus.flatten_taxii_object(
+            self.indicator(pattern="[hostname:value = 'box.example']"))
+        rows, _ = nexus.build_indicators(
+            records, types=config["types"], source="taxii",
+            mapping_table=nexus.OPENCTI_TO_ZEEK)
+        self.assertEqual(rows, [])
+
+
+class TestTaxiiEndToEnd(unittest.TestCase):
+    """A real TAXII server, over a real socket, through the real client and
+    out as a rendered intel.dat line -- the wiring this task is for."""
+
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--1", "name": "bad domain",
+             "pattern": "[domain-name:value = 'evil.example']",
+             "pattern_type": "stix", "labels": ["phishing"],
+             "confidence": 80, "created": "2026-08-01T00:00:00Z"},
+            {"type": "indicator", "id": "indicator--2", "name": "benign",
+             "pattern": "[ipv4-addr:value = '203.0.113.9']",
+             "pattern_type": "stix", "labels": ["benign"],
+             "confidence": 80, "created": "2026-08-01T00:00:00Z"},
+        ]}]
+
+    def test_a_taxii_run_renders_an_intel_line(self):
+        config = {"source": "taxii", "source_host": "127.0.0.1",
+                  "token": "t", "scheme": "http", "port": self.server.port,
+                  "verify_tls": False, "timeout": 5, "retries": 1,
+                  "taxii_version": "2.1", "taxii_username": None,
+                  "days": 90, "exclude_labels": ["benign"],
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"}]}
+        client = nexus.make_client(config)
+        rows, stats = nexus.build_indicators(
+            nexus._fetch_records(client, config), types=None,
+            source="taxii", mapping_table=nexus.OPENCTI_TO_ZEEK,
+            source_fmt="TAXII-{collection}",
+            desc_template="{event_info}")
+        lines = nexus.rows_to_lines(rows)
+        self.assertEqual(lines, ["evil.example\tIntel::DOMAIN\t"
+                                 "TAXII-Feed-One\tbad domain\t-"])
+        # The excluded object was fetched and then dropped locally, which is
+        # exactly what the summary promises.
+        self.assertEqual(stats.fetched, 1)
+        self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
+
+
+class TestTaxiiProbe(unittest.TestCase):
+    """--probe --source taxii became reachable the moment "taxii" joined
+    SOURCES; before this it fell through to the MISP probe and died on
+    describe_types()."""
+
+    def setUp(self):
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+        self.buffer = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.buffer)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def test_the_probe_reports_the_collections(self):
+        # Through cmd_probe, not _cmd_probe_taxii: calling the helper proves
+        # it works, never that --source taxii reaches it.
+        token = os.path.join(tempfile.mkdtemp(), "token")
+        with io.open(token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        args = nexus.build_parser().parse_args(
+            ["--probe", "--source", "taxii", "--host", "127.0.0.1",
+             "--scheme", "http", "--port", str(self.server.port),
+             "--insecure", "--retries", "1", "--token-file", token])
+        self.assertEqual(nexus.cmd_probe(args), 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("Feed One", printed)
+        self.assertIn("Feed Two", printed)
+        self.assertIn("after download", printed)
+
+    def test_an_endpoint_with_no_readable_collection_is_a_failure(self):
+        self.server.server.routes = {"/taxii2/": (200, {"title": "T",
+                                                        "api_roots": []})}
+        client = self.server.client()
+        self.assertEqual(nexus._cmd_probe_taxii(client, None), 1)
+        self.assertIn("none readable", self.buffer.getvalue())
+
+    def test_probe_says_its_counts_are_pre_filter(self):
+        # TAXII has no way to count a filtered subset -- the label,
+        # marking, confidence, validity and author filters all run after
+        # download. A probe count that didn't say so would read as "what
+        # you'll get", which it is not.
+        token = os.path.join(tempfile.mkdtemp(), "token")
+        with io.open(token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        args = nexus.build_parser().parse_args(
+            ["--probe", "--source", "taxii", "--host", "127.0.0.1",
+             "--scheme", "http", "--port", str(self.server.port),
+             "--insecure", "--retries", "1", "--token-file", token])
+        self.assertEqual(nexus.cmd_probe(args), 0)
+        printed = self.buffer.getvalue().lower()
+        self.assertIn("before the post-download filters", printed)
+
+    def test_probe_reports_the_real_object_count_per_collection(self):
+        # A probe that printed a constant, or the collection count instead
+        # of the object count, would still satisfy the wording test above --
+        # this catches that.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T", "api_roots": ["/api1/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Feed One"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--%d" % n,
+             "pattern": "[domain-name:value = 'x%d.example']" % n,
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}
+            for n in range(3)]}]
+        client = self.server.client()
+        args = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, args), 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("Feed One", printed)
+        self.assertRegex(printed, r"Feed One\s+3\s")
+
+    def test_probe_marks_a_count_that_hit_the_limit(self):
+        # A count equal to probe_limit means the pull was capped, not that
+        # the collection really holds exactly that many objects -- the "+"
+        # is the only thing telling the two apart.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T", "api_roots": ["/api1/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Feed One"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--%d" % n,
+             "pattern": "[domain-name:value = 'x%d.example']" % n,
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}
+            for n in range(3)]}]
+        client = self.server.client()
+
+        capped = argparse.Namespace(probe_limit=3)
+        self.assertEqual(nexus._cmd_probe_taxii(client, capped), 0)
+        printed = self.buffer.getvalue()
+        self.assertRegex(printed, r"Feed One\s+3\+")
+
+        self.buffer.truncate(0)
+        self.buffer.seek(0)
+        self.server.server.objects_index = 0
+        under = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, under), 0)
+        printed = self.buffer.getvalue()
+        line = [l for l in printed.splitlines() if "Feed One" in l][0]
+        self.assertNotIn("+", line)
+
+    def test_probe_reports_one_collections_error_without_losing_the_rest(self):
+        # The whole point of a probe is a survey; one unreadable collection
+        # must not cost the operator the counts for the others. The fake
+        # server's /objects/ branch always answers 200 regardless of
+        # routes= (it is intercepted ahead of the routes lookup), so the
+        # fault is injected at the client instead -- fetch_objects raising
+        # for one collection is exactly what a real 500 or connection
+        # failure would look like from _cmd_probe_taxii's point of view.
+        self.server.server.routes = {
+            "/taxii2/": (200, {"title": "T",
+                               "api_roots": ["/api1/", "/api2/"]}),
+            "/api1/collections/": (200, {"collections": [
+                {"id": "c1", "title": "Bad Feed"}]}),
+            "/api2/collections/": (200, {"collections": [
+                {"id": "c2", "title": "Good Feed"}]}),
+        }
+        self.server.server.pages = [{"more": False, "objects": [
+            {"type": "indicator", "id": "indicator--0",
+             "pattern": "[domain-name:value = 'x0.example']",
+             "pattern_type": "stix", "created": "2026-08-01T00:00:00Z"}]}]
+        client = self.server.client()
+        real_fetch_objects = client.fetch_objects
+
+        def flaky_fetch_objects(collection, **kwargs):
+            if collection["id"] == "c1":
+                raise nexus.SourceError("boom")
+            return real_fetch_objects(collection, **kwargs)
+
+        client.fetch_objects = flaky_fetch_objects
+        args = argparse.Namespace(probe_limit=5000)
+        self.assertEqual(nexus._cmd_probe_taxii(client, args), 0)
+        printed = self.buffer.getvalue()
+        bad_line = [l for l in printed.splitlines() if "Bad Feed" in l][0]
+        good_line = [l for l in printed.splitlines() if "Good Feed" in l][0]
+        self.assertIn("ERR", bad_line)
+        self.assertRegex(good_line, r"Good Feed\s+1\s")
+
+
+class TestTaxiiExplain(unittest.TestCase):
+    """--explain on a TAXII profile must not print a MISP restSearch body."""
+
+    def _explain(self, **over):
+        config = {"source": "taxii", "source_host": "taxii.example",
+                  "days": 90, "collections": [
+                      {"id": "c1", "title": "Feed One", "api_root": "/api1/"},
+                      {"id": "c2", "title": "Feed Two", "api_root": "/api2/"}]}
+        config.update(over)
+        path = os.path.join(tempfile.mkdtemp(), "t.json")
+        nexus.save_profile(config, path)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(
+                nexus.cmd_explain(argparse.Namespace(profile=path)), 0)
+        return buffer.getvalue()
+
+    def test_2_1_is_described_as_limit_and_cursor_paged(self):
+        # "one GET request per collection" was true of neither version: 2.1
+        # sends limit and follows `next`, one request per page.
+        printed = self._explain(taxii_version="2.1")
+        self.assertNotIn("GET request(s), one per collection", printed)
+        self.assertIn("limit=%d" % nexus.TAXII_PAGE_SIZE, printed)
+        self.assertIn("next", printed)
+
+    def test_2_0_is_described_as_range_paged(self):
+        # 2.0 has no limit parameter at all; page size only reaches the
+        # server as the width of a Range header, one request per page.
+        printed = self._explain(taxii_version="2.0")
+        self.assertNotIn("limit=", printed)
+        self.assertIn("Range", printed)
+
+    def test_it_prints_one_request_per_collection(self):
+        printed = self._explain()
+        self.assertNotIn("restSearch", printed)
+        self.assertIn("/api1/collections/c1/objects/", printed)
+        self.assertIn("/api2/collections/c2/objects/", printed)
+        self.assertIn("added_after=", printed)
+
+
+class TestTaxiiBuild(Quiet):
+    """cmd_build driven all the way through on a TAXII profile.
+
+    TestTaxiiEndToEnd hand-passes mapping_table=OPENCTI_TO_ZEEK to
+    build_indicators, which is precisely the line cmd_build's taxii branch
+    exists to set -- so it could not catch that branch going missing.
+    Mutating the branch to `elif False:` writes an empty file and exits 0.
+    """
+
+    def setUp(self):
+        Quiet.setUp(self)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.out = os.path.join(self.dir, "intel.dat")
+        self.token = os.path.join(self.dir, "token")
+        with io.open(self.token, "w", encoding="utf-8") as handle:
+            handle.write("tok\n")
+        self.server = FakeTaxii()
+        self.addCleanup(self.server.stop)
+
+    def objects(self, count=1, values_per_pattern=1):
+        objects = []
+        for n in range(count):
+            values = ["evil%d-%d.example" % (n, v)
+                      for v in range(values_per_pattern)]
+            pattern = " OR ".join("domain-name:value = '%s'" % v
+                                  for v in values)
+            objects.append({"type": "indicator", "id": "indicator--%d" % n,
+                            "name": "bad %d" % n, "pattern": "[%s]" % pattern,
+                            "pattern_type": "stix", "labels": ["phishing"],
+                            "created": "2026-08-01T00:00:00Z"})
+        return objects
+
+    def profile(self, **over):
+        config = {
+            "source": "taxii", "source_host": "127.0.0.1", "scheme": "http",
+            "port": self.server.port, "verify_tls": False, "proxy": None,
+            "timeout": 5, "retries": 1, "taxii_version": "2.1",
+            "collections": [{"id": "c1", "title": "Feed One",
+                             "api_root": "/api1/"}],
+            "days": 0, "include_labels": [], "exclude_labels": [],
+            "include_markings": [], "include_authors": [],
+            "min_confidence": 0, "drop_expired": True,
+            "split_composites": "both", "allow_subnet": True,
+            "hostname_as_domain": True, "types": None,
+            "exclude_private": True, "own_networks": [], "own_domains": [],
+            "allowlist_file": None, "source_fmt": "TAXII-{collection}",
+            "desc_template": "{event_info}", "source_base_url": None,
+            "do_notice": False, "meta_maxlen": 200,
+            "output_path": self.out, "offline": True,
+            "deployment": "offline", "backup": False, "dry_run": False,
+            "apply": False, "max_indicators": None,
+        }
+        config.update(over)
+        path = os.path.join(self.dir, "taxii.json")
+        nexus.save_profile(config, path)
+        return path
+
+    def run_build(self, profile_path):
+        args = nexus.resolve_source_args(nexus.build_parser().parse_args(
+            ["--profile", profile_path, "--yes", "--offline",
+             "--token-file", self.token]))
+        return nexus.cmd_build(args)
+
+    def test_a_taxii_profile_builds_a_real_intel_file(self):
+        self.server.server.pages = [{"more": False,
+                                     "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self.profile()), 0)
+        with io.open(self.out, encoding="utf-8") as handle:
+            body = handle.read()
+        self.assertIn("evil0-0.example\tIntel::DOMAIN\tTAXII-Feed-One",
+                      body)
+
+    def test_the_indicator_cap_is_honoured_exactly(self):
+        # Five objects, three values each: 15 indicators from 5 objects.
+        # fetch_objects counts objects and _fetch_records counts records, so
+        # a cap enforced only by max_results overshoots 3x -- and check_size
+        # treats the cap as a hard block, so the build fails and writes
+        # nothing rather than trimming.
+        self.server.server.pages = [{"more": False,
+                                     "objects": self.objects(5, 3)}]
+        self.assertEqual(self.run_build(self.profile(max_indicators=3)), 0)
+        with io.open(self.out, encoding="utf-8") as handle:
+            rows = [l for l in handle.read().splitlines()
+                    if l and not l.startswith("#")]
+        self.assertEqual(len(rows), 3)
+
+    def _basic_profile(self):
+        return self.profile(taxii_auth="basic")
+
+    def test_a_basic_profile_replays_as_basic_not_bearer(self):
+        # taxii_username is excluded from profiles on purpose -- it is half a
+        # credential -- so a replayed Basic profile has to find it somewhere.
+        # Without that, make_client silently builds a Bearer client and the
+        # server answers 401 with a message blaming the token.
+        os.environ["NEXUS_TAXII_USERNAME"] = "alice-admin"
+        self.addCleanup(os.environ.pop, "NEXUS_TAXII_USERNAME", None)
+        self.server.server.pages = [{"more": False, "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self._basic_profile()), 0)
+        expected = "Basic " + base64.b64encode(
+            b"alice-admin:tok").decode("ascii")
+        self.assertEqual(sorted(set(r["auth"] for r in self.server.requests)),
+                         [expected])
+
+    def test_a_basic_profile_with_no_username_fails_instead_of_downgrading(self):
+        # --yes cannot prompt, so this is the unattended path failing loudly
+        # rather than sending the password as a Bearer token.
+        os.environ.pop("NEXUS_TAXII_USERNAME", None)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            with self.assertLogs(nexus.log, level="ERROR"):
+                code = self.run_build(self._basic_profile())
+        self.assertEqual(code, 2)
+        self.assertIn("NEXUS_TAXII_USERNAME", errors.getvalue() + self.printed)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_bearer_profile_is_untouched(self):
+        os.environ.pop("NEXUS_TAXII_USERNAME", None)
+        self.server.server.pages = [{"more": False, "objects": self.objects(1)}]
+        self.assertEqual(self.run_build(self.profile()), 0)
+        self.assertEqual(sorted(set(r["auth"] for r in self.server.requests)),
+                         ["Bearer tok"])
+
+    def test_a_dropped_object_is_still_counted_as_fetched(self):
+        # The summary promises the post-download filters "thin what is kept,
+        # not what is fetched"; a stats line reading "fetched 1" when two
+        # objects crossed the wire contradicts it.
+        self.server.server.pages = [{"more": False, "objects": [
+            self.objects(1)[0],
+            {"type": "indicator", "id": "indicator--x", "name": "benign",
+             "pattern": "[domain-name:value = 'ok.example']",
+             "pattern_type": "stix", "labels": ["benign"],
+             "created": "2026-08-01T00:00:00Z"}]}]
+        self.assertEqual(
+            self.run_build(self.profile(exclude_labels=["benign"])), 0)
+        self.assertIn("fetched 2 records -> 1 indicators", self.printed)
+        self.assertIn("taxii post-download filter", self.printed)
+
+
+class TestTaxiiFetchRecords(unittest.TestCase):
+    """_fetch_records' TAXII branch: one query per collection, flattened,
+    then thinned by the post-download filters."""
+
+    class StubClient(object):
+        def __init__(self, objects_by_collection):
+            self.objects = objects_by_collection
+            self.calls = []
+
+        def fetch_objects(self, collection, added_after=None,
+                          max_results=None, page_size=100):
+            self.calls.append({"collection": collection["id"],
+                               "added_after": added_after,
+                               "max_results": max_results})
+            sent = 0
+            for obj in self.objects.get(collection["id"], []):
+                yield obj
+                sent += 1
+                # Honoured exactly as TaxiiClient honours it -- on objects,
+                # which is the whole point of not passing a record budget in.
+                if max_results is not None and sent >= max_results:
+                    return
+
+    def indicator(self, value, ident, **over):
+        obj = {"type": "indicator", "id": ident, "name": "n",
+               "pattern": "[domain-name:value = '%s']" % value,
+               "pattern_type": "stix", "labels": ["phishing"],
+               "created": "2026-08-01T00:00:00Z"}
+        obj.update(over)
+        return obj
+
+    def config(self, **over):
+        config = {"source": "taxii", "days": 0,
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"},
+                                  {"id": "c2", "title": "Feed Two",
+                                   "api_root": "/api2/"}]}
+        config.update(over)
+        return config
+
+    def test_every_selected_collection_is_queried_and_named(self):
+        client = self.StubClient({"c1": [self.indicator("a.example", "i--1")],
+                                  "c2": [self.indicator("b.example", "i--2")]})
+        records = list(nexus._fetch_records(client, self.config()))
+        self.assertEqual([c["collection"] for c in client.calls], ["c1", "c2"])
+        self.assertEqual([r["value"] for r in records],
+                         ["a.example", "b.example"])
+        self.assertEqual([r["collection"] for r in records],
+                         ["Feed One", "Feed Two"])
+
+    def test_days_becomes_a_server_side_added_after(self):
+        client = self.StubClient({})
+        list(nexus._fetch_records(client, self.config(days=90)))
+        stamp = client.calls[0]["added_after"]
+        self.assertIsNotNone(stamp)
+        moment = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - moment
+        self.assertAlmostEqual(delta.total_seconds(), 90 * 86400, delta=120)
+
+    def test_no_time_filter_sends_no_added_after(self):
+        client = self.StubClient({})
+        list(nexus._fetch_records(client, self.config(days=0)))
+        self.assertIsNone(client.calls[0]["added_after"])
+
+    def unmappable(self, ident):
+        """An indicator that flattens to no records at all.
+
+        Routine, not exotic: every yara/sigma/snort indicator flattens to
+        nothing, as do windows-registry-key and network-traffic patterns.
+        """
+        return {"type": "indicator", "id": ident, "name": "n",
+                "pattern": "rule x { condition: true }",
+                "pattern_type": "yara", "created": "2026-08-01T00:00:00Z"}
+
+    def test_the_cap_is_a_record_budget_not_an_object_budget(self):
+        # max_indicators counts records; fetch_objects' max_results counts
+        # objects, and flattening is 1:N with N often zero.  Passing the
+        # record budget down as an object cap ended the pull early and said
+        # nothing: ten objects, five records, "capped at 10".
+        objects = []
+        for n in range(5):
+            objects.append(self.unmappable("i--y%d" % n))
+            objects.append(self.indicator("d%d.example" % n, "i--d%d" % n))
+        client = self.StubClient({"c1": objects})
+        records = list(nexus._fetch_records(client, self.config(
+            collections=[{"id": "c1", "title": "Feed One",
+                          "api_root": "/api1/"}],
+            max_indicators=3)))
+        self.assertEqual([r["value"] for r in records],
+                         ["d0.example", "d1.example", "d2.example"])
+        self.assertIsNone(client.calls[0]["max_results"])
+
+    def test_the_post_download_filters_are_actually_applied(self):
+        client = self.StubClient({
+            "c1": [self.indicator("keep.example", "i--1", labels=["phishing"]),
+                   self.indicator("drop.example", "i--2", labels=["benign"])]})
+        config = self.config(collections=[{"id": "c1", "title": "Feed One",
+                                           "api_root": "/api1/"}],
+                             exclude_labels=["benign"])
+        records = list(nexus._fetch_records(client, config))
+        self.assertEqual([r["value"] for r in records], ["keep.example"])
+
+
+class TestTaxiiSummary(unittest.TestCase):
+    """The Proceed prompt is where an operator approves the scope, so the
+    summary has to describe the TAXII run, not a MISP one."""
+
+    def config(self, **over):
+        config = {"source": "taxii", "source_host": "taxii.example",
+                  "scheme": "https", "port": 443, "verify_tls": True,
+                  "taxii_version": "2.1", "days": 90,
+                  "collections": [{"id": "c1", "title": "Feed One",
+                                   "api_root": "/api1/"}],
+                  "split_composites": "both", "allow_subnet": True,
+                  "hostname_as_domain": True,
+                  "include_labels": ["apt"], "exclude_labels": ["benign"],
+                  "include_markings": ["marking-definition--m1"],
+                  "include_authors": ["identity--a1"],
+                  "min_confidence": 75, "drop_expired": True,
+                  "exclude_private": True, "own_networks": [],
+                  "own_domains": [], "allowlist_file": None,
+                  "source_fmt": "TAXII-{collection}",
+                  "desc_template": "", "source_base_url": None,
+                  "do_notice": False, "meta_maxlen": 200,
+                  "output_path": "/tmp/intel.dat"}
+        config.update(over)
+        return config
+
+    def test_the_answered_window_is_not_reported_as_all_time(self):
+        # The TAXII path never sets time_mode; reading it made the summary
+        # claim "all time" over an answered 90-day added_after -- the one
+        # filter TAXII really does apply server-side.
+        text = nexus.summarise_config(self.config())
+        self.assertNotIn("all time", text)
+        self.assertIn("90 days", text)
+        self.assertIn("added_after", text)
+
+    def test_no_time_filter_says_so(self):
+        text = nexus.summarise_config(self.config(days=0))
+        self.assertIn("all time", text)
+
+    def test_the_selected_collections_are_named(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("Feed One", text)
+
+    def test_no_collections_is_called_out_not_left_blank(self):
+        text = nexus.summarise_config(self.config(collections=[]))
+        self.assertIn("none selected", text)
+
+    def test_the_client_side_filters_are_marked_after_download(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("after download", text.lower())
+        for fragment in ("apt", "benign", "marking-definition--m1",
+                         "identity--a1", "75"):
+            self.assertIn(fragment, text)
+        self.assertIn("valid_until", text)
+
+    def test_no_misp_lines_leak_onto_the_taxii_summary(self):
+        text = nexus.summarise_config(self.config())
+        self.assertNotIn("all of MISP", text)
+        self.assertNotIn("to_ids", text)
+        self.assertNotIn("restSearch", text)
+
+    def test_the_summary_shows_the_query_that_will_be_sent(self):
+        text = nexus.summarise_config(self.config())
+        self.assertIn("match[type]=indicator", text)
+
+
+class TestTaxiiProfiles(unittest.TestCase):
+
+    def test_a_v2_profile_without_taxii_keys_still_loads(self):
+        path = os.path.join(tempfile.mkdtemp(), "old.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"profile_version": nexus.PROFILE_VERSION,
+                       "nexus_version": "x", "saved_utc": "now",
+                       "config": {"source": "misp", "types": ["ip-dst"]}},
+                      handle)
+        config = nexus.load_profile(path)
+        self.assertEqual(config["source"], "misp")
+        self.assertNotIn("taxii_version", config)
+
+    def test_a_taxii_profile_keeps_the_collections_but_not_the_secrets(self):
+        path = os.path.join(tempfile.mkdtemp(), "taxii.json")
+        nexus.save_profile({"source": "taxii", "token": "pw",
+                            "taxii_username": "alice",
+                            "taxii_version": "2.0",
+                            "collections": [{"id": "c1", "title": "Feed One",
+                                             "api_root": "/api1/"}]}, path)
+        config = nexus.load_profile(path)
+        self.assertEqual(config["taxii_version"], "2.0")
+        self.assertEqual(config["collections"][0]["title"], "Feed One")
+        self.assertNotIn("token", config)
+        self.assertNotIn("taxii_username", config)
 
 class TestOpenctiSearch(unittest.TestCase):
 
