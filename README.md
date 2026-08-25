@@ -444,5 +444,4 @@ Working against fake servers and a full offline test suite. **Verified against
 a live MISP instance**: connection, discovery, a full interview-driven build
 and `--lint` all producing a valid, correctly-formatted `intel.dat`.
 **OpenCTI, TAXII, and applying to a real Security Onion manager remain
-unverified.** `HANDOFF.md` §7 lists exactly what is unverified and what to
-check the first time a real one is available.
+unverified.**
