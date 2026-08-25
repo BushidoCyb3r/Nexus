@@ -59,11 +59,18 @@ Useful ones:
 | Flag | What it does |
 |---|---|
 | `--probe` | Connect and report available IOC counts. Builds nothing. |
-| `--dry-run` | Build to a temp file and show the diff. Writes nothing live. |
-| `--diff` | Show what would change against the current file. |
+| `--dry-run` | Build, run every check, report the indicator delta. Writes nothing. |
+| `--diff` | Add the full line diff. Implies `--dry-run`, so it never writes. |
 | `--explain` | Print the resolved platform query for a saved profile. Contacts nothing. |
-| `--lint PATH` | Validate an `intel.dat` and exit. |
+| `--lint PATH` | Validate an `intel.dat` and exit. Reads the schema from the file's own `#fields` header. |
 | `--apply` | Push the existing file to the grid and check the reporter log. |
+| `--do-notice` | Emit the sixth `meta.do_notice` column, `T` on every row — every match raises a Zeek notice. With `--lint`, force that schema instead of reading it. |
+
+The connection flags — `--scheme`, `--port`, `--insecure`, `--proxy`,
+`--timeout`, `--retries`, and `--host` — seed the stage 1 defaults. They do
+not skip the questions; Enter accepts the seeded value. `--insecure` is the
+one that also counts as the typed `INSECURE` confirmation, because it is
+already a deliberate act spelled out on the command line.
 
 At the end of the interview Nexus offers to save your answers as a **profile**
 under `/opt/nexus/profiles/`. Replay it with:
@@ -135,8 +142,9 @@ you the commands and stops.
 Before writing anything it checks the things that would otherwise fail at 02:00
 with nobody watching: that this host runs systemd, that the unit directory is
 writable, that the profile is not an offline one, that a credential is actually
-reachable without a terminal, and whether the profile applies to the grid or
-only stages the file.
+reachable without a terminal — including one sitting in `/opt/nexus/nexus.env`,
+which the unit reads but your shell does not — and whether the profile applies
+to the grid or only stages the file.
 
 The units it writes:
 
@@ -202,8 +210,29 @@ loaded but nothing matches.
   asking.
 - It will not write a broad indicator that would arm Zeek against half the
   internet. Subnets wider than the configured floor are refused.
-- It will not let a filter silently match nothing.
+- It will not let a filter silently match nothing. A run that builds zero
+  indicators — a bad token's permissions, a filter that matches nothing, no IOC
+  types or collections selected — blocks and writes nothing, rather than
+  leaving a header-only `intel.dat` that Zeek loads and never matches.
+- It will not exceed a cap you set in the interview. The cap is measured
+  against the whole merged file, not just this run's additions, so once
+  `intel.dat` has grown to it every later run blocks and writes nothing until
+  you raise it.
+- It will not build from a half-finished pull. If the platform fails part-way
+  through a fetch — a token that expires mid-run, a server error that outlasts
+  the retries — the run says so and writes nothing, rather than merging the
+  fraction it managed to download and reporting success.
+- It will not preserve comment lines you add to `intel.dat` by hand. A `#`
+  line is skipped when the existing file is read, so it is absent from the
+  merge written back. Indicators are never lost; your annotations are.
 - It will not add a dependency.
+- It will not write an indicator it knows Zeek would ignore. A value starting
+  with `#` is a comment line to Zeek's reader, so it is rejected at
+  normalisation rather than written and silently skipped.
+
+One thing it *will* do that is worth knowing before you ask for it:
+`meta.do_notice` has no per-indicator setting. Turning it on writes `T` on
+every row, so every matching indicator raises a Zeek notice.
 
 ---
 
@@ -213,7 +242,7 @@ loaded but nothing matches.
 python3 -m unittest test_nexus
 ```
 
-No network, no Security Onion, no platform. The suite stands up fake MISP,
+742 tests. No network, no Security Onion, no platform. The suite stands up fake MISP,
 OpenCTI and TAXII servers on local sockets.
 
 ---

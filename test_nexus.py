@@ -8,6 +8,7 @@ a local http.server that replays canned responses.
 import argparse
 import base64
 import contextlib
+import http.client
 import io
 import json
 import logging
@@ -17,7 +18,9 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -193,6 +196,33 @@ class TestNormalise(unittest.TestCase):
     def test_url_defanged(self):
         self.assertEqual(nexus.norm_url("hxxp://evil[.]com/a"), "evil.com/a")
 
+    def test_url_with_a_query_but_no_path_keeps_its_host(self):
+        # "example.com?a=1" used to put the whole query string inside the
+        # host, so every host check failed it and the indicator was dropped
+        # as url_no_host.  Zeek matches host+uri and the uri starts at "/".
+        self.assertEqual(nexus.norm_url("http://evil.com?a=1&b=2"),
+                         "evil.com/?a=1&b=2")
+        self.assertEqual(nexus.norm_url("http://user:pw@evil.com?a=1"),
+                         "evil.com/?a=1")
+        # A URL that already has a path is untouched by that repair.
+        self.assertEqual(nexus.norm_url("http://evil.com/a?b=1"),
+                         "evil.com/a?b=1")
+
+    def test_url_with_an_ipv6_literal_host(self):
+        # The port split cut "[2606:4700::1111]" down to "[2606", so every
+        # host check failed and the URL was dropped as url_no_host -- a
+        # reason that named the wrong problem.  The brackets stay: that is
+        # the form a Host header carries, and Zeek matches host+uri.
+        self.assertEqual(nexus.norm_url("http://[2606:4700::1111]/a"),
+                         "[2606:4700::1111]/a")
+        self.assertEqual(nexus.norm_url("https://[2606:4700::1111]:8443"),
+                         "[2606:4700::1111]:8443/")
+        self.assertEqual(nexus.norm_url("http://u:pw@[2606:4700::1111]/a"),
+                         "[2606:4700::1111]/a")
+        # A bracketed thing that is not an address is still no host.
+        self.assertRejected(nexus.norm_url, "http://[not-an-address]/a",
+                            "url_no_host")
+
     def test_url_rejections(self):
         self.assertRejected(nexus.norm_url, "http://", "empty_url")
         self.assertRejected(nexus.norm_url, "http://evil com/a",
@@ -290,6 +320,15 @@ class TestExclusions(unittest.TestCase):
         self.assertEqual(ex.reason("corp.example/a", "Intel::URL"), "own_domain")
         self.assertEqual(ex.reason("bob@corp.example", "Intel::EMAIL"),
                          "own_domain")
+
+    def test_url_host_survives_a_port_and_an_ipv6_literal(self):
+        # The URL branch split the host on ":" to drop a port, which also
+        # cut a bracketed IPv6 literal in half -- so it compared "[2606"
+        # against the operator's own domains.
+        ex = nexus.ExclusionSet(own_domains=["corp.example"])
+        self.assertEqual(ex.reason("corp.example:8443/a", "Intel::URL"),
+                         "own_domain")
+        self.assertIsNone(ex.reason("[2606:4700::1111]/a", "Intel::URL"))
 
     def test_allowlist(self):
         ex = nexus.ExclusionSet(allowlist=["1.2.3.4"])
@@ -559,12 +598,6 @@ class TestFileIO(unittest.TestCase):
         header, rows = nexus.read_existing(os.path.join(self.tmp, "nope.dat"))
         self.assertIsNone(header)
         self.assertEqual(rows, [])
-
-    def test_merge_preserves_hand_added_rows_only(self):
-        rows = ["1.2.3.4\tIntel::ADDR\tMISP-event-1\t-\t-",
-                "5.6.7.8\tIntel::ADDR\thand-added\t-\t-"]
-        preserved = nexus.merge_preserved(rows, source_prefix="MISP")
-        self.assertEqual(preserved, ["5.6.7.8\tIntel::ADDR\thand-added\t-\t-"])
 
     def test_additive_merge_never_removes_or_rewrites_existing(self):
         existing = [
@@ -3130,6 +3163,55 @@ class TestTaxiiInterviewRouting(Quiet):
         self.assertIs(config["drop_expired"], True)
 
 
+class TestTaxiiVersionIsDetectedAtConnectTime(Quiet):
+    """Stage 1 asks the TAXII version before there is a client to ask the
+    server with -- stage 1 is what collects the credential.  Detection can
+    only happen when run_interview connects, and it has to happen there: a
+    2.0 server does not answer /taxii2/, so taking the stage 1 answer on
+    trust reads as an unreachable host, and the operator reaches stage 3
+    with no collections and a build that fetches nothing.
+    """
+
+    class Stub(object):
+        def __init__(self, speaks="2.0"):
+            self.speaks = speaks
+            self.version = "2.1"
+            self.detected = 0
+
+        def detect_version(self):
+            self.detected += 1
+            self.version = self.speaks
+            return self.speaks
+
+        def get_version(self):
+            raise AssertionError("the TAXII path must detect, not assume")
+
+        def get_collections(self):
+            return [{"id": "c1", "title": "Feed", "api_root": "/api1/"}]
+
+    def interview(self, stub):
+        return nexus.run_interview(
+            None, input_fn=scripted(["taxii.example"], fill=""),
+            getpass_fn=lambda prompt: "tok", source="taxii", offline=True,
+            connect=lambda config: stub)
+
+    def test_a_20_server_corrects_the_answered_version(self):
+        stub = self.Stub("2.0")
+        config = self.interview(stub)
+        self.assertEqual(stub.detected, 1)
+        self.assertEqual(config["taxii_version"], "2.0")
+        self.assertIn("answers TAXII 2.0", self.printed)
+        # The point of the correction: discovery still runs, so stage 3 has
+        # collections to offer.
+        self.assertEqual([c["id"] for c in config["collections"]], ["c1"])
+
+    def test_an_agreeing_server_is_not_announced(self):
+        stub = self.Stub("2.1")
+        config = self.interview(stub)
+        self.assertEqual(config["taxii_version"], "2.1")
+        self.assertNotIn("answers TAXII", self.printed)
+
+
 # ---------------------------------------------------------------------------
 # STAGES 2, 2b, 3 -- OpenCTI discovery, feeds and IOC types
 # ---------------------------------------------------------------------------
@@ -3386,6 +3468,26 @@ class TestStage7SourceFormats(Quiet):
         self.assertTrue(config["do_notice"])
         self.assertNotIn("do_notice.zeek", self.printed)
 
+    def test_stage7_keeps_the_meta_source_stage_2b_chose(self):
+        """Stage 2b sets "MISP-feed-{feed}" when feeds were selected.
+
+        Offering the menu with its own default threw that away, and
+        run_interview then warned that meta.source had no {feed} placeholder
+        -- about a choice this stage had just made for the operator.
+        """
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443,
+                  "source_fmt": "MISP-feed-{feed}"}
+        nexus._stage7_metadata(config, scripted([], fill=""))
+        self.assertEqual(config["source_fmt"], "MISP-feed-{feed}")
+        self.assertIn("stage 2b", self.printed)
+
+    def test_stage7_still_defaults_to_the_first_format_without_one(self):
+        config = {"source": "misp", "source_host": "h.local",
+                  "scheme": "https", "port": 443}
+        nexus._stage7_metadata(config, scripted([], fill=""))
+        self.assertEqual(config["source_fmt"], "MISP-event-{event_id}")
+
     def test_misp_stage7_is_byte_identical(self):
         config = {"source": "misp", "source_host": "h.local",
                   "scheme": "https", "port": 443}
@@ -3396,9 +3498,10 @@ class TestStage7SourceFormats(Quiet):
             fake.state["prompts"],
             ["  meta.source format -- choose 1-4 [1]: ",
              "meta.desc template ({event_info} {category} {tags} {comment} "
-             "{type} {org} {uuid}) [{event_info} | {category}]: ",
+             "{type} {org} {uuid} {feed}) [{event_info} | {category}]: ",
              "Link meta.url back to the MISP event? [Y/n]: ",
-             "Emit the meta.do_notice column? [y/N]: ",
+             "Emit the meta.do_notice column? (T on every row -- every "
+             "hit raises a Zeek notice) [y/N]: ",
              "Max metadata field length [200]: "])
         self.assertEqual(
             self.printed,
@@ -3776,6 +3879,16 @@ class TestCheckBroadIndicators(unittest.TestCase):
         v = nexus.check_broad_indicators(rows)
         self.assertEqual(v.level, "warn")
         self.assertIn("localhost/path", v.message)
+
+    def test_url_with_an_ipv6_literal_host_is_not_broad(self):
+        # norm_url learned about bracketed hosts; this check kept its own
+        # copy of the broken split, so "[2606:4700::1111]/a" became "[2606",
+        # which has no dot, and every IPv6 URL indicator was reported as an
+        # overly broad indicator.  One address is as narrow as it gets.
+        rows = [row("[2606:4700::1111]/a", "Intel::URL"),
+                row("[2606:4700::1111]:8443/", "Intel::URL")]
+        v = nexus.check_broad_indicators(rows)
+        self.assertEqual(v.level, "ok")
 
     def test_offenders_capped_at_ten_in_message(self):
         rows = [row("bad%d" % i, "Intel::DOMAIN") for i in range(15)]
@@ -4974,6 +5087,18 @@ class TestStixPattern(unittest.TestCase):
         self.assertEqual(nexus.parse_stix_pattern(pattern),
                          [("IPv4-Addr", "45.33.32.1")])
 
+    def test_and_composed_observations_become_independent_indicators(self):
+        # Zeek's Intel framework has no way to say "only when both are
+        # seen", so an AND-composed pattern is flattened and each half
+        # fires on its own.  A deliberate over-match: the alternative is
+        # dropping the pattern and losing two real indicators to a
+        # structure Zeek could not have used.
+        pattern = ("[domain-name:value = 'a.com'] AND "
+                   "[ipv4-addr:value = '45.33.32.1']")
+        self.assertEqual(nexus.parse_stix_pattern(pattern),
+                         [("Domain-Name", "a.com"),
+                          ("IPv4-Addr", "45.33.32.1")])
+
     def test_unsupported_property_yields_nothing(self):
         self.assertEqual(
             nexus.parse_stix_pattern("[windows-registry-key:key = 'HKLM\\\\Run']"),
@@ -5609,6 +5734,28 @@ class TestTaxiiBuild(Quiet):
             rows = [l for l in handle.read().splitlines()
                     if l and not l.startswith("#")]
         self.assertEqual(len(rows), 3)
+
+    def test_a_run_that_builds_nothing_is_blocked_not_written(self):
+        # The append-only merge cannot shrink a file, so check_not_empty and
+        # check_delta are both no-ops -- which left a run that fetches or
+        # keeps nothing writing a header-only intel.dat and exiting 0.  A
+        # fresh manager would then have a file Zeek loads and never matches.
+        self.server.server.pages = [{"more": False, "objects": []}]
+        self.assertEqual(self.run_build(self.profile()), 1)
+        self.assertIn("built 0 indicators", self.printed)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_a_filter_that_keeps_nothing_is_blocked_too(self):
+        # Objects arrive and are dropped by a post-download filter: the same
+        # zero-indicator outcome by a different route, and the one an
+        # operator is most likely to cause by hand.
+        self.server.server.pages = [{"more": False,
+                                     "objects": self.objects(3)}]
+        self.assertEqual(
+            self.run_build(self.profile(include_labels=["nothing-matches"])),
+            1)
+        self.assertIn("built 0 indicators", self.printed)
+        self.assertFalse(os.path.exists(self.out))
 
     def _basic_profile(self):
         return self.profile(taxii_auth="basic")
@@ -6290,6 +6437,16 @@ class TestOfflineBuild(Quiet):
         self.assertEqual(header, nexus.header_line(False))
         self.assertEqual([row.split("\t")[0] for row in rows], ["45.33.32.1"])
 
+    def test_do_notice_flag_reaches_the_build(self):
+        # The flag said "emit the meta.do_notice column" and emitted nothing:
+        # only --lint ever read it.
+        self.assertEqual(
+            self.build(self.config(do_notice=False),
+                       argv=["--offline", "--do-notice"]), 0)
+        header, rows = nexus.read_existing(self.out)
+        self.assertEqual(header, nexus.header_line(True))
+        self.assertEqual(len(rows[0].split("\t")), 6)
+
     def test_offline_build_prints_both_transfer_routes(self):
         self.build(self.config())
         self.assertIn("--import", self.printed)
@@ -6669,6 +6826,151 @@ class TestBuildAppendOnlyGuards(Quiet):
         with open(self.out, "rb") as handle:
             self.assertEqual(handle.read(), b"\xff\xfe not utf-8 at all\n")
 
+    def test_the_expected_count_is_the_merged_total_not_the_new_rows(self):
+        """What cmd_build tells verify_runtime to expect after an apply.
+
+        verify_runtime's verdict *is* apply_to_grid's return value, so getting
+        this number wrong is not a cosmetic warning -- a good build on a
+        manager that already had indicators exited 1.
+        """
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "already.example\tIntel::DOMAIN\tMISP\td\t-"])
+        seen = {}
+        self.addCleanup(setattr, nexus, "apply_to_grid", nexus.apply_to_grid)
+        nexus.apply_to_grid = lambda **kw: seen.update(kw) or (True, [])
+        self.assertEqual(self.build(self.config(apply=True)), 0)
+        # One row already on the manager, one freshly built.
+        self.assertEqual(seen["expected"], 2)
+
+    def test_a_platform_failure_mid_fetch_is_reported_not_raised(self):
+        """The fetch is a generator, so it fails inside build_indicators.
+
+        A token that expires mid-pull, or a 500 that outlasts the retries,
+        is the likeliest runtime failure there is.  Uncaught it left a
+        traceback in a timer's journal, and the exception text -- which
+        carries the URL and up to 500 bytes of response body -- never
+        reached the redactor.  Nothing may be written: a partial pull would
+        merge cleanly and report success.
+        """
+        nexus.write_atomic(self.out, [
+            nexus.header_line(False),
+            "already.example\tIntel::DOMAIN\tMISP\td\t-"])
+        before = self._raw()
+
+        def dying(client, config):
+            yield {"type": "ip-dst", "value": "45.33.32.1", "event_id": "7"}
+            raise nexus.SourceError("MISP fell over mid-pull")
+
+        nexus._fetch_records = dying
+        config = self.config()
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(self.build(config), 2)
+        self.assertIn("fetch failed", errors.getvalue())
+        self.assertEqual(self._raw(), before)
+
+
+class TestTaxiiApiRootStaysOnHost(Quiet):
+    """A discovery document names its own API roots as absolute URLs.
+
+    urljoin follows one wherever it points, and the transport puts the
+    Authorization header on every request.  NoCrossHostRedirect covers the
+    3xx route to that leak; this covers the discovery route.
+    """
+
+    def client(self):
+        return nexus.TaxiiClient("taxii.example", "t" * 20)
+
+    def test_a_relative_root_is_same_host(self):
+        self.assertTrue(self.client()._same_host("/api1/"))
+
+    def test_an_absolute_root_on_the_same_host_is_allowed(self):
+        self.assertTrue(
+            self.client()._same_host("https://taxii.example/api1/"))
+
+    def test_another_host_is_not(self):
+        self.assertFalse(self.client()._same_host("https://evil.example/api1/"))
+
+    def test_the_same_host_over_plain_http_is_not(self):
+        # Downgrading the scheme still puts the credential on the wire in
+        # cleartext, which is the thing being protected against.
+        self.assertFalse(self.client()._same_host("http://taxii.example/api1/"))
+
+    def test_fetch_objects_refuses_a_foreign_root(self):
+        # A collection can also arrive from a saved profile, bypassing
+        # get_collections entirely.
+        client = self.client()
+        with self.assertRaises(nexus.TaxiiError):
+            list(client.fetch_objects(
+                {"id": "c1", "api_root": "https://evil.example/api1/"}))
+
+    def test_an_explicit_default_port_still_matches_a_root_without_one(self):
+        # Stage 1 always answers the port question, so a real client's
+        # base_url is "https://host:443" while the server's own api_roots
+        # leave the default port off.  Comparing netlocs called those two
+        # different hosts and every absolute root on a real server was
+        # refused -- a TAXII source that discovered no collections at all.
+        client = nexus.TaxiiClient("taxii.example", "t" * 20, port=443)
+        self.assertEqual(client.base_url, "https://taxii.example:443")
+        self.assertTrue(client._same_host("https://taxii.example/api1/"))
+
+    def test_a_root_that_spells_out_the_default_port_matches_too(self):
+        client = nexus.TaxiiClient("taxii.example", "t" * 20)
+        self.assertTrue(client._same_host("https://taxii.example:443/api1/"))
+
+    def test_a_different_port_is_still_a_different_host(self):
+        client = nexus.TaxiiClient("taxii.example", "t" * 20, port=443)
+        self.assertFalse(client._same_host("https://taxii.example:8443/api1/"))
+
+    def test_a_non_default_port_must_match(self):
+        client = nexus.TaxiiClient("taxii.example", "t" * 20, port=8443)
+        self.assertTrue(client._same_host("https://taxii.example:8443/api1/"))
+        self.assertFalse(client._same_host("https://taxii.example/api1/"))
+
+
+class TestLintDetectsItsOwnSchema(unittest.TestCase):
+    """The #fields header states the schema, so nobody should have to."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, header, row):
+        path = os.path.join(self.tmp, "intel.dat")
+        nexus.write_atomic(path, [header, row])
+        return path
+
+    def test_a_do_notice_file_lints_clean_with_no_flag(self):
+        path = self.write(nexus.header_line(True),
+                          "a.example\tIntel::DOMAIN\tMISP\td\t-\tT")
+        self.assertEqual(nexus.lint_file(path), [])
+
+    def test_a_plain_file_still_lints_clean_with_no_flag(self):
+        path = self.write(nexus.header_line(False),
+                          "a.example\tIntel::DOMAIN\tMISP\td\t-")
+        self.assertEqual(nexus.lint_file(path), [])
+
+    def test_an_explicit_answer_still_overrides_the_header(self):
+        path = self.write(nexus.header_line(True),
+                          "a.example\tIntel::DOMAIN\tMISP\td\t-\tT")
+        self.assertTrue(nexus.lint_file(path, do_notice=False))
+
+
+class TestDiffImpliesDryRun(unittest.TestCase):
+    def test_diff_alone_does_not_write(self):
+        # --diff is a way of looking at the file, not of writing it.
+        args = nexus.build_parser().parse_args(["--diff"])
+        self.assertFalse(args.dry_run)   # argparse leaves them independent
+        seen = []
+        try:
+            saved = nexus.cmd_build
+            nexus.cmd_build = lambda a: seen.append(a) or 0
+            nexus.main(["--diff"])
+        finally:
+            nexus.cmd_build = saved
+        self.assertTrue(seen[0].dry_run)
+
 
 class TestOfflineFlagParsing(unittest.TestCase):
     def test_offline_defaults_to_false(self):
@@ -6678,6 +6980,104 @@ class TestOfflineFlagParsing(unittest.TestCase):
     def test_offline_flag_sets_true(self):
         args = nexus.build_parser().parse_args(["--offline"])
         self.assertTrue(args.offline)
+
+
+class TestRedirectRefusesATlsDowngrade(unittest.TestCase):
+    """Same host, https -> http, still puts the Authorization header in the
+    clear.  TaxiiClient._same_host already compares scheme for exactly this
+    reason; the 3xx route had only ever compared host.
+    """
+
+    def redirect(self, old_url, new_url):
+        handler = nexus.NoCrossHostRedirect()
+        req = urllib.request.Request(old_url)
+        return handler.redirect_request(
+            req, None, 302, "Found", http.client.HTTPMessage(), new_url)
+
+    def test_a_downgrade_to_plain_http_is_refused(self):
+        with self.assertRaises(nexus.SourceError) as caught:
+            self.redirect("https://misp.example/a", "http://misp.example/b")
+        self.assertIn("plain HTTP", str(caught.exception))
+
+    def test_a_cross_host_redirect_is_still_refused(self):
+        with self.assertRaises(nexus.SourceError):
+            self.redirect("https://misp.example/a", "https://evil.example/b")
+
+    def test_an_upgrade_to_https_is_allowed(self):
+        # The safe direction, and a common server configuration.
+        self.assertIsNotNone(
+            self.redirect("http://misp.example/a", "https://misp.example/b"))
+
+    def test_a_default_port_is_not_a_different_host(self):
+        # Every client built from the interview carries an explicit port, so
+        # a Location header that omits it -- the normal way a server writes
+        # one -- used to read as a cross-host redirect and fail the request.
+        self.assertIsNotNone(
+            self.redirect("https://misp.example:443/a",
+                          "https://misp.example/b"))
+
+    def test_a_changed_port_on_the_same_host_is_refused(self):
+        with self.assertRaises(nexus.SourceError):
+            self.redirect("https://misp.example/a",
+                          "https://misp.example:8443/b")
+
+    def test_a_malformed_location_header_reads_as_cross_host(self):
+        # A server that writes its Location header without a "/" between
+        # host and path -- "https://1.2.3.4servers/x" -- glues the path onto
+        # the hostname.  That parses as a different host, so the refusal
+        # fires here too, same as any other cross-host redirect.
+        with self.assertRaises(nexus.SourceError) as caught:
+            self.redirect("http://1.2.3.4/servers/getVersion",
+                          "https://1.2.3.4servers/getVersion")
+        self.assertIn("cross-host", str(caught.exception))
+
+    def test_a_same_scheme_same_host_redirect_is_allowed(self):
+        self.assertIsNotNone(
+            self.redirect("https://misp.example/a", "https://misp.example/b"))
+
+
+class TestProbeReadsTheTaxiiBasicUsername(unittest.TestCase):
+    """--probe runs no interview, and a profile never stores the username.
+
+    Without the environment fallback every probe authenticated Bearer, so a
+    Basic-auth TAXII server answered 401 and the message blamed the token.
+    """
+
+    def probe_config(self, username):
+        seen = {}
+
+        def factory(config):
+            seen.update(config)
+            raise nexus.SourceError("stopped before the wire")
+
+        self.addCleanup(setattr, nexus, "make_client", nexus.make_client)
+        nexus.make_client = factory
+        for name, value in (("NEXUS_TOKEN", "t" * 20),
+                            ("NEXUS_TAXII_USERNAME", username)):
+            self.addCleanup(_restore_env, name, os.environ.get(name))
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        args = nexus.build_parser().parse_args(
+            ["--probe", "--source", "taxii", "--host", "taxii.example"])
+        with self.assertRaises(nexus.SourceError):
+            nexus.cmd_probe(args)
+        return seen
+
+    def test_the_username_reaches_the_client(self):
+        self.assertEqual(self.probe_config("reader")["taxii_username"],
+                         "reader")
+
+    def test_no_username_stays_bearer(self):
+        self.assertIsNone(self.probe_config(None)["taxii_username"])
+
+
+def _restore_env(name, value):
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 # ---------------------------------------------------------------------------
@@ -7155,6 +7555,45 @@ class TestTimerPreconditions(Quiet):
         self.assertIn("does not apply to the grid",
                       " ".join(m for l, m in findings if l == "warn"))
 
+    def env_file(self, text):
+        """Point NEXUS_ENV_FILE at a temp file holding `text`."""
+        path = os.path.join(self.tmp, "nexus.env")
+        with io.open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        self.patch(nexus, "NEXUS_ENV_FILE", path)
+        return path
+
+    def test_a_token_in_the_units_environment_file_satisfies_the_check(self):
+        # The fix message tells the operator to put NEXUS_TOKEN in
+        # nexus.env; the check has to be able to see it there, or following
+        # the instruction can never clear the error that produced it.
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "")
+        self.env_file('NEXUS_TOKEN="abcdef123456"\n')
+        ok, findings = self.check({"apply": True})
+        self.assertTrue(ok)
+        self.assertEqual([f for f in findings if f[0] == "error"], [])
+
+    def test_a_taxii_username_in_the_environment_file_satisfies_the_check(self):
+        self.env_file("# nexus timer credentials\n"
+                      "NEXUS_TOKEN=abcdef123456\n"
+                      "NEXUS_TAXII_USERNAME=analyst-one\n")
+        ok, findings = self.check({"apply": True, "source": "taxii",
+                                   "taxii_auth": "basic"})
+        self.assertTrue(ok)
+        self.assertEqual([f for f in findings if f[0] == "error"], [])
+
+    def test_an_environment_file_with_an_empty_value_is_not_a_credential(self):
+        self.patch(nexus, "resolve_token", lambda args, interactive=True: "")
+        self.env_file("NEXUS_TOKEN=\n")
+        ok, findings = self.check({"apply": True})
+        self.assertFalse(ok)
+        self.assertIn("no API token reachable",
+                      " ".join(m for _, m in findings))
+
+    def test_the_environment_file_never_yields_a_secret_only_a_name(self):
+        self.env_file("NEXUS_TOKEN=abcdef123456\n")
+        self.assertEqual(nexus.env_file_names(), {"NEXUS_TOKEN"})
+
 
 class TestInstallTimerCommand(Quiet):
 
@@ -7291,6 +7730,115 @@ class TestInstallTimerCli(unittest.TestCase):
                    if "render_unit_files(" in line]
         self.assertEqual(len(callers), 2)  # the def, and cmd_install_timer
 
+
+
+class TestCommentCharIndicator(unittest.TestCase):
+    """A "#"-leading indicator is a comment line, not an indicator.
+
+    Zeek's ASCII reader skips it and read_existing() drops it, so it used to
+    be written, ignored by every sensor, and then lost from the next merge --
+    all while lint reported the file clean.
+    """
+
+    def test_leading_hash_is_rejected(self):
+        for value in ("#readme.txt", "  #notes.doc"):
+            with self.assertRaises(nexus.Rejected) as ctx:
+                nexus.norm_filename(value)
+            self.assertEqual(ctx.exception.reason, "leading_comment_char")
+
+    def test_leading_hash_rejected_for_freeform_types(self):
+        with self.assertRaises(nexus.Rejected):
+            nexus.norm_freeform("#agent/1.0")
+
+    def test_hash_elsewhere_in_the_value_is_kept(self):
+        self.assertEqual(nexus.norm_filename("re#port.txt"), "re#port.txt")
+
+    def test_build_tallies_it_instead_of_writing_a_ghost_row(self):
+        record = {"type": "filename", "value": "#readme.txt",
+                  "event_info": "x", "event_id": "1", "org": "o",
+                  "event_tags": [], "category": "c", "uuid": "u",
+                  "comment": "", "event_uuid": "", "timestamp": ""}
+        rows, stats = nexus.build_indicators([record])
+        self.assertEqual(rows, [])
+        self.assertEqual(stats.rejected.get("leading_comment_char"), 1)
+
+
+class TestConnectionFlagsSeedTheInterview(unittest.TestCase):
+    """The CLI connection flags seed stage 1; they never skip a question."""
+
+    def _run(self, defaults, answers):
+        config = {}
+        supply = iter(answers)
+        nexus._stage1_connection(config, None, lambda prompt: next(supply),
+                                 lambda prompt: "tok", source="misp",
+                                 host="cti.local", defaults=defaults)
+        return config
+
+    def test_flags_become_the_offered_defaults(self):
+        args = nexus.build_parser().parse_args(
+            ["--scheme", "http", "--port", "8080", "--insecure",
+             "--proxy", "http://p:3128", "--timeout", "5", "--retries", "2"])
+        # Every answer is empty: each question is asked and its default taken.
+        config = self._run(nexus.connection_defaults(args), [""] * 7)
+        self.assertEqual(config["scheme"], "http")
+        self.assertEqual(config["port"], 8080)
+        self.assertFalse(config["verify_tls"])
+        self.assertEqual(config["proxy"], "http://p:3128")
+        self.assertEqual(config["timeout"], 5)
+        self.assertEqual(config["retries"], 2)
+
+    def test_a_typed_answer_still_beats_the_flag(self):
+        args = nexus.build_parser().parse_args(["--timeout", "5"])
+        config = self._run(nexus.connection_defaults(args),
+                           ["", "", "", "", "", "60", ""])
+        self.assertEqual(config["timeout"], 60)
+
+    def test_insecure_is_its_own_confirmation(self):
+        """--insecure is the deliberate act the typed INSECURE asks for.
+
+        Re-asking made the flag unactionable: taking the seeded default with
+        Enter handed verification straight back.
+        """
+        args = nexus.build_parser().parse_args(["--insecure"])
+        config = self._run(nexus.connection_defaults(args), [""] * 7)
+        self.assertFalse(config["verify_tls"])
+
+    def test_without_the_flag_declining_still_needs_typed_confirmation(self):
+        args = nexus.build_parser().parse_args([])
+        config = self._run(nexus.connection_defaults(args),
+                           ["", "", "", "n", "oops", "", "", ""])
+        self.assertTrue(config["verify_tls"])
+
+    def test_no_flags_keeps_the_built_in_defaults(self):
+        args = nexus.build_parser().parse_args([])
+        config = self._run(nexus.connection_defaults(args), [""] * 7)
+        self.assertEqual(config["scheme"], "https")
+        self.assertEqual(config["port"], 443)
+        self.assertTrue(config["verify_tls"])
+        self.assertIsNone(config["proxy"])
+        self.assertEqual(config["timeout"], 30)
+        self.assertEqual(config["retries"], 3)
+
+
+class TestProbeUnattended(unittest.TestCase):
+    """--probe runs no interview, so --yes is a legitimate way to run it."""
+
+    def test_probe_with_yes_and_a_target_is_dispatched(self):
+        seen = []
+        real = nexus.cmd_probe
+        nexus.cmd_probe = lambda args: seen.append(args) or 0
+        self.addCleanup(setattr, nexus, "cmd_probe", real)
+        rc = nexus.main(["--probe", "--host", "h", "--source", "misp",
+                         "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 1)
+
+    def test_probe_with_yes_and_no_target_refuses_rather_than_prompting(self):
+        rc = nexus.main(["--probe", "--yes"])
+        self.assertEqual(rc, 2)
+
+    def test_build_with_yes_and_no_profile_is_still_refused(self):
+        self.assertEqual(nexus.main(["--yes"]), 2)
 
 
 if __name__ == "__main__":

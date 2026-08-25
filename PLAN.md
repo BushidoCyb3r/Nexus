@@ -1,17 +1,17 @@
 # Nexus — MISP / OpenCTI / TAXII → Zeek `intel.dat` Builder for Security Onion
 
-**Status:** phases 0–6 and 8–10 built and tested — three IOC sources (MISP, OpenCTI, TAXII), one per run, plus feed selection, plus offline build and airgapped import; phase 7 (systemd timer, install docs) is all that remains
+**Status:** every phase built and tested — three IOC sources (MISP, OpenCTI, TAXII), one per run, plus feed selection, offline build and airgapped import, and the opt-in systemd timer. What remains is live validation against a real MISP, OpenCTI or TAXII server and a real Security Onion manager — see `HANDOFF.md` §7.
 **Target host:** Security Onion 3.2 manager node, or — for an offline build — any host with Python 3.6+ and nothing else installed
 **Form:** a single Python 3 script, `nexus.py`, stdlib only — no pip, no venv, no packaging
 
 ```
 nexus.py        the tool          python3 nexus.py
-test_nexus.py   650 tests         python3 -m unittest test_nexus
+test_nexus.py   742 tests         python3 -m unittest test_nexus
 ```
 
 **New assistant picking this up: read `HANDOFF.md` first.**
 
-Working today: the full interview end-to-end against any of the three platforms, including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run --diff`, `--offline`, `--import PATH`. `--source {misp,opencti,taxii}` and `--host` select the platform; `--misp` remains as a deprecated alias for `--host --source misp`.
+Working today: the full interview end-to-end against any of the three platforms, including apply, and unattended replay from a profile. Modes: `--check-env`, `--seed`, `--apply`, `--probe`, `--lint`, `--explain`, `--profile`, `--yes`, `--dry-run`, `--diff` (implies `--dry-run`), `--do-notice`, `--offline`, `--import PATH`, `--install-timer`. `--source {misp,opencti,taxii}` and `--host` select the platform; `--misp` remains as a deprecated alias for `--host --source misp`.
 
 ---
 
@@ -97,6 +97,17 @@ Interview answers can be saved as a **profile** so later runs are non-interactiv
 - Counts: `pageInfo.globalCount` is an exact total, permission-dependent; `count_type` falls back to a `first: 1` probe's `len(nodes)` when it's absent, which is still exact for that fallback shape (see `HANDOFF.md` §3).
 - Body/entity: only **Indicators** are queried, not raw Observables — see §2 (Decisions taken) in the OpenCTI design spec, `docs/superpowers/specs/2026-08-17-opencti-source-design.md`. An indicator's linked observables (`observables(first: 50) { edges { node { ... } } }`) supply the actual IOC values; `parse_stix_pattern` is a fallback for indicators with no linked observables, and only for `pattern_type == "stix"` — YARA/Sigma pattern bodies are never mined for values.
 
+### TAXII API
+
+- Two protocol versions, negotiated per connection. 2.1 discovers at `GET /taxii2/` and sends `Accept: application/taxii+json;version=2.1`; 2.0 discovers at `GET /taxii/` and sends `Accept: application/vnd.oasis.taxii+json; version=2.0`. `detect_version()` probes 2.1 then 2.0. The question is still asked, defaulted to 2.1: stage 1 collects the credential and so has no client to detect with. `run_interview` runs the detection when it connects, at stage 2, and corrects the answer out loud if the server disagrees — without that, a 2.0 server simply fails to answer `/taxii2/` and the whole interview reads it as an unreachable host.
+- Unlike GraphQL, TAXII uses ordinary status codes, so the transport's existing 401/403 handling already covers authentication failure. Auth is **Bearer or Basic**; the Basic username is half a credential and is excluded from profiles exactly like the password (`NEXUS_TAXII_USERNAME` supplies it unattended).
+- Discovery names its own **API roots**, and the spec makes them absolute URLs. `TaxiiClient._same_host` refuses one that is not on the authenticated scheme, host and port (compared through `_origin()`, which normalises a default port away so `https://h` and `https://h:443` are one origin), on both routes an API root becomes a request — `get_collections` skips it with a warning, `fetch_objects` raises. Otherwise the discovery document could redirect the `Authorization` header to a third party without ever issuing a 3xx.
+- Collections live under an API root: `GET <root>collections/`, then `GET <root>collections/<id>/objects/`.
+- Pagination differs by version. 2.1 sends `limit` and follows the envelope's `more`/`next`; 2.0 has no such parameter and walks a `Range: items N-M` window, reading `Content-Range` back. Both stop on a cursor or window that fails to advance, on an empty page, and — for 2.0 — on the total reported by the *first* page, so a server whose total outruns its window cannot be pulled forever.
+- **The query syntax reaches `match[type]` and `added_after`, nothing else.** `match[type]` is fixed to `indicator`; `added_after` carries the days-back answer. Labels, markings, confidence, `valid_until` and author all live inside the STIX object, so `taxii_object_allowed` applies them **after download** and every prompt that collects one says so.
+- Only `type == "indicator"` objects are read, and only `pattern_type == "stix"` patterns are parsed — `parse_stix_pattern` is shared with the OpenCTI fallback and emits `OPENCTI_TO_ZEEK` keys, so TAXII reuses that mapping table wholesale. The pattern's *structure* is not honoured: every `=` comparison in it becomes an indicator, so `AND`- and `OR`-composed observation expressions and qualifiers (`REPEATS`, `WITHIN`, `START`/`STOP`) all flatten to the same independent values. For an `AND` that over-matches, deliberately — Zeek's Intel framework is a flat list with no way to express "only when both are seen", and the alternative is dropping the pattern and losing two real indicators to a structure Zeek could not have used. Only `!=` is genuinely dropped, structurally: the regex's property class excludes `!`, so a negation never reaches the `=`.
+- **STIX 2.0 has no `confidence` property.** `flatten_taxii_object` carries an absent value through as `None`, never 0 — 0 is a real (low) confidence in 2.1, and treating absent as zero would let a minimum-confidence filter silently drop every object from a 2.0 feed.
+
 ---
 
 ## 3. Script structure
@@ -107,10 +118,12 @@ Internally organised into banner-delimited sections, in dependency order so the 
 
 ```
 #!/usr/bin/env python3
-"""nexus.py — build a Zeek intel.dat from MISP or OpenCTI, for Security Onion 3.2."""
+"""nexus.py — build a Zeek intel.dat from MISP, OpenCTI or TAXII, for Security Onion 3.2."""
 
 # ── CONSTANTS ──────────────────────────────────────────────
-#   SO paths, Zeek type set, MISP→Zeek and OpenCTI→Zeek mapping tables, defaults
+#   SO paths, Zeek type set, MISP→Zeek and OpenCTI→Zeek mapping tables
+#   (TAXII reuses OPENCTI_TO_ZEEK), TAXII_VERSIONS / _ACCEPT / _DISCOVERY,
+#   defaults
 
 # ── LOGGING ────────────────────────────────────────────────
 #   setup_logging(), a redacting Filter that scrubs the API token
@@ -124,17 +137,27 @@ Internally organised into banner-delimited sections, in dependency order so the 
 #                      get_version, get_labels, get_markings,
 #                      get_organizations, count_type, search_indicators
 #                      (cursor-paginated generator)
+#   class TaxiiClient(_HttpTransport):  detect_version, get_version,
+#                      get_collections, fetch_objects (2.1 envelope
+#                      pagination) / _fetch_objects_20 (Range windows),
+#                      _same_host — refuses an API root off the
+#                      authenticated origin
+#   NoCrossHostRedirect — refuses a 3xx that would carry the Authorization
+#   header to another host, or down from https to http on the same one
+#   _origin(url) — (scheme, host, port) with a default port normalised
+#   away; the one comparison both refusals are built on
 #   flatten_attribute(attr) → one record; flatten_indicator(node,
-#   stats=None) → a *list*, one record per extracted observable value
-#   (an indicator carrying both an MD5 and a SHA-256 yields two rows).
-#   Both emit the same record shape (below), so everything downstream
-#   of this seam is source-agnostic
-#   parse_stix_pattern(pattern) — fallback for OpenCTI indicators with no
-#   linked observables; only for pattern_type == "stix"
+#   stats=None) and flatten_taxii_object(obj, collection_title, stats=None)
+#   → a *list*, one record per extracted value (an indicator carrying both
+#   an MD5 and a SHA-256 yields two rows).  All three emit the same record
+#   shape (below), so everything downstream of this seam is source-agnostic
+#   parse_stix_pattern(pattern) — the value source for TAXII, and the
+#   fallback for OpenCTI indicators with no linked observables; only for
+#   pattern_type == "stix"
 
 # ── FEEDS ──────────────────────────────────────────────────
 #   feed_provenance(), feed_is_selectable(), apply_feed_to_params()
-#   (MISP only — OpenCTI has no feed concept)
+#   (MISP only — neither OpenCTI nor TAXII has a feed concept)
 
 # ── MAPPING ────────────────────────────────────────────────
 #   map_attribute(record, table=MISP_TO_ZEEK or OPENCTI_TO_ZEEK)
@@ -145,10 +168,15 @@ Internally organised into banner-delimited sections, in dependency order so the 
 # ── NORMALISE / VALIDATE ───────────────────────────────────
 #   norm_addr, norm_subnet, norm_domain, norm_url, norm_hash,
 #   norm_email, norm_cert_hash, sanitize_meta
+#   _prepare() — the shared funnel; carries the guards that are about the
+#   line format rather than the value: _reject_control (tabs/newlines) and
+#   _reject_comment (a leading "#", which Zeek reads as a comment line)
 #   NORMALISERS = {Intel::TYPE: fn}
 
 # ── FILTERS ────────────────────────────────────────────────
 #   ExclusionSet: RFC1918, own CIDRs, own domain suffixes, allowlist file
+#   taxii_object_allowed(record, config): the six filters TAXII's query
+#   syntax cannot express, applied after download
 
 # ── INTEL FILE ─────────────────────────────────────────────
 #   header_line(), render_meta(), render_line(), build_indicators()
@@ -158,15 +186,20 @@ Internally organised into banner-delimited sections, in dependency order so the 
 
 # ── ENVIRONMENT CHECK ──────────────────────────────────────
 #   detect_so_version(), notice_policy_loaded(), check_env()  — stage 0
+#   check_output_target() — the off-box counterpart for --offline
 
 # ── GUARDRAILS ─────────────────────────────────────────────
 #   check_size(), check_not_empty(), check_delta(), check_load_file(),
-#   check_broad_indicators(), run_guardrails()   (§8)
+#   check_broad_indicators(), check_built_anything(), run_guardrails()  (§8)
 
 # ── INTERVIEW ──────────────────────────────────────────────
 #   ask(), ask_yes_no(), ask_int(), ask_choice(), ask_multi(),
-#   discover() (MISP) / discover_opencti(),
-#   build_search_params() (MISP) / build_opencti_filters() (OpenCTI),
+#   discover() (MISP) / discover_opencti() / discover_taxii(),
+#   build_search_params() (MISP) / build_opencti_filters() (OpenCTI) /
+#   taxii_added_after() (TAXII's one server-side filter),
+#   connection_defaults() — the CLI connection flags, seeding stage 1's
+#     answers when there is no live client to read defaults off,
+#   resolve_build_target() — offline vs. manager, asked before check_env(),
 #   then run_interview() -> Config, one stage per §4 heading,
 #   stages 2/2b/3/4/5 branching by source
 
@@ -179,32 +212,42 @@ Internally organised into banner-delimited sections, in dependency order so the 
 
 # ── APPLY ──────────────────────────────────────────────────
 #   seed_load_file(), salt_apply(), log_offset(), log_errors_since(),
-#   verify_runtime(), apply_to_grid()
+#   verify_runtime(), apply_to_grid(), print_transfer_instructions()
+
+# ── SCHEDULE ───────────────────────────────────────────────
+#   render_unit_files(), describe_calendar(), env_file_names() — which
+#   variables the unit's EnvironmentFile supplies, since a terminal cannot
+#   see them, check_timer_preconditions(), cmd_install_timer()
+#   — --install-timer only; nothing else in the file may reach
+#   render_unit_files()
 
 # ── MAIN ───────────────────────────────────────────────────
 #   argparse (--source/--host/--misp), client factory picking
-#   MispClient or OpenctiClient from config["source"],
-#   mode dispatch, summary printing
+#   MispClient, OpenctiClient or TaxiiClient from config["source"],
+#   mode dispatch, cmd_build / cmd_import orchestration,
+#   summary printing
 ```
 
 **Design rules that survive the single-file form:**
 
 - The mapping / normalise / filter / intel-file sections must not touch the network or the filesystem — pure functions over plain dicts, so they're testable by importing `nexus.py` from a test script.
 - Only `write_atomic()` may write to the live intel path.
-- `_HttpTransport` is the only thing that speaks HTTP; `MispClient` and `OpenctiClient` both subclass it and are the only things that call it.
+- `_HttpTransport` is the only thing that speaks HTTP; `MispClient`, `OpenctiClient` and `TaxiiClient` all subclass it and are the only things that call it.
 
-Internal record shape after fetch — produced by both `flatten_attribute(attr)` (MISP, one record per attribute) and `flatten_indicator(node, stats=None)` (OpenCTI, a *list* of records — one per observable value extracted from the indicator, so a file indicator carrying an MD5 and a SHA-256 fans out to two). The shape is identical either way, so mapping, normalisation and everything after it runs unchanged regardless of source:
+Internal record shape after fetch — produced by `flatten_attribute(attr)` (MISP, one record per attribute), `flatten_indicator(node, stats=None)` (OpenCTI) and `flatten_taxii_object(obj, collection_title, stats=None)` (TAXII). The latter two return a *list* — one record per value extracted, so a file indicator carrying an MD5 and a SHA-256 fans out to two. The shape is identical whichever produced it, so mapping, normalisation and everything after it runs unchanged regardless of source:
 
 ```python
 {
-  "value": str, "type": str, "category": str, "to_ids": bool,
+  "value": str, "type": str, "category": str,
   "uuid": str, "timestamp": int, "comment": str,
   "event_id": str, "event_uuid": str, "event_info": str,
   "event_tags": [str], "org": str,
 }
 ```
 
-Deploy: copy to `/usr/local/bin/nexus`, `chmod 750`, root-owned. Working state (profiles, backups, logs) under `/opt/nexus/`, created on first run.
+`to_ids` is deliberately **not** in that shape: it is a MISP-only query filter (`build_search_params`), applied server-side, so no record ever needs to carry it. `flatten_taxii_object` adds six TAXII-only keys on top of the shared ones — `collection`, `labels`, `confidence`, `valid_until`, `created_by_ref`, `object_marking_refs` — read by `taxii_object_allowed` and by `render_meta`'s `{collection}` placeholder. Nothing source-agnostic reads them, and `TestFlattenTaxii` pins the *shared* key set equal to `flatten_indicator`'s so a future divergence fails loudly.
+
+Deploy: copy to `/opt/nexus/nexus.py`, `chmod 750`, root-owned (`README.md` — Install). Working state (profiles, backups, logs) under `/opt/nexus/`, created on first run.
 
 ---
 
@@ -212,7 +255,7 @@ Deploy: copy to `/usr/local/bin/nexus`, `chmod 750`, root-owned. Working state (
 
 The heart of the tool. Every question has a default in `[brackets]`; Enter accepts it. Every list-select is populated **live from the connected instance**, never hardcoded. Answers are echoed as a summary for confirmation before anything is fetched or written.
 
-Stages 0, 6, 7 and 8 below call the same code regardless of source. Stages 1, 2, 2b, 3, 4 and 5 branch by source — MISP and OpenCTI variants are described side by side within each. (Stage 7's question wording is a partial exception — see the note under item 31.)
+Stages 0, 6, 7 and 8 below call the same code regardless of source. Stages 1, 2, 2b, 3, 4 and 5 branch by source — the MISP, OpenCTI and TAXII variants are described side by side within each. TAXII branches hardest: it has no type menu (stage 3 asks which *collection* instead) and no quality stage at all, because everything that would live there is one of the post-download filters stage 5 asks.
 
 ### Stage 0 — Environment check (no questions)
 
@@ -220,12 +263,14 @@ Detects SO version, verifies `/opt/so/saltstack/local/salt/zeek/policy/intel/` e
 
 ### Stage 1 — Connection
 
-0. Threat intel platform `[misp / opencti]` — asked whenever `--source` was not already supplied on the command line; a caller that already knows skips the question.
-1. Platform address (IP or hostname) — prompt text is `MISP address` or `OpenCTI address` depending on the answer above.
+0. Threat intel platform `[misp / opencti / taxii]` — asked whenever `--source` was not already supplied on the command line; a caller that already knows skips the question.
+1. Platform address (IP or hostname) — prompt text is `MISP address` or `OpenCTI address` depending on the answer above. Every connection flag (`--host`, `--scheme`, `--port`, `--insecure`, `--proxy`, `--timeout`, `--retries`) seeds the corresponding default here. None of them skips its question.
 2. Scheme + port `[https / 443]` for either source; the http default is `[80]` for MISP and `[4000]` for OpenCTI (OpenCTI's conventional plaintext port).
-3. Verify TLS certificate? `[yes]` — `no` warns and requires typed confirmation (`INSECURE`), identical for both sources.
+3. Verify TLS certificate? `[yes]` — `no` warns and requires typed confirmation (`INSECURE`), identical for both sources. `--insecure` on the command line seeds the answer *and* stands in for the typed confirmation: it is already the deliberate act, and asking twice made the flag impossible to act on.
 4. HTTP proxy? `[none]`
 5. API token — `getpass`, never echoed, never logged; prompt text is `MISP API token` or `OpenCTI API token`.
+
+**TAXII variant of stage 1.** Two extra questions before the credential, because TAXII carries its own protocol version and can authenticate two ways: TAXII version `[2.1 / 2.0]`, always asked and defaulted to 2.1 — detection needs a client, and this stage is what builds the credential one, so `run_interview` detects at the stage 2 connect and corrects the answer there; and authentication `[bearer / basic]`. Basic collects an echoed username plus a silent password; both are excluded from a saved profile, so an unattended replay reads the username from `NEXUS_TAXII_USERNAME`.
 6. Timeout / retries `[30s / 3]`
 
 → MISP: `GET /servers/getVersion`, showing MISP version and the token's owning org. OpenCTI: a `{ about { version } }` GraphQL query. Both abort cleanly on an authentication failure — for OpenCTI that means reading the `errors` array out of a 200 response, since GraphQL never uses 401/403 (see §2, OpenCTI API).
@@ -236,9 +281,11 @@ MISP: fetches `describeTypes`, `tags`, `organisations`, `sharing_groups`, then a
 
 OpenCTI: fetches labels, marking definitions, organisations, then an exact per-type indicator count from `pageInfo.globalCount`. Prints `N labels, N markings, N organisations` in the same shape as the MISP discovery line.
 
+TAXII: walks every API root in the discovery document (skipping any that is not on the authenticated host and scheme) and lists the collections the credential can actually read. Prints `N collections`. There is nothing to count here — TAXII cannot count a filtered subset, so a per-type count would be a number for a query Nexus never sends.
+
 ### Stage 2b — Feeds
 
-MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On an OpenCTI run this stage prints one line and moves straight to stage 3 — skipping it silently would look like a bug to an operator used to the MISP flow:
+MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On an OpenCTI run this stage prints one line and moves straight to stage 3 — skipping it silently would look like a bug to an operator used to the MISP flow. On a TAXII run the stage does not run at all: a collection *is* the feed, and stage 3 asks for it directly.
 
 ```
 -- Stage 2b: feeds
@@ -262,6 +309,8 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
 
 **OpenCTI variant of stage 3.** Driven by `OPENCTI_IOC_CLASSES` instead of MISP's attribute-type table, annotated with live counts the same way, with `OPENCTI_OFF_BY_DEFAULT` (`User-Account`, `Software`) left unselected. The composite-type question (item 9) is skipped — no `OPENCTI_TO_ZEEK` entry has more than one target Zeek type, so it would be pure noise. The result populates the `x_opencti_main_observable_type` filter.
 
+**TAXII variant of stage 3** (`_stage3_collections_taxii`). There is no type menu: `match[type]=indicator` already narrows every collection on the wire, and the values themselves come out of `parse_stix_pattern`, which cannot be asked for a subset. So items 7–9 become one question — which collections to pull from, multi-select, all preselected — and items 10 and 11 are asked unchanged. A `no` to item 10 has no type menu to prune, so it is turned into an explicit allow-list of every `OPENCTI_TO_ZEEK` key except `Hostname`; otherwise the answer would be collected and then quietly do nothing.
+
 ### Stage 4 — Quality filters
 
 12. `to_ids` flagged only? `[yes]` — the biggest signal/noise lever
@@ -282,6 +331,8 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
 | Exclude indicators past their `valid_until`? | yes |
 
 `valid_until` is compared against the run's own UTC timestamp, resolved at query-build time; `build_opencti_filters(config, now=None)` takes an optional fixed `now` so tests stay deterministic.
+
+**There is no stage 4 on TAXII.** Every filter that would belong here is one TAXII's query syntax cannot express, so it is asked in stage 5 and applied after download.
 
 ### Stage 5 — Scope
 
@@ -304,6 +355,20 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
 | Time window | `all` / `last N days` / explicit range `[all]` |
 | Timestamp field | `created_at` or `valid_from` `[created_at]` |
 
+**Stage 5, TAXII variant** — one question the server acts on, and six it does not. The stage opens by saying so, and every one of the six repeats it in its own prompt text, because a filter the operator believes is cutting transfer volume when it is not is the defect this project has fixed three times:
+
+| Question | Where it is applied |
+|---|---|
+| Days back (0 = no time filter) `[90]` | **server-side**, as `added_after` |
+| Include labels `[none = all]` | after download |
+| Exclude labels `[none]` | after download |
+| Include marking-definition refs `[none = all]` | after download |
+| Include `created_by_ref` authors `[none = all]` | after download |
+| Minimum confidence `[0]` | after download — and on a 2.0 feed the stage warns that STIX 2.0 carries no `confidence` at all, so it will exclude nothing |
+| Drop indicators past `valid_until`? `[yes]` | after download |
+
+`taxii_added_after(config, now=None)` turns the days-back answer into the query parameter, and the pre-flight summary calls the *same* function rather than recomputing it — a summary that described a window the query did not have would be worse than no summary.
+
 ### Stage 6 — Local exclusions
 
 25. Exclude RFC1918 / loopback / link-local / multicast? `[yes]`
@@ -315,9 +380,9 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
 
 ### Stage 7 — Metadata
 
-29. `meta.source` format: fixed string / `MISP` / `MISP-<org>` / `MISP-event-<id>` `[MISP-event-<id>]`
-30. `meta.desc` template over `{event_info}`, `{category}`, `{tags}`, `{comment}`, `{type}`, `{org}`, `{uuid}` `[{event_info} | {category}]`
-31. `meta.url` — link back to the source event/indicator? `[yes]`. The question wording and the `meta.source` preset choices (item 29) are still MISP-flavored on an OpenCTI run — a cosmetic gap, not a functional one, since "fixed string" is always available. The computed URL itself is correct either way: `[https://<misp>/events/view/<id>]` for MISP, `[https://<opencti>/dashboard/observations/indicators/<id>]` for OpenCTI — `render_meta` branches on `config["source"]`.
+29. `meta.source` format — the preset list is per source: `SOURCE_FORMATS` for MISP (`MISP-event-{event_id}` / `MISP-{org}` / `MISP` / fixed string), `OPENCTI_SOURCE_FORMATS`, `TAXII_SOURCE_FORMATS` (`TAXII-{collection}` first, since a collection is the only identity a TAXII object has). If stage 2b already chose one — it sets `MISP-feed-{feed}` when feeds were selected — that value leads the list and is the default, rather than being silently overwritten by the menu's own first entry.
+30. `meta.desc` template over `{event_info}`, `{category}`, `{tags}`, `{comment}`, `{type}`, `{org}`, `{uuid}`, `{feed}` `[{event_info} | {category}]`
+31. `meta.url` — link back to the source event/indicator? `[yes]`. `render_meta` branches on `config["source"]`: `[https://<misp>/events/view/<id>]` for MISP, `[https://<opencti>/dashboard/observations/indicators/<id>]` for OpenCTI. On TAXII the question is **not asked** — a TAXII object has no browsable page, and the MISP-shaped URL would send an analyst to a server with no such event — so the stage says `meta.url is left empty` and moves on.
 32. Emit `meta.do_notice`? `[no]` — detects whether `do_notice.zeek` is loaded
 33. Max metadata field length `[200]`
 
@@ -327,7 +392,7 @@ MISP only. `GET /feeds` and the feed-selection flow described in §4b below. On 
 35. Existing file behavior: **append-only** (all existing indicators retained)
 36. Back up first? `[yes]`
 37. Optional hard cap on indicator count `[none / unlimited]`
-38. Dry run — write to temp and show a diff instead? `[no]`
+38. Dry run — build, run every check, report the indicator delta, write nothing? `[no]`. `--diff` adds the full line diff and implies `--dry-run`, so asking to *see* a diff can never write one.
 39. Save answers as a profile? `[yes → /opt/nexus/profiles/<name>.json]`
 40. Apply now? `[no]` — if yes: backup → write → `salt -C 'I@zeek:enabled:true' state.apply zeek` → tail `reporter.log`
 
@@ -393,16 +458,16 @@ Anything unmapped is dropped and tallied in a "skipped types" report — nothing
 Per Intel type, before an indicator enters the file:
 
 - **ADDR** — parse with `ipaddress`; reject invalid, unspecified, loopback, multicast, and (by default) private.
-- **SUBNET** — parse as network; reject `/0`; warn below `/16`.
-- **DOMAIN** — lowercase, strip trailing dot, IDNA-encode, reject bare TLDs and anything without a dot.
-- **URL** — strip `scheme://`, strip leading `//`, keep path + query, drop fragment; reject empty remainder.
-- **FILE_HASH** — lowercase, hex only, length in {32, 40, 64, 96, 128}.
+- **SUBNET** — parse as network; reject `/0`; **reject** anything broader than `MIN_PREFIX_V4`/`MIN_PREFIX_V6` (/16, /32), and reject loopback, multicast and link-local ranges the way ADDR does. A prefix exactly *at* the floor is admitted here and warned about by `check_broad_indicators` — see §8.
+- **DOMAIN** — lowercase, strip trailing dot, strip a leading `*.`, IDNA-encode, reject bare TLDs, numeric TLDs, and an IP address wearing a domain's clothes.
+- **URL** — strip `scheme://`, strip leading `//`, drop the fragment, keep path + query, drop `user:pass@` (Zeek never sees credentials in the host header it matches against). A URL with a query but no path gets the `/` it elided — `evil.com?a=1` → `evil.com/?a=1` — and a pathless URL gets a bare one, because Zeek builds its match candidate as host+uri and a uri always starts with `/`. Reject an empty remainder, whitespace, or a host that is neither a valid domain nor a valid address.
+- **FILE_HASH** — lowercase, hex only, length in {32, 40, 56, 64, 96, 128} — md5, sha1, **sha224**, sha256, sha384, sha512. There is a `hashlib` round-trip test over all six; sha224 was missing once and silently dropped every sha224 IOC.
 - **EMAIL** — lowercase, exactly one `@`, valid domain part.
 - **CERT_HASH** — 40 hex chars.
 - **All types** — reject values containing tab, CR or LF (they would corrupt the file); strip surrounding whitespace; refuse zero-length.
 - **Metadata** — replace tab/CR/LF with a space, collapse whitespace runs, truncate to the configured max, substitute `-` when empty.
 
-**Deduplication** — key `(indicator, indicator_type)`. First wins; repeats optionally append `(+N more events)` to `meta.desc`.
+**Deduplication** — key `(indicator, indicator_type)`, inline in `build_indicators`. First wins; repeats are counted into `BuildStats.duplicates` and reported, and the later row's metadata is discarded rather than merged into the first — an indicator carried by two events keeps the first event's `meta.desc`.
 
 ---
 
@@ -416,7 +481,7 @@ Per Intel type, before an indicator enters the file:
 6. Exactly one `\n` after the last record, no trailing blank line.
 7. Confirm `__load__.Zeek` is still present alongside it.
 
-**Merge mode**: append-only. `cmd_build` and `cmd_import` both call `merge_additive()`, which keeps every existing *indicator* line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Operator `#` comment lines are the one thing this does not cover: `read_existing()` filters them out, so they do not survive a merge on either path — see the "Append-only does not currently cover operator comment lines" entry in `HANDOFF.md` §6. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, exists in the file but has no callers.)
+**Merge mode**: append-only. `cmd_build` and `cmd_import` both call `merge_additive()`, which keeps every existing *indicator* line verbatim and in its original order — hand-maintained and Nexus-written alike — and appends only rows whose `(indicator, Intel::Type)` key is not already present. Operator `#` comment lines are the one thing this does not cover: `read_existing()` filters them out, so they do not survive a merge on either path — see the "Append-only does not currently cover operator comment lines" entry in `HANDOFF.md` §6. Where the source returns changed metadata for an IOC already in the file, the existing line wins. (`merge_preserved()`, a selective retain-by-`meta.source` variant, was deleted once append-only landed — `merge_additive()` retains *every* existing row, hand-added or not, so there was nothing left for it to preserve.)
 
 **Backup**: previous file copied to `/opt/nexus/backups/intel.dat.<ISO8601>` before replacement, with a retention count. Under `--offline`, `/opt/nexus` does not exist on that host and is not writable, so the backup instead goes to `nexus-backups/intel.dat.<ISO8601>` beside the output path, same retention count.
 
@@ -427,8 +492,9 @@ Per Intel type, before an indicator enters the file:
 - **Size** — retrieval is unlimited by default, warns at 100k indicators, and
   optionally hard-stops at an operator-selected cap. Every indicator sits in
   every Zeek worker's memory, so actual capacity depends on the target nodes.
-- **Overly broad indicators** — reject wide subnets, single-label domains, and known CDN/cloud domains unless explicitly allowed.
-- **Empty result set** — refuse to write an empty or near-empty file over a populated one without explicit confirmation. A MISP outage must not silently wipe intel.
+- **Overly broad indicators** — `norm_subnet` *rejects* a prefix broader than `MIN_PREFIX_V4`/`V6` (/16, /32) outright; `check_broad_indicators` then *warns* on anything that survived at or broader than the floor, plus single-label domains and hostless URLs. The two deliberately disagree at the boundary: a /16 is a real IOC, but the operator should see it named before it arms every sensor. There is **no built-in CDN/cloud domain list** — that is what `enforceWarninglist` (MISP-side), the allowlist file and the own-domains list are for; a hardcoded list inside Nexus would be stale the week after it shipped.
+- **Empty result set** and **large drop** — `check_not_empty` and `check_delta` refuse to write an empty, near-empty or sharply shrunken file over a populated one. Both are **skipped under the append-only merge**, which is every path that ships today: the merge cannot remove a row, so a MISP outage produces a file identical to yesterday's rather than an empty one. They are kept, and tested, for the replace-mode path in §14 — not dead, but not reachable from any answer the interview currently offers either.
+- **A run that builds nothing** — `check_built_anything` is the append-only branch's replacement for those two, and it counts `rows` (what *this* run built), not the merged total. Skipping the pair left the zero-result case with no guard at all: a token whose permissions return nothing, a filter that matches nothing, no IOC types or no TAXII collections selected all fetch, build nothing, merge nothing and report success — writing a header-only `intel.dat` on a fresh manager, or printing "added 0 new indicators" and applying it on a populated one. It blocks rather than warns, because a warning still writes that file; the merge is append-only, so refusing loses nothing and the non-zero exit shows up in a timer's journal.
 - **Append-only invariant** — diff by `(indicator, indicator_type)` and add only
   new keys. Existing rows, including their metadata, are never deleted or
   rewritten by a MISP refresh.
@@ -466,11 +532,16 @@ Salt is invoked as an **argv list, never a shell string** — nothing needs a sh
 nexus                                  # full interview
 nexus --profile daily.json             # replay answers, prompt only for token
 nexus --profile daily.json --yes       # fully unattended
-nexus --profile daily.json --dry-run --diff
-nexus --lint /path/to/intel.dat        # validate a file, no MISP needed
+nexus --profile daily.json --diff      # show the line diff; implies --dry-run
+nexus --lint /path/to/intel.dat        # validate a file, no platform needed
 nexus --explain --profile daily.json   # print the resolved platform query, fetch nothing
 nexus --check-env                      # stage 0 only: paths, __load__.Zeek, SO version
+nexus --offline                        # build for transfer, no Security Onion needed
+nexus --import /media/usb/intel.dat    # merge one back in, append-only
+nexus --install-timer                  # write nexus.service + nexus.timer, on request only
 ```
+
+`--do-notice` widens the schema to six columns wherever it applies: it forces `config["do_notice"]` on a build, and forces the six-column expectation on `--lint` (which otherwise reads the schema off the file's own `#fields` header). Forcing it onto a file built without it is caught by the header check and blocked, not written.
 
 Token resolution order: `--token-file` → env (`NEXUS_TOKEN`, then the deprecated `NEXUS_MISP_TOKEN` for back-compat) → `/opt/nexus/credentials.json` (0600) → interactive prompt. Under `--yes` the prompt is skipped and the run fails loudly instead — an unattended job must never block forever on a `getpass` nobody will answer.
 
@@ -500,6 +571,7 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 - **Golden file** — fixture MISP response → expected `intel.dat`, byte-for-byte. Catches the whitespace regressions the SO docs explicitly warn about. A parallel OpenCTI fixture exercises the same golden-file path through `flatten_indicator` and the STIX pattern fallback.
 - **Fake MISP** — `http.server` responder (`FakeMisp`/`FakeMispHandler`) replaying canned `restSearch` pages; exercises pagination, 401, 403, 429, timeout, malformed JSON, mid-pagination failure.
 - **Fake OpenCTI** — the GraphQL counterpart (`FakeOpencti`/`FakeOpenctiHandler`), replaying canned query responses; exercises cursor pagination, a 200-with-`errors` auth rejection, and a cursor that fails to advance.
+- **Fake TAXII** — `FakeTaxii`/`FakeTaxiiHandler`, serving *both* protocol versions off one socket: 2.1 discovery and envelope pagination, 2.0 discovery and `Range`/`Content-Range` windows, per-API-root collection listings, a root that answers 500, Basic and Bearer auth, and a server that cannot end its own pagination (so the client's stop conditions are what end it).
 - **Linter self-test** — writer output must always pass `--lint`, for either source.
 - **Integration** — against a MISP training VM or `demo.misp-project.org`, and an OpenCTI instance, then a lab SO 3.2 grid: seed `__load__.Zeek`, apply, confirm the file reaches `/opt/so/conf/zeek/policy/intel/`, clean `reporter.log`, generate a hit, confirm it lands in `intel.log`. Not yet done against a real OpenCTI — see `HANDOFF.md` §7.
 
@@ -516,10 +588,10 @@ A sibling `test_nexus.py` that imports `nexus.py` — same stdlib-only constrain
 | 4 ✅ | Profiles, `--yes`, `--dry-run`, `--diff`, `--explain` | unattended run reproduces phase-3 output |
 | 5 ✅ | Local exclusions + all §8 guardrails | a test per refusal path |
 | 6 ✅ | Apply — `__load__.Zeek` seeding, salt apply, reporter check | lab grid: apply → hit in `intel.log` |
-| 7 ✅ | systemd timer, install steps, operator README — `--install-timer` renders and writes `nexus.service`/`nexus.timer` on request only, after pre-flighting the failures that would otherwise surface unattended; enables nothing | offline test suite (691 tests, including that a build never reaches the unit renderer); unverified on a fresh manager |
+| 7 ✅ | systemd timer, install steps, operator README — `--install-timer` renders and writes `nexus.service`/`nexus.timer` on request only, after pre-flighting the failures that would otherwise surface unattended; enables nothing | offline test suite (701 tests, including that a build never reaches the unit renderer); unverified on a fresh manager |
 | 8 ✅ | OpenCTI as a second, independently selectable IOC source — client, mapping, interview branching, config/profile/CLI | offline test suite (537 tests); unverified against a live OpenCTI instance, see `HANDOFF.md` §7 |
 | 9 ✅ | Offline build (`--offline`) — build a transfer-ready `intel.dat` on a host with no Security Onion installed, plus `--import PATH` to merge one back into a manager's live file, append-only | offline test suite (537 tests, includes a poison-path assertion that an offline build never touches the real `SO_*` paths, and a byte-identity assertion that import never rewrites an existing row) |
-| 10 ✅ | TAXII as a third, independently selectable IOC source — `TaxiiClient` (2.0/2.1, Basic or Bearer), version detection with an asked-not-skipped default, per-API-root collection discovery, pagination for both protocol versions, a STIX indicator flattener, six client-side filters for what TAXII's query syntax cannot express, source-aware interview stages, full wiring, `--probe` | offline test suite (650 tests, includes a fake server serving both protocol versions); unverified against a live TAXII server, see `HANDOFF.md` §7 |
+| 10 ✅ | TAXII as a third, independently selectable IOC source — `TaxiiClient` (2.0/2.1, Basic or Bearer), version detection with an asked-not-skipped default, per-API-root collection discovery, pagination for both protocol versions, a STIX indicator flattener, six client-side filters for what TAXII's query syntax cannot express, source-aware interview stages, full wiring, `--probe` | offline test suite (701 tests, includes a fake server serving both protocol versions); unverified against a live TAXII server, see `HANDOFF.md` §7 |
 
 Phases 1–2 are independently useful and fully testable without a Security Onion box. Phase 3 is where the tool becomes what was asked for. Phases 8, 9 and 10 were taken out of numeric order — they landed after phase 6 while phase 7 was still outstanding, since all three are source-neutral and deployment-neutral to what phase 7 covers. Phase 7 closed last, which is why the timer knows about all three sources and about offline profiles.
 

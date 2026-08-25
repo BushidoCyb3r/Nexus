@@ -2,12 +2,12 @@
 """nexus.py - build a Zeek intel.dat from MISP, OpenCTI or TAXII, for Security
 Onion 3.2.
 
-Phases 0-6 and 8-10: environment check, source client (MISP, OpenCTI or a
-TAXII 2.0/2.1 server), the mapping/normalise/write core, the interactive
+All phases: environment check, source client (MISP, OpenCTI or a TAXII
+2.0/2.1 server), the mapping/normalise/write core, the interactive
 interview, profiles and the unattended modes, the safety guardrails,
-apply-to-grid, offline build plus airgapped import, and OpenCTI (phase 9)
-and TAXII (phase 10) as further sources.  Phase 7 (systemd timer, install
-docs) is outstanding.
+apply-to-grid, the opt-in systemd timer (phase 7), OpenCTI (phase 8) and
+TAXII (phase 10) as further sources, and offline build plus airgapped
+import (phase 9).
 One source per run, selected in the interview or via --source.  --offline
 builds a transfer-ready intel.dat on a host with no Security Onion installed;
 --import PATH merges one back into a manager's live file, append-only.
@@ -374,23 +374,21 @@ class RedactingFilter(logging.Filter):
             text = text.replace(secret, "***REDACTED***")
         return text
 
-    _scrub = scrub  # retained: callers predate the public name
-
     def filter(self, record):
         if isinstance(record.msg, str):
-            record.msg = self._scrub(record.msg)
+            record.msg = self.scrub(record.msg)
         if record.args:
             if isinstance(record.args, dict):
                 record.args = dict(
-                    (k, self._scrub(v) if isinstance(v, str) else v)
+                    (k, self.scrub(v) if isinstance(v, str) else v)
                     for k, v in record.args.items()
                 )
             else:
                 record.args = tuple(
-                    self._scrub(a) if isinstance(a, str) else a for a in record.args
+                    self.scrub(a) if isinstance(a, str) else a for a in record.args
                 )
         if record.exc_text:
-            record.exc_text = self._scrub(record.exc_text)
+            record.exc_text = self.scrub(record.exc_text)
         return True
 
 
@@ -451,22 +449,72 @@ def _is_loopback(host):
         return host == "localhost"
 
 
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url):
+    """(scheme, host, port) with a default port normalised away to None.
+
+    Comparing raw netlocs calls "https://h" and "https://h:443" different
+    origins, and both spellings are routine here: stage 1 always answers the
+    port question, so every client's base_url carries an explicit port, while
+    the URLs a server names for itself -- a TAXII api_root, a Location header
+    -- normally leave a default port off.  Naive netloc equality therefore
+    refused legitimate same-origin URLs: every absolute API root on a real
+    TAXII server, and any redirect that merely normalised a path.
+
+    None rather than the number, so that http:80 and https:443 compare equal
+    on the port.  The scheme is a separate element and each caller decides
+    what a scheme change means -- NoCrossHostRedirect allows the upgrade to
+    https and refuses the downgrade; _same_host requires an exact match.
+
+    An unparseable port is not an origin we can vouch for, so it is returned
+    as a value nothing else equals rather than raising.
+    """
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return (scheme, None, -1)
+    if port == DEFAULT_PORTS.get(scheme):
+        port = None
+    return (scheme, (parsed.hostname or "").lower(), port)
+
+
 class NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse a redirect that would leak the Authorization header.
 
     urllib's default handler forwards all headers on a 3xx, so a compromised
     or merely misconfigured MISP could bounce the request -- and the API
     token with it -- to an arbitrary host.
+
+    Scheme counts as well as host, for the same reason TaxiiClient._same_host
+    compares it: a same-host redirect from https to http still puts the
+    Authorization header on the wire in cleartext.  The http -> https
+    direction is the safe one and stays allowed.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old_host = urllib.parse.urlparse(req.full_url).netloc
-        new_host = urllib.parse.urlparse(newurl).netloc
-        if new_host and new_host != old_host:
-            raise urllib.error.HTTPError(
-                req.full_url, code,
-                "refusing cross-host redirect to %s (would leak the API token)"
-                % newurl, headers, fp)
+        old_scheme, old_host, old_port = _origin(req.full_url)
+        new_scheme, new_host, new_port = _origin(newurl)
+        refusal = None
+        # The downgrade is checked first because it is also a port change
+        # (443 -> 80), and "cross-host" would be a true but less useful name
+        # for what is really a cleartext credential.
+        if old_scheme == "https" and new_scheme == "http":
+            refusal = "redirect to plain HTTP at %s" % newurl
+        elif new_host and (new_host, new_port) != (old_host, old_port):
+            refusal = "cross-host redirect to %s" % newurl
+        if refusal:
+            # Not urllib.error.HTTPError: _HttpTransport._request's generic
+            # HTTPError handler ignores exc.reason and instead reads the
+            # original response body for "detail" -- so a refusal raised as
+            # an HTTPError showed the server's 3xx boilerplate instead of the
+            # reason it was refused.  SourceError skips that path and every
+            # retry, since retrying a security refusal cannot help.
+            raise SourceError(
+                "refusing %s (would leak the API token)" % refusal)
         return urllib.request.HTTPRedirectHandler.redirect_request(
             self, req, fp, code, msg, headers, newurl)
 
@@ -483,8 +531,10 @@ class TaxiiError(SourceError):
     pass
 
 
-# The MISP names predate OpenCTI support.  Kept so existing call sites and
-# tests keep working; new code raises and catches the neutral names.
+# The MISP names predate OpenCTI support.  Nothing in this file raises or
+# catches them any more -- they are kept as aliases so an out-of-tree caller
+# (and the tests that pin the aliasing) keeps working.  New code uses the
+# neutral names.
 MispError = SourceError
 MispAuthError = SourceAuthError
 
@@ -1067,6 +1117,19 @@ class TaxiiClient(_HttpTransport):
                                      % base64.b64encode(raw).decode("ascii")}
         return {"Authorization": "Bearer %s" % self.token}
 
+    def _same_host(self, url):
+        """True when `url` stays on the server we authenticated to.
+
+        A relative root ("/api1/") has no netloc and is trivially same-host;
+        an absolute one must match scheme, host and port.  The port comparison
+        goes through _origin so an api_root that omits the scheme's default
+        port still matches a base_url that spells it out -- which is the
+        normal case, because stage 1 always answers the port question.
+        """
+        if not urllib.parse.urlparse(url).netloc:
+            return True
+        return _origin(url) == _origin(self.base_url)
+
     def detect_version(self):
         """Probe 2.1's discovery path, then 2.0's.
 
@@ -1104,6 +1167,14 @@ class TaxiiClient(_HttpTransport):
         roots = (payload or {}).get("api_roots") or []
         found = []
         for root in roots:
+            if not self._same_host(root):
+                # The spec says api_roots are absolute URLs, and urljoin would
+                # follow one to whatever host it names -- carrying the
+                # Authorization header there.  NoCrossHostRedirect blocks the
+                # 3xx route to the same leak; this is the discovery route.
+                log.warning("ignoring API root %s: it is not on %s",
+                            root, self.base_url)
+                continue
             path = root if root.endswith("/") else root + "/"
             try:
                 body, _ = self._request("GET", path + "collections/")
@@ -1129,6 +1200,13 @@ class TaxiiClient(_HttpTransport):
         defines that are useful here; everything else the operator asked for
         is applied after download, in taxii_object_allowed().
         """
+        # get_collections() already filtered discovery, but a collection can
+        # also arrive from a saved profile.  This is the one place both routes
+        # turn into a request, so the check belongs here as well.
+        if not self._same_host(collection.get("api_root") or ""):
+            raise TaxiiError("API root %s is not on %s; refusing to send the "
+                             "credential there"
+                             % (collection.get("api_root"), self.base_url))
         if self.version == "2.0":
             for obj in self._fetch_objects_20(collection, added_after,
                                               max_results, page_size):
@@ -1428,9 +1506,23 @@ _STIX_COMPARISON = re.compile(
 def parse_stix_pattern(pattern):
     """STIX pattern -> [(mapping_table_key, value), ...].
 
-    Used only when an indicator has no linked observables.  Anything that
-    cannot be represented as a flat indicator -- negations, qualifiers, object
-    types with no Zeek equivalent -- is skipped rather than approximated.
+    The value source for TAXII, and the fallback for an OpenCTI indicator
+    with no linked observables.
+
+    Every `property = 'value'` comparison in the pattern contributes one
+    indicator.  The pattern's *structure* is deliberately not honoured:
+    Zeek's Intel framework is a flat list of values with no way to express
+    "only when both are seen", so `[a] AND [b]`, `[a] OR [b]` and a
+    qualifier like `REPEATS 2 TIMES` or `WITHIN 60 SECONDS` all yield the
+    same independent indicators, each of which fires on its own.  That
+    over-matches an AND-composed pattern, and that is the honest trade: the
+    alternative is dropping such patterns entirely, which loses real
+    indicators to a structure Zeek could not have used anyway.
+
+    Two things are genuinely skipped rather than approximated: a `!=`
+    comparison, because an exclusion cannot be expressed at all here (the
+    property character class excludes "!", so the regex simply fails to
+    reach the "="), and any object type with no Zeek equivalent.
     """
     if not pattern:
         return []
@@ -1705,6 +1797,22 @@ def _reject_control(value):
     return value
 
 
+def _reject_comment(value):
+    """A leading "#" makes the line a comment, not an indicator.
+
+    Zeek's ASCII input reader treats a "#" line as a header or a comment and
+    never loads it, and read_existing() drops it for the same reason -- so
+    such a row is written, silently ignored by every sensor, and then dropped
+    from the next merge despite append-only.  Failure that looks exactly like
+    success, which is the one thing this file refuses to ship.  Only the
+    normalisers that admit free text (filename, software, username) can
+    produce one; the guard lives here so all of them are covered at once.
+    """
+    if value.startswith("#"):
+        raise Rejected("leading_comment_char")
+    return value
+
+
 def _prepare(value, defang=False):
     if value is None:
         raise Rejected("empty")
@@ -1713,7 +1821,7 @@ def _prepare(value, defang=False):
         value = defang_repair(value)
     if not value:
         raise Rejected("empty")
-    return _reject_control(value)
+    return _reject_comment(_reject_control(value))
 
 
 def norm_addr(value):
@@ -1791,12 +1899,37 @@ def norm_domain(value):
     return value
 
 
+def url_host(value):
+    """Host of a URL indicator, port and IPv6 brackets removed.
+
+    An IPv6 literal is bracketed and made of colons, so a plain
+    split(":", 1) cuts "[2606:4700::1111]" down to "[2606".  norm_url
+    learned that in 2026-08-24's audit; the two other places that pull a
+    host out of an already-normalised URL indicator --
+    ExclusionSet._reason and check_broad_indicators -- each carried their
+    own copy of the broken split and were left behind, so the fix lives
+    here where all three reach it.
+
+    Takes either a bare authority or a whole host+uri indicator.
+    """
+    authority = value.split("/", 1)[0]
+    if authority.startswith("["):
+        return authority.partition("]")[0].lstrip("[")
+    return authority.split(":", 1)[0]
+
+
 def norm_url(value):
     """Strip the scheme -- Zeek matches host+uri with no protocol prefix."""
     value = _prepare(value, defang=True)
     value = _SCHEME_RE.sub("", value)
     value = value.lstrip("/")
     value = value.split("#", 1)[0]
+    # "example.com?a=1" has a query but no path, so partitioning on "/" below
+    # would put the whole query string inside the host and every host check
+    # would fail it as url_no_host.  Zeek builds its match candidate as
+    # host+uri and a uri starts at the "/", so give it the one the URL
+    # elided; a URL that already has a path is left alone.
+    value = re.sub(r"^([^/?]*)\?", r"\1/?", value, count=1)
     if not value:
         raise Rejected("empty_url")
     if " " in value:
@@ -1809,7 +1942,9 @@ def norm_url(value):
     # matches against, so drop them rather than emit an indicator that cannot
     # possibly fire.
     authority = host.rpartition("@")[2]
-    host_only = authority.split(":", 1)[0]
+    # The brackets stay on the emitted indicator: that is the form a Host
+    # header carries, and Zeek matches host+uri.
+    host_only = url_host(authority)
     try:
         norm_domain(host_only)
     except Rejected:
@@ -1973,8 +2108,7 @@ class ExclusionSet(object):
             return self._domain_excluded(indicator)
 
         elif zeek_type == "Intel::URL":
-            host = indicator.split("/", 1)[0].split(":", 1)[0]
-            return self._domain_excluded(host)
+            return self._domain_excluded(url_host(indicator))
 
         elif zeek_type == "Intel::EMAIL":
             return self._domain_excluded(indicator.partition("@")[2])
@@ -2306,10 +2440,20 @@ def lint_lines(lines, do_notice=False):
     return problems
 
 
-def lint_file(path, do_notice=False):
+def lint_file(path, do_notice=None):
+    """Lint an intel.dat.  do_notice=None reads the schema off the file.
+
+    The `#fields` header states the schema unambiguously, so making the
+    operator restate it with --do-notice only ever produced a wall of
+    "expected 5 fields, got 6" against a perfectly good file.  Pass True or
+    False to override -- the only file that needs it is one with no header,
+    which lint reports on its own line anyway.
+    """
     with open(path, "r", encoding="utf-8") as handle:
         content = handle.read()
     lines = content.split("\n")
+    if do_notice is None:
+        do_notice = bool(lines) and lines[0] == header_line(True)
     problems = []
     if content and not content.endswith("\n"):
         problems.append("file does not end with a newline")
@@ -2333,17 +2477,6 @@ def read_existing(path):
     header = lines[0] if lines[0].startswith("#fields") else None
     body = lines[1:] if header else lines
     return header, [l for l in body if l.strip() and not l.startswith("#")]
-
-
-def merge_preserved(existing_rows, source_prefix=DEFAULT_SOURCE_PREFIX):
-    """Keep hand-maintained lines -- anything whose meta.source is not ours."""
-    preserved = []
-    for line in existing_rows:
-        fields = line.split("\t")
-        source = fields[2] if len(fields) > 2 else ""
-        if not source.startswith(source_prefix):
-            preserved.append(line)
-    return preserved
 
 
 def merge_additive(existing_rows, new_rows):
@@ -2526,7 +2659,7 @@ def check_env(intel_dir=SO_INTEL_DIR, default_dir=SO_INTEL_DEFAULT_DIR,
         st = os.stat(intel_path)
         try:
             _, rows = read_existing(intel_path)
-            problems = lint_file(intel_path)
+            problems = lint_file(intel_path)  # schema from the file's header
         except (OSError, UnicodeDecodeError) as exc:
             # Every build merges into this file.  Unreadable here is a hard
             # stop, not a warning: the alternative is a traceback out of
@@ -2683,6 +2816,33 @@ def check_delta(new_count, existing_count, max_drop_pct=25.0):
         "ok", "%.1f%% drop, within the %.1f%% limit" % (drop_pct, max_drop_pct))
 
 
+def check_built_anything(row_count):
+    """Block a run that produced no indicators at all.
+
+    The append-only counterpart to check_not_empty/check_delta, both of which
+    no-op under a merge that cannot shrink a file -- which left the
+    zero-result case with no guard at all.  A bad token scope, a filter that
+    matches nothing, no IOC types selected, no TAXII collection selected: all
+    of them fetch, build nothing, merge nothing and report success.  On a
+    fresh manager that writes a header-only intel.dat and calls it done; on a
+    populated one it prints "added 0 new indicators" and, if the profile said
+    so, applies it.  Both are failure that looks exactly like success.
+
+    A block rather than a warning, because a warning still writes that file.
+    The merge is append-only, so refusing to write loses nothing: the
+    manager keeps whatever it already had, and the run exits non-zero where a
+    timer's journal will show it.
+    """
+    if row_count < 1:
+        return GuardrailVerdict(
+            "block",
+            "this run built 0 indicators -- nothing was fetched, or every "
+            "record was dropped by the type selection, the filters or the "
+            "exclusions; refusing to write a file that would report success "
+            "while matching nothing")
+    return GuardrailVerdict("ok", "%d indicators built this run" % row_count)
+
+
 def check_load_file(intel_dir, load_filename=SO_LOAD_FILE):
     """Block if __load__.Zeek is absent -- without it Zeek never loads intel.dat.
 
@@ -2702,11 +2862,16 @@ def check_broad_indicators(rows):
     """Warn on indicators broad enough to be a liability rather than a signal.
 
     `rows` is the (indicator, zeek_type, source, desc, url, do_notice) tuples
-    from build_indicators().  Everything flagged here already fails
-    normalisation on the way in (norm_subnet enforces MIN_PREFIX_V4/V6,
-    norm_domain rejects bare TLDs, norm_url rejects a hostless URL) -- this
-    is a second, independent look at whatever actually ended up in `rows`,
-    so a future caller that builds rows some other way is still covered.
+    from build_indicators().  Mostly a second, independent look at what
+    normalisation already rejects (norm_domain rejects bare TLDs, norm_url
+    rejects a hostless URL), so a future caller that builds rows some other
+    way is still covered -- `cmd_import`, whose rows were normalised by a
+    copy of Nexus this one cannot inspect, is the caller it exists for.
+
+    Subnets are the one place the two deliberately disagree: norm_subnet
+    admits a prefix exactly at MIN_PREFIX_V4/V6 and this warns on it.  A /16
+    is 65k addresses -- narrow enough to be a real IOC, wide enough that an
+    operator should see it named before it arms every sensor.
     """
     offenders = []
     for row in rows:
@@ -2724,8 +2889,11 @@ def check_broad_indicators(rows):
             if "." not in indicator:
                 offenders.append("%s (single-label domain)" % indicator)
         elif zeek_type == "Intel::URL":
-            host = indicator.split("/", 1)[0].split(":", 1)[0]
-            if "." not in host:
+            host = url_host(indicator)
+            # A dotless host is a single label and therefore broad -- unless
+            # it is an IPv6 literal, which is one address and as narrow as an
+            # indicator gets.
+            if "." not in host and ":" not in host:
                 offenders.append("%s (URL host has no dot)" % indicator)
 
     if not offenders:
@@ -2762,7 +2930,14 @@ def run_guardrails(rows, existing_count, intel_dir=None, append_only=False,
     verdicts = [check_size(new_count, thresholds.get("warn_at", 100000),
                            thresholds.get("cap")),
                 check_broad_indicators(rows)]
-    if not append_only:
+    if append_only:
+        # check_not_empty and check_delta cannot fire against a merge that
+        # only ever grows, so the zero-result case gets its own guard here
+        # rather than going unchecked.  It counts `rows` -- what this run
+        # built -- not total_count, which stays large on a populated manager
+        # even when the run fetched nothing at all.
+        verdicts.append(check_built_anything(len(rows)))
+    else:
         verdicts.extend([
             check_not_empty(new_count, existing_count,
                             thresholds.get("min_absolute", 1)),
@@ -2825,7 +3000,6 @@ TAXII_SOURCE_FORMATS = (
 
 DEFAULT_DESC_TEMPLATE = "{event_info} | {category}"
 DEFAULT_DAYS = 90
-DEFAULT_MAX_INDICATORS = None
 PROFILE_DIR = os.path.join(NEXUS_HOME, "profiles")
 
 NONE_WORDS = frozenset(("", "none", "-", "no", "any", "all time"))
@@ -3208,9 +3382,26 @@ def discover_taxii(client):
 # -- stages -----------------------------------------------------------------
 
 def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
-                       host=None):
-    """Stage 1.  Collects connection answers only -- main() builds the client."""
+                       host=None, defaults=None):
+    """Stage 1.  Collects connection answers only -- main() builds the client.
+
+    `client`, when there is one, is the bag of defaults: a re-run against a
+    live connection offers back what that connection already uses.  `defaults`
+    is the same bag for the case there is no client yet -- the CLI connection
+    flags, which seed the answers exactly the way --host does and skip none of
+    the questions.
+    """
     _stage(1, "Connection")
+    seed = dict(defaults or {})
+
+    def _seeded(key, fallback):
+        """The client wins, then the CLI flag, then the built-in default."""
+        if client is not None:
+            value = getattr(client, key, None)
+            if value is not None:
+                return value
+        value = seed.get(key)
+        return fallback if value is None else value
 
     # No silent default: a flagless run asks which platform it is pointed at.
     # A caller that already knows (later, --source) skips the question.
@@ -3227,31 +3418,37 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
         "%s address (IP or hostname)" % label,
         host or (client.host if client is not None else None), input_fn).strip()
     config["scheme"] = ask_choice(
-        "Scheme", ["https", "http"],
-        client.scheme if client is not None else "https", input_fn)
+        "Scheme", ["https", "http"], _seeded("scheme", "https"), input_fn)
     if config["scheme"] == "https":
         default_port = 443
     elif source == "opencti":
         default_port = OPENCTI_DEFAULT_PORT_HTTP
     else:
         default_port = 80
-    if client is not None and client.port:
-        default_port = client.port
+    default_port = _seeded("port", default_port) or default_port
     config["port"] = ask_int("Port", default_port, 1, 65535, input_fn)
 
-    verify_default = client.verify_tls if client is not None else True
-    verify = ask_yes_no("Verify the TLS certificate?", verify_default, input_fn)
+    verify = ask_yes_no("Verify the TLS certificate?",
+                        _seeded("verify_tls", True), input_fn)
     if not verify:
         print("  WARNING: disabling verification exposes this session to a "
               "man-in-the-middle.")
-        typed = ask("  type INSECURE to confirm, anything else keeps "
-                    "verification on", "", input_fn)
-        verify = typed.strip() != "INSECURE"
-        if verify:
-            print("  keeping certificate verification enabled")
+        # The typed confirmation exists so nobody turns TLS verification off
+        # by fat-fingering one prompt.  --insecure is already that deliberate
+        # act, spelled out on the command line, so asking again would only
+        # make the flag impossible to act on: an operator taking the seeded
+        # default with Enter would silently get verification back.
+        if seed.get("verify_tls") is False:
+            print("  --insecure was given; verification stays off")
+        else:
+            typed = ask("  type INSECURE to confirm, anything else keeps "
+                        "verification on", "", input_fn)
+            verify = typed.strip() != "INSECURE"
+            if verify:
+                print("  keeping certificate verification enabled")
     config["verify_tls"] = verify
 
-    proxy = ask("HTTP proxy URL", "none", input_fn)
+    proxy = ask("HTTP proxy URL", _seeded("proxy", None) or "none", input_fn)
     config["proxy"] = None if proxy.strip().lower() in NONE_WORDS else proxy
 
     if source == "taxii":
@@ -3302,11 +3499,9 @@ def _stage1_connection(config, client, input_fn, getpass_fn, source=None,
                                           getpass_fn=getpass_fn))
 
     config["timeout"] = ask_int(
-        "Request timeout (seconds)",
-        client.timeout if client is not None else 30, 1, 3600, input_fn)
+        "Request timeout (seconds)", _seeded("timeout", 30), 1, 3600, input_fn)
     config["retries"] = ask_int(
-        "Retries on transient failure",
-        client.retries if client is not None else 3, 1, 10, input_fn)
+        "Retries on transient failure", _seeded("retries", 3), 1, 10, input_fn)
     return config
 
 
@@ -3685,18 +3880,26 @@ def _stage6_exclusions(config, input_fn):
 def _stage7_metadata(config, input_fn, offline=False):
     _stage(7, "Metadata")
     source = config.get("source") or "misp"
-    formats = {"opencti": OPENCTI_SOURCE_FORMATS,
-               "taxii": TAXII_SOURCE_FORMATS}.get(source, SOURCE_FORMATS)
+    formats = list({"opencti": OPENCTI_SOURCE_FORMATS,
+                    "taxii": TAXII_SOURCE_FORMATS}.get(source, SOURCE_FORMATS))
     platform = SOURCE_LABELS.get(source, "MISP")
-    choice = ask_choice("meta.source format", list(formats),
-                        formats[0][0], input_fn)
+    # Stage 2b already set source_fmt to "MISP-feed-{feed}" when feeds were
+    # selected.  Offering this menu with its own default silently threw that
+    # away, and run_interview then warned that meta.source has no {feed}
+    # placeholder -- a complaint about a choice this stage had just made on
+    # the operator's behalf.
+    preset = config.get("source_fmt")
+    if preset and preset not in _opt_values(formats):
+        formats.insert(0, (preset, "set by the feed selection in stage 2b"))
+    choice = ask_choice("meta.source format", formats,
+                        preset or formats[0][0], input_fn)
     if choice == "fixed string":
         choice = ask_required("Fixed meta.source value", platform, input_fn)
     config["source_fmt"] = choice
 
     config["desc_template"] = ask(
         "meta.desc template ({event_info} {category} {tags} {comment} "
-        "{type} {org} {uuid})", DEFAULT_DESC_TEMPLATE, input_fn)
+        "{type} {org} {uuid} {feed})", DEFAULT_DESC_TEMPLATE, input_fn)
 
     link_target = {"opencti": "OpenCTI indicator",
                    "taxii": None}.get(source, "MISP event")
@@ -3716,8 +3919,14 @@ def _stage7_metadata(config, input_fn, offline=False):
     else:
         config["source_base_url"] = None
 
+    # There is no per-indicator control: the column is emitted as T on every
+    # row or not at all, so "yes" means every hit raises a Zeek notice.  On a
+    # populated intel.dat that is an alert per match, which is a decision, not
+    # a formatting detail -- so the prompt says so rather than the README
+    # alone.
     config["do_notice"] = ask_yes_no(
-        "Emit the meta.do_notice column?", False, input_fn)
+        "Emit the meta.do_notice column? (T on every row -- every hit raises "
+        "a Zeek notice)", False, input_fn)
     # Offline, the local policy tree says nothing about the manager this
     # file is going to, so neither message would be true of it.
     if config["do_notice"] and not offline:
@@ -3759,7 +3968,7 @@ def _stage8_output(config, input_fn, offline=False):
                   "none", input_fn).strip().lower()
     config["max_indicators"] = None if cap in NONE_WORDS else int(cap)
     config["dry_run"] = ask_yes_no(
-        "Dry run (write to a temp file and show a diff)?", False, input_fn)
+        "Dry run (build and show the diff, write nothing)?", False, input_fn)
 
     config["profile_path"] = None
     if ask_yes_no("Save these answers as a profile?", True, input_fn):
@@ -3784,7 +3993,8 @@ def _stage8_output(config, input_fn, offline=False):
 
 
 def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
-                  source=None, host=None, connect=None, offline=False):
+                  source=None, host=None, connect=None, offline=False,
+                  defaults=None):
     """Walk stages 1-8 and return a plain dict config.
 
     `client` may be None, which skips discovery so the interview is runnable
@@ -3796,10 +4006,14 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
     connection can resolve a typed name to.  Callers that want a live
     interview pass make_client here; callers that must stay offline pass
     nothing.
+
+    `defaults` seeds stage 1's connection answers from the CLI flags
+    (--scheme, --port, --insecure, --proxy, --timeout, --retries).  They are
+    defaults, not answers: every question is still asked.
     """
     config = {}
     _stage1_connection(config, client, input_fn, getpass_fn, source=source,
-                       host=host)
+                       host=host, defaults=defaults)
 
     _stage(2, "Discovery")
     if client is None and connect is not None:
@@ -3807,7 +4021,24 @@ def run_interview(client, input_fn=input, getpass_fn=getpass.getpass,
             candidate = connect(config)
             # Fail fast on one call: discovery is dozens of requests, and on
             # an unreachable host every one of them would retry and time out.
-            candidate.get_version()
+            if config["source"] == "taxii":
+                # This is the first moment detection is possible at all:
+                # stage 1 asks the version question, and stage 1 is also
+                # what collects the credential, so it has no client to
+                # detect with.  It has to happen here rather than not at
+                # all -- a 2.0 server does not answer /taxii2/, so taking
+                # the answered version on trust would read as an
+                # unreachable host, and the operator would reach stage 3
+                # with no collections to choose from and a build that
+                # fetches nothing.
+                detected = candidate.detect_version()
+                if detected != config.get("taxii_version"):
+                    print("  this server answers TAXII %s, not the %s chosen "
+                          "in stage 1 -- continuing as %s"
+                          % (detected, config.get("taxii_version"), detected))
+                    config["taxii_version"] = detected
+            else:
+                candidate.get_version()
             client = candidate
         except SourceError as exc:
             print("  could not connect: %s" % REDACTOR.scrub(str(exc)))
@@ -3916,8 +4147,6 @@ def build_search_params(config):
 
     if config.get("orgs"):
         params["org"] = list(config["orgs"])
-    if config.get("feed_org_ids"):
-        params["org"] = list(config["feed_org_ids"])
     if config.get("sharing_groups"):
         params["sharinggroup"] = list(config["sharing_groups"])
     if config.get("event_ids"):
@@ -4618,6 +4847,38 @@ def describe_calendar(oncalendar):
     return ("ok", text)
 
 
+def env_file_names(path=None):
+    """Variable names carrying a non-empty value in the timer's EnvironmentFile.
+
+    Names only -- the values are secrets and nothing here needs them.
+
+    resolve_token() does not read this file and must not: under the timer,
+    systemd has already loaded it into the environment, so the ordinary env
+    lookup finds it.  But `--install-timer` runs from a terminal, where that
+    file is *not* in the environment, and the precondition check below used
+    to conclude "no API token reachable without a terminal" and then advise
+    putting the token in the very file it had just ignored -- an instruction
+    that could never clear the error it came with.
+    """
+    # Resolved here rather than as a default argument: NEXUS_ENV_FILE is
+    # derived from NEXUS_HOME, which tests relocate to a temp directory.
+    try:
+        with open(path or NEXUS_ENV_FILE, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    found = set()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        # systemd strips one layer of matching quotes around the value.
+        if value.strip().strip("'\""):
+            found.add(name.strip())
+    return found
+
+
 def check_timer_preconditions(args, config, profile):
     """Can a timed replay of this profile actually succeed?  (ok, findings).
 
@@ -4647,9 +4908,14 @@ def check_timer_preconditions(args, config, profile):
                          % profile))
         ok = False
 
-    # resolve_token's own precedence, asked the way the timer will ask it.
-    # The value is only ever tested for emptiness; it is not logged or kept.
-    if not resolve_token(args, interactive=False):
+    # resolve_token's own precedence, asked the way the timer will ask it,
+    # plus the EnvironmentFile the unit reads and a terminal cannot see.  The
+    # value is only ever tested for emptiness; it is not logged or kept.
+    from_env_file = env_file_names()
+    # The env file is consulted first so its answer short-circuits
+    # resolve_token, which logs an error of its own before returning "".
+    if not (from_env_file & {"NEXUS_TOKEN", "NEXUS_MISP_TOKEN"}
+            or resolve_token(args, interactive=False)):
         findings.append(("error", "no API token reachable without a terminal"))
         findings.append(("fix", "put NEXUS_TOKEN=... in %s (chmod 0600), or "
                                 "a token in %s/credentials.json"
@@ -4657,7 +4923,8 @@ def check_timer_preconditions(args, config, profile):
         ok = False
 
     if config.get("source") == "taxii" and config.get("taxii_auth") == "basic":
-        if not (os.environ.get("NEXUS_TAXII_USERNAME") or "").strip():
+        if not ((os.environ.get("NEXUS_TAXII_USERNAME") or "").strip()
+                or "NEXUS_TAXII_USERNAME" in from_env_file):
             findings.append(("error", "this profile uses TAXII Basic auth and "
                                       "the username is never stored"))
             findings.append(("fix", "put NEXUS_TAXII_USERNAME=... in %s "
@@ -4884,6 +5151,25 @@ def resolve_source_args(args):
     return args
 
 
+def connection_defaults(args):
+    """The CLI connection flags, as the bag stage 1 seeds its answers from.
+
+    --scheme/--port carry argparse defaults rather than None, so "not given"
+    is indistinguishable from "given the default" and both simply agree with
+    what stage 1 would have offered anyway.  --insecure is a store_true, so
+    only the True case is a statement; absent it, stage 1 keeps its own
+    verify-by-default.
+    """
+    return {
+        "scheme": getattr(args, "scheme", None),
+        "port": getattr(args, "port", None),
+        "verify_tls": False if getattr(args, "insecure", False) else None,
+        "proxy": getattr(args, "proxy", None),
+        "timeout": getattr(args, "timeout", None),
+        "retries": getattr(args, "retries", None),
+    }
+
+
 def make_client(config):
     """Build the client for whichever platform the config names."""
     kwargs = {
@@ -4918,7 +5204,8 @@ def cmd_check_env(args):
 
 def cmd_lint(args):
     try:
-        problems = lint_file(args.lint, do_notice=args.do_notice)
+        problems = lint_file(args.lint,
+                             do_notice=True if args.do_notice else None)
     except (OSError, IOError, UnicodeDecodeError) as exc:
         print("cannot read %s: %s" % (args.lint, exc), file=sys.stderr)
         return 2
@@ -5024,6 +5311,14 @@ def cmd_probe(args):
         "scheme": args.scheme, "port": args.port,
         "verify_tls": not args.insecure, "proxy": args.proxy,
         "timeout": args.timeout, "retries": args.retries,
+        # A probe has no interview to ask for TAXII's Basic username.
+        # Without this every probe authenticated Bearer, so a Basic-auth
+        # server answered 401 and the message blamed the token.  Environment
+        # only, and the same variable the systemd timer reads -- there is no
+        # way to know in advance that the server wants Basic, so prompting
+        # for it would be a question every MISP probe had to decline.
+        "taxii_username": (os.environ.get("NEXUS_TAXII_USERNAME")
+                           or "").strip() or None,
     })
 
     if args.source == "opencti":
@@ -5130,6 +5425,7 @@ def _cmd_probe_misp(client, args):
     print("  %-24s %10s  %s" % ("misp type", "count", "zeek type"))
 
     total = 0
+    approximate = False
     for misp_type in candidates:
         try:
             count, exact = client.count_type(misp_type, base,
@@ -5140,13 +5436,17 @@ def _cmd_probe_misp(client, args):
         if count == 0 and not args.show_empty:
             continue
         total += count
+        approximate = approximate or not exact
         marker = "" if exact else "+"
         flag = "" if misp_type not in MISP_OFF_BY_DEFAULT else "   (off by default)"
         print("  %-24s %9d%s  %s%s"
               % (misp_type, count, marker, zeek_type_for(misp_type), flag))
 
-    print("\n  approximate total indicators available: %d%s"
-          % (total, "" if total < args.probe_limit else "+"))
+    # X-Result-Count is an exact total, so the "+" belongs to a count that
+    # actually hit the probe ceiling -- not to a sum that happens to be
+    # larger than it, which is what the old comparison flagged.
+    print("\n  total indicators available: %d%s"
+          % (total, "+" if approximate else ""))
     unmapped = sorted(t for t in known if t in MISP_UNMAPPABLE)
     if unmapped:
         print("\nPresent in MISP but not mappable to Zeek:")
@@ -5303,16 +5603,26 @@ def build_parser():
     run.add_argument("--dry-run", action="store_true",
                      help="build and compare, write nothing")
     run.add_argument("--diff", action="store_true",
-                     help="with --dry-run, show the full line diff")
+                     help="show the full line diff instead of writing; "
+                          "implies --dry-run")
 
     parser.add_argument("--do-notice", action="store_true",
-                        help="expect/emit the meta.do_notice column")
+                        help="emit the meta.do_notice column, T on every row "
+                             "-- every matching indicator raises a Zeek "
+                             "notice; with --lint, force that schema instead "
+                             "of reading it from the file's header")
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     args = resolve_source_args(args)
+    # --diff is a way of looking at the file, not of writing it.  On its own
+    # it used to fall through _report_dry_run's `if not dry_run: return False`
+    # and write, which is the opposite of what an operator asking to see a
+    # diff wants.
+    if args.diff:
+        args.dry_run = True
     explicit_log = args.log_file is not None
     logfile = args.log_file or os.path.join(NEXUS_HOME, "logs", "nexus.log")
     setup_logging(args.verbose, logfile, required=explicit_log)
@@ -5336,11 +5646,15 @@ def main(argv=None):
     # exists only to catch an unattended run with nothing to answer with.
     if args.import_file:
         return cmd_import(args)
-    if args.yes and not args.profile:
-        print("--yes requires --profile (there is nothing to answer "
-              "unattended)", file=sys.stderr)
-        return 2
     if args.probe:
+        # Above the --yes gate, like --import and --install-timer: a probe
+        # runs no interview, so --probe --host H --source S --yes is a
+        # legitimate unattended invocation and the gate below is only about
+        # a *build* having nothing to answer with.
+        if args.yes and not (args.host and args.source):
+            print("--probe --yes needs --host and --source (there is nothing "
+                  "to answer unattended)", file=sys.stderr)
+            return 2
         # Flags exist to skip questions, not to change what a flagless run
         # means: absent --host/--source, --probe asks rather than errors.
         try:
@@ -5354,6 +5668,11 @@ def main(argv=None):
             print("\nAborted: %s" % exc)
             return 130
         return cmd_probe(args)
+
+    if args.yes and not args.profile:
+        print("--yes requires --profile (there is nothing to answer "
+              "unattended)", file=sys.stderr)
+        return 2
 
     return cmd_build(args)
 
@@ -5482,7 +5801,8 @@ def cmd_build(args):
             # --source answers its own question; --host only seeds the
             # default, so the address is still asked.
             config = run_interview(None, source=args.source, host=args.host,
-                                   connect=make_client, offline=offline)
+                                   connect=make_client, offline=offline,
+                                   defaults=connection_defaults(args))
         except InterviewAborted as exc:
             print("\nAborted: %s" % exc)
             return 130
@@ -5499,8 +5819,11 @@ def cmd_build(args):
     # CLI flags win over whatever the profile recorded.
     if args.dry_run:
         config["dry_run"] = True
-    if args.yes:
-        config["apply"] = config.get("apply", False)
+    if args.do_notice:
+        # It said "emit the meta.do_notice column" and emitted nothing: the
+        # flag was read by --lint alone.  Forcing the wider schema onto a
+        # file built without it is caught by the header check below, loudly.
+        config["do_notice"] = True
 
     path = config["output_path"]
     if offline:
@@ -5560,17 +5883,32 @@ def cmd_build(args):
         table = MISP_TO_ZEEK
         wanted_types = config["types"]
     records = _fetch_records(client, config)
-    rows, stats = build_indicators(
-        records, types=wanted_types, exclusions=exclusions,
-        split_composites=config["split_composites"],
-        allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
-        desc_template=config["desc_template"],
-        base_url=config["source_base_url"],
-        meta_maxlen=config["meta_maxlen"],
-        do_notice=config["do_notice"] or None,
-        source=config.get("source", "misp"),
-        mapping_table=table, stats=stats,
-    )
+    try:
+        rows, stats = build_indicators(
+            records, types=wanted_types, exclusions=exclusions,
+            split_composites=config["split_composites"],
+            allow_subnet=config["allow_subnet"], source_fmt=config["source_fmt"],
+            desc_template=config["desc_template"],
+            base_url=config["source_base_url"],
+            meta_maxlen=config["meta_maxlen"],
+            do_notice=config["do_notice"] or None,
+            source=config.get("source", "misp"),
+            mapping_table=table, stats=stats,
+        )
+    except SourceError as exc:
+        # _fetch_records is a generator, so a platform failure lands here
+        # rather than at the get_version() call above -- a token that expires
+        # mid-pull, a 500 that outlasts the retries, a page of malformed
+        # JSON.  It is the likeliest runtime failure there is, and uncaught it
+        # left a traceback in the timer's journal instead of a line.  The
+        # partial fetch is discarded rather than built: it would merge
+        # cleanly, add a fraction of the indicators and report success.
+        # Scrubbed because a SourceError carries the URL and up to 500 bytes
+        # of response body, and only the logging path redacts on its own.
+        print("\n%s fetch failed after %d record(s): %s"
+              % (label, stats.fetched, REDACTOR.scrub(str(exc))),
+              file=sys.stderr)
+        return 2
     print("\n" + stats.report())
 
     try:
@@ -5645,8 +5983,13 @@ def cmd_build(args):
     target = ("standalone node" if config.get("deployment") == "standalone"
               else "grid")
     print("\nApplying to the %s: %s" % (target, SO_APPLY_CMD))
+    # len(combined), not len(rows): the file on disk is the merge, and
+    # verify_runtime counts rows in the file salt synced.  Passing the
+    # newly-built count failed every apply on a manager that already had
+    # indicators -- and verify_runtime's verdict is apply_to_grid's return
+    # value, so a good run exited 1.
     applied, steps = apply_to_grid(intel_dir=os.path.dirname(path),
-                                   expected=len(rows))
+                                   expected=len(combined))
     for level, message in steps:
         print(LEVEL_PREFIX.get(level, "  ") + message)
     return 0 if applied else 1
@@ -5865,4 +6208,10 @@ def cmd_import(args):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # The interview funnels Ctrl-C into InterviewAborted, but a fetch can
+        # run for minutes with no prompt in sight and ended in a traceback.
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
