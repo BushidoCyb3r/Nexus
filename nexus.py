@@ -5397,13 +5397,23 @@ def _cmd_probe_misp(client, args):
         if key in version:
             print("  %-13s: %s" % (key, version[key]))
 
-    try:
-        described = client.describe_types()
-        tags = client.get_tags()
-        orgs = client.get_orgs()
-    except SourceError as exc:
-        print("discovery failed: %s" % exc, file=sys.stderr)
-        return 2
+    # One call per try, matching discover()'s tolerance: a MISP server can
+    # 500 on one discovery endpoint (seen live: a broken taxonomy behind
+    # /tags) while every other endpoint, and the token, are fine.  Bundling
+    # the three in one try turned that single bad endpoint into a probe that
+    # reports nothing at all, including the parts that worked.
+    described, tags, orgs = {}, [], []
+    for label, setter in (("attribute types", lambda: described.update(
+                               types=client.describe_types().get("types") or [])),
+                          ("tags", lambda: tags.extend(client.get_tags())),
+                          ("organisations", lambda: orgs.extend(client.get_orgs()))):
+        try:
+            setter()
+        except SourceError as exc:
+            # Non-fatal, like every other per-item ERR in this survey below
+            # -- stdout, not stderr, so it sits alongside the counts that
+            # did come back rather than looking like a separate failure.
+            print("  could not fetch %s: %s" % (label, exc))
 
     known = set(described.get("types") or [])
     print("\nDiscovery")

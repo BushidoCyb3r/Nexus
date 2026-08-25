@@ -2,3 +2,16 @@ __pycache__/
 *.pyc
 .DS_Store
 .superpowers/
+
+# generated intel.dat output and its offline backups (see nexus.py's
+# offline backup_dir: <output dir>/nexus-backups/)
+*.dat
+/nexus-backups/
+
+# profiles saved by an offline build land beside the output file -- never
+# contain the token, but are local test config, not part of the tool
+/*.json
+
+# credentials, if staged locally instead of /opt/nexus
+*.token
+nexus.env

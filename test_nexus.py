@@ -5467,6 +5467,41 @@ class TestTaxiiEndToEnd(unittest.TestCase):
         self.assertEqual(nexus.lint_lines([nexus.header_line()] + lines), [])
 
 
+class TestMispProbeToleratesOneFailingDiscoveryEndpoint(unittest.TestCase):
+    """Found live: a real MISP 500'd on /tags (a broken taxonomy) while
+    /attributes/describeTypes and /organisations, and the token, were fine.
+    _cmd_probe_misp used to fetch all three in one try, so that one bad
+    endpoint discarded the two that worked -- the interview's own discover()
+    already tries each endpoint independently and just warns; the probe
+    meant to preview it was more fragile than the thing it previews.
+    """
+
+    def setUp(self):
+        self.misp = FakeMisp()
+        self.addCleanup(self.misp.close)
+        self.buffer = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.buffer)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def test_tags_failing_does_not_lose_types_or_orgs(self):
+        client = self.misp.client()
+        real_get_tags = client.get_tags
+
+        def flaky_get_tags():
+            raise nexus.SourceError("HTTP 500 from .../tags")
+
+        client.get_tags = flaky_get_tags
+        args = argparse.Namespace(to_ids=False, published=False, days=None,
+                                  probe_limit=5000, show_empty=False)
+        self.assertEqual(nexus._cmd_probe_misp(client, args), 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("could not fetch tags", printed)
+        self.assertIn("attribute types known to this MISP : 3", printed)
+        self.assertIn("organisations                      : 1", printed)
+        client.get_tags = real_get_tags
+
+
 class TestTaxiiProbe(unittest.TestCase):
     """--probe --source taxii became reachable the moment "taxii" joined
     SOURCES; before this it fell through to the MISP probe and died on

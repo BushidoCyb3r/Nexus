@@ -79,6 +79,197 @@ under `/opt/nexus/profiles/`. Replay it with:
 sudo /opt/nexus/nexus.py --profile misp --yes
 ```
 
+### Walkthrough: the interactive menu, stage by stage
+
+This is the full interview, prompt by prompt, with a recommended answer for a
+first build against a MISP instance. Every stage can be answered differently;
+these are sane defaults for getting a working `intel.dat` on the first try,
+not the only correct answers.
+
+**Where is this intel.dat going?**
+
+```
+1) manager     this machine's Security Onion
+2) offline     another host -- write it here and transfer it
+```
+
+`2` (offline) for a first build, even if this machine *is* the manager — it
+writes a plain file you can inspect with `--lint` before anything touches
+`/opt/so`. Switch to `1` once you trust the profile.
+
+**Stage 1 — Connection**
+
+```
+Threat intel platform            -> 1 (misp)
+MISP address (IP or hostname)    -> the host or IP
+Scheme                           -> 1 (https), unless the instance is plain HTTP
+Port [443]                       -> Enter, unless it runs on a non-default port
+Verify the TLS certificate?      -> Y if the cert chains to a CA you trust
+                                     n only for a lab/self-signed instance --
+                                     see "TLS certificate errors" below before
+                                     you do this against anything real
+HTTP proxy URL [none]            -> Enter, unless one is required
+MISP API token                   -> paste it (hidden input)
+Request timeout (seconds) [30]   -> Enter
+Retries on transient failure [3] -> Enter
+```
+
+**Stage 2 — Discovery.** No prompts. Nexus connects and pulls live attribute
+type counts, tags, organisations and feeds. If the connection fails, it says
+so and continues offline — later stages fall back to the full generic type
+list instead of what this instance actually has.
+
+**Stage 2b — MISP feeds** (only appears if the instance has feeds configured)
+
+```
+Restrict to specific feeds? (no = all of MISP) -> n for a first build
+```
+
+**Stage 3 — What IOCs do you want?**
+
+```
+IOC classes -> Enter (all five classes preselected)
+```
+
+Then one multi-select per class you kept (network, file, email, tls, host).
+Enter accepts the preselection, which already excludes the types marked
+`(noisy)` or `(off by default)` — `link`, `filename`, `github-username`,
+`target-user`, `whois-registrant-name`.
+
+```
+Composite types (domain|ip, filename|md5): emit which half? -> 1 (both)
+Treat hostname as Intel::DOMAIN?                              -> Y
+Emit Intel::SUBNET for CIDR values in IP attributes?          -> Y
+```
+
+**Stage 4 — Quality filters**
+
+```
+to_ids-flagged attributes only?              -> Y
+Published events only?                       -> Y
+Enforce MISP warninglists (strip known-good)? -> Y
+Exclude deleted attributes?                  -> Y
+Minimum event threat level                   -> 1 (any)
+Event analysis state                         -> 1 (any)
+```
+
+**Stage 5 — Scope**
+
+```
+Time window                          -> 3 (all), or 1 (last N days) for a
+                                         smaller, faster first pull
+Which timestamp does that window mean? -> 1 (attribute last-edited)
+Include tags (OR, none = all)        -> Enter (none)
+Exclude tags (NOT)                   -> Enter (keeps the suggested
+                                         false-positive, type:OSINT)
+Restrict to organisations            -> Enter (none)
+Restrict to sharing groups           -> Enter (none)
+Restrict to event IDs or UUIDs       -> Enter (none)
+```
+
+**Stage 6 — Local exclusions**
+
+```
+Exclude RFC1918 / loopback / link-local / multicast? -> Y
+Your own networks (CIDR list)                        -> Enter, or your ranges
+Your own domain suffixes                             -> Enter, or your domains
+Extra allowlist file to subtract                     -> Enter (none)
+```
+
+**Stage 7 — Metadata**
+
+```
+meta.source format                       -> 1 (MISP-event-{event_id})
+meta.desc template                       -> Enter (default)
+Link meta.url back to the MISP event?    -> Y
+Emit the meta.do_notice column?          -> N, unless you want every match
+                                             to raise a Zeek notice
+Max metadata field length [200]          -> Enter
+```
+
+**Stage 8 — Output and apply**
+
+```
+Output path [./intel.dat]                                -> Enter
+Back up the existing file first?                          -> Y
+Optional hard cap on indicator count (none = unlimited)   -> Enter (none)
+Dry run (build and show the diff, write nothing)?         -> Y the first time
+Save these answers as a profile?                          -> Y, give it a name
+```
+
+Answer `Y` to dry run the first time through: it builds, runs every guardrail,
+and reports the indicator delta without writing anything. Once the summary
+and delta look right, run it again — same answers, `n` at dry run — to
+actually write the file. A saved profile with `dry_run: true` baked in stays
+a dry run on every replay until you edit `"dry_run": false` in the profile
+JSON directly; no CLI flag turns dry run back off once a profile has it on.
+
+If a build reaches the pre-flight summary and then fails with the platform
+rejecting your token, re-verify the token with `--probe` (below) before
+re-running the full interview — `--probe` reads the token from a file, which
+survives copy-paste far more reliably than the interview's hidden prompt.
+
+### TLS certificate errors
+
+`certificate verify failed: unable to get local issuer certificate` means the
+platform's cert doesn't chain to a CA this machine trusts — normal for a
+self-signed or internal-CA instance. Two ways through it:
+
+- **Lab / throwaway instance:** answer `n` to "Verify the TLS certificate?",
+  then type `INSECURE` (capitals, exactly) at the confirmation prompt. A
+  blank Enter here leaves verification **on**, on purpose.
+- **Anything you'll reuse:** get the platform's CA/server cert over a channel
+  you already trust — copy it directly off the server, don't fetch it over
+  the same connection you're trying to verify — and run with
+  `SSL_CERT_FILE=/path/to/cert.pem` set, answering `Y` to verify.
+
+### Sample oneliners
+
+These assume `nexus.py` is on your `PATH` or you're in its directory; swap in
+`sudo /opt/nexus/nexus.py` for a manager install. None of these hardcode a
+token in the command itself — each reads it from a short-lived file or
+prompts for it directly, so it never lands in shell history.
+
+**Check connectivity and see what's available, without building anything:**
+
+```
+umask 077; read -s -p "API token: " TOK; echo; printf '%s' "$TOK" > /tmp/nexus.token; unset TOK
+python3 nexus.py --probe --source misp --host YOUR_HOST --scheme https --insecure --token-file /tmp/nexus.token
+rm -f /tmp/nexus.token
+```
+
+Drop `--insecure` once the platform's cert verifies. Swap `--source misp` for
+`opencti` or `taxii` as needed.
+
+**Replay a saved profile unattended, with the token piped in via process
+substitution (nothing touches disk):**
+
+```
+python3 nexus.py --profile YOUR_PROFILE --yes --token-file <(read -s -p "API token: " T; echo -n "$T")
+```
+
+**Same, but the token comes from the environment instead (the same variable
+the systemd timer reads):**
+
+```
+NEXUS_TOKEN=your-token-here python3 nexus.py --profile YOUR_PROFILE --yes
+```
+
+**Validate a file you already built, or one you're about to transfer:**
+
+```
+python3 nexus.py --lint /path/to/intel.dat
+```
+
+**Airgapped build in one line — writes a transfer-ready file, asks nothing
+else:**
+
+```
+umask 077; read -s -p "API token: " TOK; echo; printf '%s' "$TOK" > /tmp/nexus.token; unset TOK
+python3 nexus.py --offline --profile YOUR_PROFILE --yes --token-file /tmp/nexus.token
+rm -f /tmp/nexus.token
+```
+
 ### Credentials are never stored in a profile
 
 A profile records *what* you query, never *who you are*. The API token is never
@@ -249,7 +440,9 @@ OpenCTI and TAXII servers on local sockets.
 
 ## Status
 
-Working against fake servers and a full offline test suite. **Not yet verified
-against a live MISP, OpenCTI or TAXII instance, or a real Security Onion
-manager.** `HANDOFF.md` §7 lists exactly what is unverified and what to check
-the first time a real one is available.
+Working against fake servers and a full offline test suite. **Verified against
+a live MISP instance**: connection, discovery, a full interview-driven build
+and `--lint` all producing a valid, correctly-formatted `intel.dat`.
+**OpenCTI, TAXII, and applying to a real Security Onion manager remain
+unverified.** `HANDOFF.md` §7 lists exactly what is unverified and what to
+check the first time a real one is available.
