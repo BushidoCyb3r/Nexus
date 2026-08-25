@@ -15,3 +15,5 @@ __pycache__/
 # credentials, if staged locally instead of /opt/nexus
 *.token
 nexus.env
+
+/PLAN.md
